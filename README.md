@@ -12,7 +12,7 @@ The application is built in Rust with a thin Tauri shell and a React front end. 
 - **Virtualized grid.** Keyboard-first browsing and editing over keyset-paginated queries.
 - **Search.** SQLite FTS5 across all text columns, opened with `Cmd+K`.
 - **Audit and undo.** Every write appends a before/after delta to `_slab_audit_log` in the same transaction, and can be undone or redone.
-- **Import and export.** Streaming CSV and JSON import with inference and a dry-run preview; CSV, JSON, and SQL export.
+- **Import and export.** Streaming CSV and JSON import with inference and a dry-run preview; CSV, JSON, and SQL export. SQL exports include user tables and SlabBase metadata but omit the audit log and search index; use the backup command for a byte-for-byte snapshot.
 - **Print and PDF.** Paginated HTML preview and vector PDF export for records, portals, and filtered tables.
 - **Backup.** One-click `VACUUM INTO` snapshots that are consistent while the workspace is open.
 
