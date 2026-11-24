@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 37eaf08d8d4464999ce2f1380889d6e6b18c55d403cab9bab57de06a23230c77 # shrinks to expression = Call { name: "IF", args: [Binary { op: Gt, left: Literal(Integer(0)), right: Literal(Integer(0)) }, Call { name: "IF", args: [Binary { op: Gt, left: Literal(Integer(-1)), right: Literal(Integer(0)) }, Literal(Integer(0)), Literal(Null)] }, Literal(Null)] }

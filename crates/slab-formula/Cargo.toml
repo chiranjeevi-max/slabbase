@@ -1,0 +1,19 @@
+[package]
+name = "slab-formula"
+description = "Formula parser, typechecker, evaluator, and dependency DAG for SlabBase"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+slab-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
