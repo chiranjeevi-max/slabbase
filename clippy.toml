@@ -1,0 +1,5 @@
+# Shipping code must not panic. Tests may use unwrap/expect to state expectations.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true

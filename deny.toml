@@ -1,0 +1,54 @@
+[graph]
+# The shipping target is macOS on Apple silicon. Linux and Windows builds are
+# supported by the same source tree but are verified by their own CI jobs.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+# Tauri's HTML/CSS handling on macOS pulls file-level MPL-2.0 helpers
+# (cssparser, selectors, dtoa-short) and option-ext. They are unmodified
+# transitive dependencies of the desktop shell; no SlabBase crate is MPL.
+exceptions = [
+    { name = "cssparser", allow = ["MPL-2.0"] },
+    { name = "cssparser-macros", allow = ["MPL-2.0"] },
+    { name = "selectors", allow = ["MPL-2.0"] },
+    { name = "dtoa-short", allow = ["MPL-2.0"] },
+    { name = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
