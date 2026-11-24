@@ -1,0 +1,33 @@
+[package]
+name = "slabbase-desktop"
+description = "SlabBase desktop shell: Tauri IPC bridge and worker thread"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "slabbase_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+ts-rs = { workspace = true }
+csv = { workspace = true }
+slab-core = { workspace = true, features = ["ts"] }
+slab-storage = { workspace = true }
+slab-formula = { workspace = true }
+slab-import = { workspace = true }
+slab-print = { workspace = true }
+slab-sync = { workspace = true }
+
+[lints]
+workspace = true
