@@ -295,6 +295,12 @@ function DraftRecord({ table }: { table: Table }) {
     return initial;
   });
   const [saving, setSaving] = useState(false);
+  const missing = table.columns.filter(
+    (column) =>
+      column.required &&
+      !isComputedColumn(column) &&
+      isBlankDraft(values[column.name] ?? "Null"),
+  );
 
   const save = async () => {
     setSaving(true);
@@ -345,10 +351,15 @@ function DraftRecord({ table }: { table: Table }) {
         >
           Cancel
         </button>
+        <span className="draft-required">
+          {missing.length > 0
+            ? `Required: ${missing.map((column) => column.name).join(", ")}`
+            : ""}
+        </span>
         <button
           type="button"
           className="button primary"
-          disabled={saving}
+          disabled={saving || missing.length > 0}
           onClick={() => void save()}
         >
           {saving ? "Creating…" : "Create record"}
@@ -356,6 +367,15 @@ function DraftRecord({ table }: { table: Table }) {
       </footer>
     </aside>
   );
+}
+
+function isBlankDraft(value: Value): boolean {
+  if (value === "Null") return true;
+  if (typeof value === "string") return true;
+  if ("Text" in value) return value.Text.trim() === "";
+  if ("Select" in value) return value.Select.trim() === "";
+  if ("AttachmentRef" in value) return value.AttachmentRef.trim() === "";
+  return false;
 }
 
 function orderedItems(items: LayoutItem[]): LayoutItem[] {

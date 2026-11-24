@@ -1353,8 +1353,10 @@ button.grid-head-cell:hover {
 
 .record-footer {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 7px;
+  min-height: 52px;
   padding: 11px 16px;
   border-top: 1px solid var(--line);
 }
@@ -2954,4 +2956,12 @@ button.grid-head-cell:hover {
 .column-row .type-select {
   flex: 0 0 100px;
   width: 100px;
+}
+
+.draft-required {
+  margin-right: auto;
+  font-size: 10px;
+  color: var(--warning);
+  max-width: 220px;
+  line-height: 1.3;
 }
