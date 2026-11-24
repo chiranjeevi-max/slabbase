@@ -1,0 +1,1682 @@
+//! Opening, schema management, write paths, and audit.
+
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use slab_core::{
+    AuditEntry, Clock, Column, ColumnDraft, ColumnType, Command, DeleteAction, FORMAT_VERSION, Hlc,
+    Layout, PolicyHook, Relation, RelationDraft, RowData, RowId, Schema, Table, TableDraft,
+    TableSummary, UndoState, Value, validate_identifier,
+};
+use slab_formula::FormulaDag;
+
+use crate::ddl::{column_definition, create_table_sql, relation_index_sql, unique_index_sql};
+use crate::error::StorageError;
+use crate::sql::{decode_value, encode_value, normalize_value, quote_ident, stored_columns};
+
+const SYSTEM_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS _slab_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS _slab_tables (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS _slab_columns (
+    id TEXT PRIMARY KEY,
+    table_name TEXT NOT NULL REFERENCES _slab_tables(name) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    type_json TEXT NOT NULL,
+    required INTEGER NOT NULL,
+    unique_flag INTEGER NOT NULL,
+    default_json TEXT,
+    position INTEGER NOT NULL,
+    UNIQUE (table_name, name)
+);
+CREATE TABLE IF NOT EXISTS _slab_relations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    parent_table TEXT NOT NULL REFERENCES _slab_tables(name) ON DELETE CASCADE,
+    child_table TEXT NOT NULL REFERENCES _slab_tables(name) ON DELETE CASCADE,
+    child_column TEXT NOT NULL,
+    on_delete TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS _slab_layouts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    table_name TEXT NOT NULL REFERENCES _slab_tables(name) ON DELETE CASCADE,
+    spec_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS _slab_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hlc TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    transaction_id TEXT NOT NULL,
+    table_name TEXT,
+    row_id INTEGER,
+    operation TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    schema_change INTEGER NOT NULL,
+    before_json TEXT,
+    after_json TEXT
+);
+CREATE INDEX IF NOT EXISTS _slab_audit_timestamp ON _slab_audit_log(timestamp_ms);
+CREATE VIRTUAL TABLE IF NOT EXISTS _slab_fts USING fts5(
+    table_name UNINDEXED,
+    row_id UNINDEXED,
+    body
+);
+"#;
+
+const UNDO_LIMIT: usize = 200;
+
+/// A live SQLite workspace.
+///
+/// The type is not `Sync`. Callers that need concurrent access place it on one
+/// worker thread and communicate through a channel, which is what the desktop
+/// shell does.
+pub struct Workspace {
+    pub(crate) conn: Connection,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) clock: Box<dyn Clock>,
+    pub(crate) actor: String,
+    pub(crate) undo: Vec<Command>,
+    pub(crate) redo: Vec<Command>,
+    pub(crate) id_seed: u64,
+    pub(crate) policy: Arc<dyn PolicyHook>,
+    pub(crate) name: String,
+}
+
+/// A summary of the open workspace.
+#[derive(Clone, Debug)]
+pub struct WorkspaceInfo {
+    /// Workspace name stored in `_slab_meta`.
+    pub name: String,
+    /// Absolute or supplied path. Absent for in-memory workspaces.
+    pub path: Option<String>,
+    /// Format version.
+    pub format_version: u32,
+    /// SQLite journal mode.
+    pub journal_mode: String,
+    /// Tables and row counts.
+    pub tables: Vec<TableSummary>,
+}
+
+/// Results of SQLite's own integrity checks.
+#[derive(Clone, Debug)]
+pub struct IntegrityReport {
+    /// `PRAGMA integrity_check` output.
+    pub integrity: String,
+    /// Number of `PRAGMA foreign_key_check` violations.
+    pub foreign_key_violations: u64,
+    /// `PRAGMA journal_mode` output.
+    pub journal_mode: String,
+    /// `PRAGMA page_count` output.
+    pub page_count: u64,
+}
+
+impl Workspace {
+    /// Creates a new workspace at a path. Fails when a non-empty file exists.
+    pub fn create(
+        path: impl AsRef<Path>,
+        name: &str,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.len() > 0
+        {
+            return Err(StorageError::Workspace(format!(
+                "{} already exists",
+                path.display()
+            )));
+        }
+        let conn = Connection::open(path)?;
+        configure(&conn)?;
+        initialize(&conn, name)?;
+        let mut workspace = Self {
+            conn,
+            path: Some(path.to_path_buf()),
+            clock,
+            actor: "local".into(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            id_seed: 0,
+            policy: Arc::new(slab_core::NoopPolicy),
+            name: name.to_owned(),
+        };
+        workspace.validate_schema()?;
+        Ok(workspace)
+    }
+
+    /// Opens an existing workspace.
+    pub fn open(path: impl AsRef<Path>, clock: Box<dyn Clock>) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(StorageError::NotFound(path.display().to_string()));
+        }
+        let conn = Connection::open(path)?;
+        configure(&conn)?;
+        let has_meta: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_slab_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_meta {
+            return Err(StorageError::Workspace(format!(
+                "{} is not a SlabBase workspace",
+                path.display()
+            )));
+        }
+        let name = read_meta(&conn, "name")?.unwrap_or_else(|| "Workspace".into());
+        let format_version = read_meta(&conn, "format_version")?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if format_version > FORMAT_VERSION {
+            return Err(StorageError::Workspace(format!(
+                "workspace format {format_version} is newer than this build supports ({FORMAT_VERSION})"
+            )));
+        }
+        let mut workspace = Self {
+            conn,
+            path: Some(path.to_path_buf()),
+            clock,
+            actor: "local".into(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            id_seed: 0,
+            policy: Arc::new(slab_core::NoopPolicy),
+            name,
+        };
+        workspace.validate_schema()?;
+        Ok(workspace)
+    }
+
+    /// Creates an in-memory workspace for tests and previews.
+    pub fn open_in_memory(name: &str, clock: Box<dyn Clock>) -> Result<Self, StorageError> {
+        let conn = Connection::open_in_memory()?;
+        configure(&conn)?;
+        initialize(&conn, name)?;
+        Ok(Self {
+            conn,
+            path: None,
+            clock,
+            actor: "local".into(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            id_seed: 0,
+            policy: Arc::new(slab_core::NoopPolicy),
+            name: name.to_owned(),
+        })
+    }
+
+    /// The workspace name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The workspace path, absent for in-memory workspaces.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Sets the actor recorded in the audit log.
+    pub fn set_actor(&mut self, actor: impl Into<String>) {
+        self.actor = actor.into();
+    }
+
+    /// Replaces the read policy hook.
+    pub fn set_policy(&mut self, policy: Arc<dyn PolicyHook>) {
+        self.policy = policy;
+    }
+
+    /// Loads the schema from metadata tables and validates it.
+    pub fn schema(&self) -> Result<Schema, StorageError> {
+        let mut tables: Vec<Table> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, name, created_at FROM _slab_tables ORDER BY name")?;
+            let rows = stmt.query_map([], |row| {
+                Ok(Table {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    columns: Vec::new(),
+                    created_at: row.get(2)?,
+                })
+            })?;
+            for row in rows {
+                tables.push(row?);
+            }
+        }
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, table_name, name, type_json, required, unique_flag, default_json, position
+                 FROM _slab_columns ORDER BY table_name, position, name",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let type_json: String = row.get(3)?;
+                let default_json: Option<String> = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    type_json,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                    default_json,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, table_name, name, type_json, required, unique, default_json, position) =
+                    row?;
+                let ty: ColumnType = serde_json::from_str(&type_json)?;
+                let default = default_json
+                    .map(|json| serde_json::from_str::<Value>(&json))
+                    .transpose()?;
+                if let Some(table) = tables.iter_mut().find(|table| table.name == table_name) {
+                    table.columns.push(Column {
+                        id,
+                        table: table_name,
+                        name,
+                        ty,
+                        required,
+                        unique,
+                        default,
+                        position: u32::try_from(position).unwrap_or(0),
+                    });
+                }
+            }
+        }
+        let mut relations: Vec<Relation> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, parent_table, child_table, child_column, on_delete
+                 FROM _slab_relations ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let action: String = row.get(5)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    action,
+                ))
+            })?;
+            for row in rows {
+                let (id, name, parent_table, child_table, child_column, action) = row?;
+                relations.push(Relation {
+                    id,
+                    name,
+                    parent_table,
+                    child_table,
+                    child_column,
+                    on_delete: match action.as_str() {
+                        "cascade" => DeleteAction::Cascade,
+                        "setNull" => DeleteAction::SetNull,
+                        _ => DeleteAction::Restrict,
+                    },
+                });
+            }
+        }
+        let mut layouts: Vec<Layout> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT spec_json FROM _slab_layouts ORDER BY name")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                layouts.push(serde_json::from_str(&row?)?);
+            }
+        }
+        Ok(Schema {
+            tables,
+            relations,
+            layouts,
+        })
+    }
+
+    fn validate_schema(&mut self) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        schema.validate()?;
+        FormulaDag::build(&schema)?;
+        Ok(())
+    }
+
+    /// Workspace metadata and row counts.
+    pub fn info(&self) -> Result<WorkspaceInfo, StorageError> {
+        let journal_mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let format_version = read_meta(&self.conn, "format_version")?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(FORMAT_VERSION);
+        Ok(WorkspaceInfo {
+            name: self.name.clone(),
+            path: self.path.as_ref().map(|path| path.display().to_string()),
+            format_version,
+            journal_mode,
+            tables: self.table_summaries()?,
+        })
+    }
+
+    /// Runs SQLite integrity and foreign key checks.
+    pub fn integrity_check(&self) -> Result<IntegrityReport, StorageError> {
+        let integrity: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let foreign_key_violations: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+        let journal_mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        Ok(IntegrityReport {
+            integrity,
+            foreign_key_violations: u64::try_from(foreign_key_violations).unwrap_or(0),
+            journal_mode,
+            page_count: u64::try_from(page_count).unwrap_or(0),
+        })
+    }
+
+    /// Writes a portable SQL script containing user tables and SlabBase
+    /// metadata. The full-text index and audit log are excluded.
+    pub fn export_sql(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let file = File::create(path)?;
+        let mut out = BufWriter::new(file);
+        writeln!(out, "-- SlabBase SQL export (format {FORMAT_VERSION})")?;
+        writeln!(out, "PRAGMA foreign_keys = OFF;")?;
+        writeln!(out, "BEGIN TRANSACTION;")?;
+        let mut table_names: Vec<String> = vec![
+            "_slab_meta".into(),
+            "_slab_tables".into(),
+            "_slab_columns".into(),
+            "_slab_relations".into(),
+            "_slab_layouts".into(),
+        ];
+        table_names.extend(schema.tables.iter().map(|table| table.name.clone()));
+        for table_name in &table_names {
+            let create: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(create) = create else {
+                continue;
+            };
+            writeln!(out, "DROP TABLE IF EXISTS {};", quote_ident(table_name))?;
+            writeln!(out, "{create};")?;
+            let sql = format!("SELECT * FROM {}", quote_ident(table_name));
+            let mut stmt = self.conn.prepare(&sql)?;
+            let column_count = stmt.column_count();
+            let columns: Vec<String> = stmt.column_names().map(quote_ident).collect();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let mut literals = Vec::with_capacity(column_count);
+                for index in 0..column_count {
+                    let value = row.get_ref(index)?;
+                    literals.push(sql_value_literal(value));
+                }
+                writeln!(
+                    out,
+                    "INSERT INTO {} ({}) VALUES ({});",
+                    quote_ident(table_name),
+                    columns.join(", "),
+                    literals.join(", ")
+                )?;
+            }
+        }
+        writeln!(out, "COMMIT;")?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Writes a consistent snapshot with `VACUUM INTO`.
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(StorageError::Workspace(format!(
+                "{} already exists",
+                path.display()
+            )));
+        }
+        let target = path
+            .to_str()
+            .ok_or_else(|| StorageError::Workspace("backup path is not valid UTF-8".into()))?;
+        self.conn.execute("VACUUM INTO ?1", params![target])?;
+        Ok(())
+    }
+
+    /// Checkpoints the WAL and consumes the workspace.
+    pub fn close(self) -> Result<(), StorageError> {
+        if self.path.is_some() {
+            self.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok(())
+    }
+
+    /// Tables and row counts for the sidebar.
+    pub fn table_summaries(&self) -> Result<Vec<TableSummary>, StorageError> {
+        let schema = self.schema()?;
+        let mut summaries = Vec::with_capacity(schema.tables.len());
+        for table in &schema.tables {
+            let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&table.name));
+            let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+            summaries.push(TableSummary {
+                name: table.name.clone(),
+                row_count: u64::try_from(count).unwrap_or(0),
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Creates a table from a draft, rejecting invalid formulas before any DDL.
+    pub fn create_table(&mut self, draft: &TableDraft) -> Result<Table, StorageError> {
+        validate_identifier(&draft.name)?;
+        let mut table = Table {
+            id: self.next_id("t"),
+            name: draft.name.clone(),
+            columns: Vec::with_capacity(draft.columns.len()),
+            created_at: now_ms(),
+        };
+        for (index, column) in draft.columns.iter().enumerate() {
+            table.columns.push(Column {
+                id: self.next_id("c"),
+                table: draft.name.clone(),
+                name: column.name.clone(),
+                ty: column.ty.clone(),
+                required: column.required,
+                unique: column.unique,
+                default: column.default.clone(),
+                position: u32::try_from(index).unwrap_or(0),
+            });
+        }
+        table.validate()?;
+        let mut candidate = self.schema()?;
+        if candidate.table(&table.name).is_some() {
+            return Err(StorageError::Unique(format!(
+                "table {} already exists",
+                table.name
+            )));
+        }
+        candidate.tables.push(table.clone());
+        candidate.validate()?;
+        FormulaDag::build(&candidate)?;
+        let command = Command::CreateTable {
+            table: table.clone(),
+        };
+        self.apply_command(&command)?;
+        Ok(table)
+    }
+
+    /// Adds a column, rebuilding no tables.
+    pub fn add_column(
+        &mut self,
+        table_name: &str,
+        draft: &ColumnDraft,
+    ) -> Result<Column, StorageError> {
+        let schema = self.schema()?;
+        let table = schema
+            .table(table_name)
+            .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
+        let position = u32::try_from(table.columns.len()).unwrap_or(0);
+        let column = Column {
+            id: self.next_id("c"),
+            table: table_name.to_owned(),
+            name: draft.name.clone(),
+            ty: draft.ty.clone(),
+            required: draft.required,
+            unique: draft.unique,
+            default: draft.default.clone(),
+            position,
+        };
+        column.validate()?;
+        let mut candidate = schema.clone();
+        let table = candidate
+            .table_mut(table_name)
+            .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
+        if table.column(&column.name).is_some() {
+            return Err(StorageError::Unique(format!(
+                "column {}.{} already exists",
+                table_name, column.name
+            )));
+        }
+        table.columns.push(column.clone());
+        candidate.validate()?;
+        FormulaDag::build(&candidate)?;
+        let command = Command::AddColumn {
+            table: table_name.to_owned(),
+            column: column.clone(),
+        };
+        self.apply_command(&command)?;
+        Ok(column)
+    }
+
+    /// Creates a parent-to-child relation, rebuilding the child table with a
+    /// real foreign key.
+    pub fn create_relation(&mut self, draft: &RelationDraft) -> Result<Relation, StorageError> {
+        if draft.on_delete == DeleteAction::SetNull {
+            return Err(StorageError::Unsupported(
+                "SET NULL relations are reserved for a later release".into(),
+            ));
+        }
+        let relation = Relation {
+            id: self.next_id("r"),
+            name: draft.name.clone(),
+            parent_table: draft.parent_table.clone(),
+            child_table: draft.child_table.clone(),
+            child_column: draft.child_column.clone(),
+            on_delete: draft.on_delete,
+        };
+        relation.validate()?;
+        let mut candidate = self.schema()?;
+        if candidate.relation(&relation.name).is_some() {
+            return Err(StorageError::Unique(format!(
+                "relation {} already exists",
+                relation.name
+            )));
+        }
+        let child = candidate
+            .table(&relation.child_table)
+            .ok_or_else(|| StorageError::NotFound(relation.child_table.clone()))?;
+        let column = child.column(&relation.child_column).ok_or_else(|| {
+            StorageError::Query(format!(
+                "missing child column {}.{}",
+                relation.child_table, relation.child_column
+            ))
+        })?;
+        if !matches!(column.ty, ColumnType::Integer) {
+            return Err(StorageError::Command(
+                "relation columns must be Integer".into(),
+            ));
+        }
+        if !column.ty.is_stored() {
+            return Err(StorageError::Command(
+                "relation columns must be stored".into(),
+            ));
+        }
+        if candidate.relations.iter().any(|existing| {
+            existing.child_table == relation.child_table
+                && existing.child_column == relation.child_column
+        }) {
+            return Err(StorageError::Command(format!(
+                "{} already has a relation on {}",
+                relation.child_table, relation.child_column
+            )));
+        }
+        candidate.relations.push(relation.clone());
+        candidate.validate()?;
+        let command = Command::CreateRelation {
+            relation: relation.clone(),
+        };
+        self.apply_command(&command)?;
+        Ok(relation)
+    }
+
+    /// Removes a relation and its foreign key constraint.
+    pub fn drop_relation(&mut self, name: &str) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let relation = schema
+            .relation(name)
+            .ok_or_else(|| StorageError::NotFound(name.to_owned()))?
+            .clone();
+        let command = Command::DropRelation { relation };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
+    /// Inserts or updates a form layout.
+    pub fn save_layout(&mut self, mut layout: Layout) -> Result<Layout, StorageError> {
+        let schema = self.schema()?;
+        if layout.id.is_empty() {
+            layout.id = self.next_id("l");
+        }
+        layout.updated_at = now_ms();
+        layout.validate(&schema)?;
+        let before = schema
+            .layouts
+            .iter()
+            .find(|existing| existing.id == layout.id)
+            .cloned();
+        let command = Command::SaveLayout {
+            before,
+            after: layout.clone(),
+        };
+        self.apply_command(&command)?;
+        Ok(layout)
+    }
+
+    /// Deletes a form layout.
+    pub fn delete_layout(&mut self, id: &str) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let layout = schema
+            .layouts
+            .iter()
+            .find(|layout| layout.id == id)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("layout {id}")))?;
+        let command = Command::DeleteLayout { layout };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
+    /// Inserts a row and returns the stored record.
+    pub fn insert_row(
+        &mut self,
+        table: &str,
+        values: &RowData,
+    ) -> Result<slab_core::Record, StorageError> {
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let prepared = prepare_row(definition, values, None, true)?;
+        let command = Command::InsertRow {
+            table: table.to_owned(),
+            row: slab_core::Record {
+                id: 0,
+                values: prepared,
+            },
+            children: Vec::new(),
+        };
+        let applied = self.apply_command(&command)?;
+        let id = applied.row_id().ok_or_else(|| {
+            StorageError::Internal("insert command did not carry a row id".into())
+        })?;
+        self.read_record(table, id)
+    }
+
+    /// Updates a row from a partial column map and returns the stored record.
+    pub fn update_row(
+        &mut self,
+        table: &str,
+        id: RowId,
+        changes: &RowData,
+    ) -> Result<slab_core::Record, StorageError> {
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let before = read_stored_record(&self.conn, definition, id)?
+            .ok_or_else(|| StorageError::NotFound(format!("{table} #{id}")))?;
+        let prepared = prepare_row(definition, changes, Some(&before.values), false)?;
+        let after = slab_core::Record {
+            id,
+            values: prepared,
+        };
+        let command = Command::UpdateRow {
+            table: table.to_owned(),
+            before: before.clone(),
+            after,
+        };
+        self.apply_command(&command)?;
+        self.read_record(table, id)
+    }
+
+    /// Deletes a row and captures cascade-deleted children for undo.
+    pub fn delete_row(&mut self, table: &str, id: RowId) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let row = read_stored_record(&self.conn, definition, id)?
+            .ok_or_else(|| StorageError::NotFound(format!("{table} #{id}")))?;
+        let hlc = self.clock.now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut children = Vec::new();
+        capture_cascades(&tx, &schema, table, id, &mut children)?;
+        delete_row_tx(&tx, table, id)?;
+        delete_fts(&tx, table, id)?;
+        for child in &children {
+            delete_fts(&tx, &child.table, child.row.id)?;
+        }
+        let command = Command::DeleteRow {
+            table: table.to_owned(),
+            row,
+            children,
+        };
+        append_audit(&tx, &command, &hlc, &self.actor, "delete", &command.label())?;
+        tx.commit()?;
+        self.push_undo(command);
+        Ok(())
+    }
+
+    /// Clears the in-memory undo and redo history.
+    pub fn clear_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Undo and redo availability.
+    pub fn undo_state(&self) -> UndoState {
+        UndoState {
+            can_undo: !self.undo.is_empty(),
+            can_redo: !self.redo.is_empty(),
+            undo_label: self.undo.last().map(Command::label),
+            redo_label: self.redo.last().map(Command::label),
+            depth: u32::try_from(self.undo.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Reverses the most recent command.
+    pub fn undo(&mut self) -> Result<UndoState, StorageError> {
+        let Some(command) = self.undo.pop() else {
+            return Err(StorageError::NothingToUndo);
+        };
+        let inverse = command.inverse();
+        let summary = format!("Undo {}", command.label());
+        match self.apply_command_with_audit(&inverse, "undo", &summary) {
+            Ok(_) => {
+                self.redo.push(command);
+                Ok(self.undo_state())
+            }
+            Err(error) => {
+                self.undo.push(command);
+                Err(error)
+            }
+        }
+    }
+
+    /// Reapplies the most recently undone command.
+    pub fn redo(&mut self) -> Result<UndoState, StorageError> {
+        let Some(command) = self.redo.pop() else {
+            return Err(StorageError::NothingToRedo);
+        };
+        let summary = format!("Redo {}", command.label());
+        match self.apply_command_with_audit(&command, "redo", &summary) {
+            Ok(_) => {
+                self.push_undo(command);
+                Ok(self.undo_state())
+            }
+            Err(error) => {
+                self.redo.push(command);
+                Err(error)
+            }
+        }
+    }
+
+    /// Recent audit entries, newest first.
+    pub fn audit_entries(&self, limit: u32, offset: u32) -> Result<Vec<AuditEntry>, StorageError> {
+        let sql = "SELECT id, hlc, timestamp_ms, actor, transaction_id, table_name, row_id,
+                          operation, summary, schema_change
+                   FROM _slab_audit_log ORDER BY id DESC LIMIT ?1 OFFSET ?2";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![i64::from(limit.min(1000)), i64::from(offset)],
+            |row| {
+                Ok(AuditEntry {
+                    id: row.get(0)?,
+                    hlc: row.get(1)?,
+                    timestamp_ms: row.get(2)?,
+                    actor: row.get(3)?,
+                    transaction: row.get(4)?,
+                    table: row.get(5)?,
+                    row_id: row.get(6)?,
+                    operation: row.get(7)?,
+                    summary: row.get(8)?,
+                    schema_change: row.get::<_, i64>(9)? != 0,
+                })
+            },
+        )?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    fn push_undo(&mut self, command: Command) {
+        self.undo.push(command);
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn next_id(&mut self, prefix: &str) -> String {
+        self.id_seed = self.id_seed.wrapping_add(1);
+        format!("{prefix}_{:x}_{:x}", now_ms(), self.id_seed)
+    }
+
+    fn apply_command(&mut self, command: &Command) -> Result<Command, StorageError> {
+        let applied =
+            self.apply_command_with_audit(command, command.operation(), &command.label())?;
+        self.push_undo(applied.clone());
+        Ok(applied)
+    }
+
+    fn apply_command_with_audit(
+        &mut self,
+        command: &Command,
+        operation: &str,
+        summary: &str,
+    ) -> Result<Command, StorageError> {
+        match command {
+            Command::CreateRelation { .. } | Command::DropRelation { .. } => self
+                .with_foreign_keys_off(|workspace| {
+                    workspace.apply_command_tx(command, operation, summary)
+                }),
+            _ => self.apply_command_tx(command, operation, summary),
+        }
+    }
+
+    fn with_foreign_keys_off<T>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let outcome = work(self);
+        let reenabled = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        match (outcome, reenabled) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
+    fn apply_command_tx(
+        &mut self,
+        command: &Command,
+        operation: &str,
+        summary: &str,
+    ) -> Result<Command, StorageError> {
+        let schema = self.schema()?;
+        let hlc = self.clock.now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let applied = match command {
+            Command::InsertRow {
+                table,
+                row,
+                children,
+            } => {
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                let id = insert_record_tx(&tx, definition, row, row.id > 0)?;
+                let mut applied_row = row.clone();
+                applied_row.id = id;
+                refresh_fts(&tx, definition, id, &applied_row.values)?;
+                for child in children {
+                    let child_table = schema
+                        .table(&child.table)
+                        .ok_or_else(|| StorageError::NotFound(child.table.clone()))?;
+                    insert_record_tx(&tx, child_table, &child.row, true)?;
+                    refresh_fts(&tx, child_table, child.row.id, &child.row.values)?;
+                }
+                Command::InsertRow {
+                    table: table.clone(),
+                    row: applied_row,
+                    children: children.clone(),
+                }
+            }
+            Command::UpdateRow {
+                table,
+                before,
+                after,
+            } => {
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                update_record_tx(&tx, definition, after)?;
+                refresh_fts(&tx, definition, after.id, &after.values)?;
+                let _ = before;
+                command.clone()
+            }
+            Command::DeleteRow {
+                table,
+                row,
+                children,
+            } => {
+                let _ = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                delete_row_tx(&tx, table, row.id)?;
+                delete_fts(&tx, table, row.id)?;
+                for child in children {
+                    delete_fts(&tx, &child.table, child.row.id)?;
+                }
+                command.clone()
+            }
+            Command::CreateTable { table } => {
+                let sql = create_table_sql(table, &table.name, &[])?;
+                tx.execute_batch(&sql)?;
+                insert_table_meta(&tx, table)?;
+                command.clone()
+            }
+            Command::DropTable { table } => {
+                tx.execute_batch(&format!("DROP TABLE {}", quote_ident(&table.name)))?;
+                tx.execute(
+                    "DELETE FROM _slab_tables WHERE name = ?1",
+                    params![table.name],
+                )?;
+                tx.execute(
+                    "DELETE FROM _slab_fts WHERE table_name = ?1",
+                    params![table.name],
+                )?;
+                command.clone()
+            }
+            Command::AddColumn { table, column } => {
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                if column.ty.is_stored() {
+                    let exists: i64 = tx.query_row(
+                        &format!("SELECT COUNT(*) FROM {}", quote_ident(table)),
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if column.required && column.default.is_none() && exists > 0 {
+                        return Err(StorageError::Command(format!(
+                            "{table}.{} cannot be required without a default on a non-empty table",
+                            column.name
+                        )));
+                    }
+                    let ddl = column_definition_alter(column)?;
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {} ADD COLUMN {ddl}",
+                        quote_ident(table)
+                    ))?;
+                    if column.unique {
+                        tx.execute_batch(&unique_index_sql(table, &column.name))?;
+                    }
+                    let mut updated = definition.clone();
+                    updated.columns.push(column.clone());
+                    rebuild_fts_for_table(&tx, &updated)?;
+                }
+                insert_column_meta(&tx, column)?;
+                command.clone()
+            }
+            Command::DropColumn { table, column } => {
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                if schema.relations.iter().any(|relation| {
+                    relation.child_table == *table && relation.child_column == column.name
+                }) {
+                    return Err(StorageError::Command(format!(
+                        "column {table}.{} is used by a relation",
+                        column.name
+                    )));
+                }
+                let relations = schema.relations.clone();
+                let mut reduced = definition.clone();
+                reduced
+                    .columns
+                    .retain(|existing| existing.name != column.name);
+                rebuild_table(&tx, &reduced, &relations)?;
+                tx.execute(
+                    "DELETE FROM _slab_columns WHERE table_name = ?1 AND name = ?2",
+                    params![table, column.name],
+                )?;
+                rebuild_fts_for_table(&tx, &reduced)?;
+                command.clone()
+            }
+            Command::CreateRelation { relation } => {
+                let child = schema
+                    .table(&relation.child_table)
+                    .ok_or_else(|| StorageError::NotFound(relation.child_table.clone()))?;
+                let mut relations = schema.relations.clone();
+                relations.push(relation.clone());
+                ensure_relation_values_valid(
+                    &tx,
+                    &relation.child_table,
+                    &relation.child_column,
+                    &relation.parent_table,
+                )?;
+                rebuild_table(&tx, child, &relations)?;
+                insert_relation_meta(&tx, relation)?;
+                command.clone()
+            }
+            Command::DropRelation { relation } => {
+                let child = schema
+                    .table(&relation.child_table)
+                    .ok_or_else(|| StorageError::NotFound(relation.child_table.clone()))?;
+                tx.execute(
+                    "DELETE FROM _slab_relations WHERE id = ?1",
+                    params![relation.id],
+                )?;
+                let relations: Vec<Relation> = schema
+                    .relations
+                    .iter()
+                    .filter(|existing| existing.id != relation.id)
+                    .cloned()
+                    .collect();
+                rebuild_table(&tx, child, &relations)?;
+                command.clone()
+            }
+            Command::SaveLayout { before, after } => {
+                let before = before.clone();
+                tx.execute(
+                    "INSERT INTO _slab_layouts (id, name, table_name, spec_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        table_name = excluded.table_name,
+                        spec_json = excluded.spec_json,
+                        updated_at = excluded.updated_at",
+                    params![
+                        after.id,
+                        after.name,
+                        after.table,
+                        serde_json::to_string(after)?,
+                        after.updated_at
+                    ],
+                )?;
+                Command::SaveLayout {
+                    before,
+                    after: after.clone(),
+                }
+            }
+            Command::DeleteLayout { layout } => {
+                tx.execute(
+                    "DELETE FROM _slab_layouts WHERE id = ?1",
+                    params![layout.id],
+                )?;
+                command.clone()
+            }
+        };
+        append_audit(&tx, &applied, &hlc, &self.actor, operation, summary)?;
+        tx.commit()?;
+        Ok(applied)
+    }
+}
+
+fn configure(conn: &Connection) -> Result<(), StorageError> {
+    conn.busy_timeout(Duration::from_millis(5_000))?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;",
+    )?;
+    Ok(())
+}
+
+fn initialize(conn: &Connection, name: &str) -> Result<(), StorageError> {
+    conn.execute_batch(SYSTEM_DDL)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO _slab_meta (key, value) VALUES ('format_version', ?1)",
+        params![FORMAT_VERSION.to_string()],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO _slab_meta (key, value) VALUES ('name', ?1)",
+        params![name],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO _slab_meta (key, value) VALUES ('created_at', ?1)",
+        params![now_ms().to_string()],
+    )?;
+    conn.execute_batch(&format!("PRAGMA user_version = {FORMAT_VERSION};"))?;
+    Ok(())
+}
+
+fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>, StorageError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM _slab_meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn prepare_row(
+    table: &Table,
+    values: &RowData,
+    existing: Option<&RowData>,
+    inserting: bool,
+) -> Result<RowData, StorageError> {
+    for key in values.keys() {
+        if key == "id" {
+            continue;
+        }
+        let column = table
+            .column(key)
+            .ok_or_else(|| StorageError::Query(format!("unknown column {}.{key}", table.name)))?;
+        if column.ty.is_computed() {
+            continue;
+        }
+    }
+    let mut prepared = RowData::new();
+    for column in table.stored_columns() {
+        let value = if let Some(value) = values.get(&column.name) {
+            normalize_value(value, &column.ty)?
+        } else if let Some(existing) = existing {
+            existing.get(&column.name).cloned().unwrap_or(Value::Null)
+        } else if let Some(default) = &column.default {
+            normalize_value(default, &column.ty)?
+        } else {
+            Value::Null
+        };
+        if column.required && value.is_null() {
+            return Err(StorageError::Constraint(format!(
+                "{}.{} is required",
+                table.name, column.name
+            )));
+        }
+        if !column.ty.accepts(&value) {
+            return Err(StorageError::Query(format!(
+                "{}.{} does not accept {}",
+                table.name,
+                column.name,
+                value.type_name()
+            )));
+        }
+        prepared.insert(column.name.clone(), value);
+    }
+    if inserting {
+        for key in values.keys() {
+            if key != "id" && table.column(key).is_none() {
+                return Err(StorageError::Query(format!(
+                    "unknown column {}.{key}",
+                    table.name
+                )));
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+pub(crate) fn read_stored_record(
+    conn: &Connection,
+    table: &Table,
+    id: RowId,
+) -> Result<Option<slab_core::Record>, StorageError> {
+    let columns = stored_columns(table);
+    let mut projections = vec![quote_ident("id")];
+    projections.extend(columns.iter().map(|column| quote_ident(&column.name)));
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {} = ?1",
+        projections.join(", "),
+        quote_ident(&table.name),
+        quote_ident("id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let mut values = RowData::new();
+    for (index, column) in columns.iter().enumerate() {
+        values.insert(
+            column.name.clone(),
+            decode_value(row, index + 1, &column.ty)?,
+        );
+    }
+    Ok(Some(slab_core::Record { id, values }))
+}
+
+fn insert_record_tx(
+    tx: &Transaction<'_>,
+    table: &Table,
+    record: &slab_core::Record,
+    explicit_id: bool,
+) -> Result<RowId, StorageError> {
+    let columns = stored_columns(table);
+    let mut names: Vec<String> = Vec::new();
+    let mut placeholders: Vec<String> = Vec::new();
+    let mut bound: Vec<rusqlite::types::Value> = Vec::new();
+    if explicit_id {
+        names.push(quote_ident("id"));
+        placeholders.push("?1".into());
+        bound.push(rusqlite::types::Value::Integer(record.id));
+    }
+    for column in &columns {
+        let value = record
+            .values
+            .get(&column.name)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if column.required && value.is_null() {
+            return Err(StorageError::Constraint(format!(
+                "{}.{} is required",
+                table.name, column.name
+            )));
+        }
+        names.push(quote_ident(&column.name));
+        placeholders.push(format!("?{}", bound.len() + 1));
+        bound.push(encode_value(&value, &column.ty)?);
+    }
+    let sql = if names.is_empty() {
+        format!("INSERT INTO {} DEFAULT VALUES", quote_ident(&table.name))
+    } else {
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quote_ident(&table.name),
+            names.join(", "),
+            placeholders.join(", ")
+        )
+    };
+    tx.execute(&sql, rusqlite::params_from_iter(bound))?;
+    if explicit_id {
+        Ok(record.id)
+    } else {
+        Ok(tx.last_insert_rowid())
+    }
+}
+
+fn update_record_tx(
+    tx: &Transaction<'_>,
+    table: &Table,
+    record: &slab_core::Record,
+) -> Result<(), StorageError> {
+    let columns = stored_columns(table);
+    let mut assignments: Vec<String> = Vec::new();
+    let mut bound: Vec<rusqlite::types::Value> = Vec::new();
+    for column in &columns {
+        let value = record
+            .values
+            .get(&column.name)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if column.required && value.is_null() {
+            return Err(StorageError::Constraint(format!(
+                "{}.{} is required",
+                table.name, column.name
+            )));
+        }
+        bound.push(encode_value(&value, &column.ty)?);
+        assignments.push(format!("{} = ?{}", quote_ident(&column.name), bound.len()));
+    }
+    if assignments.is_empty() {
+        return Ok(());
+    }
+    bound.push(rusqlite::types::Value::Integer(record.id));
+    let sql = format!(
+        "UPDATE {} SET {} WHERE {} = ?{}",
+        quote_ident(&table.name),
+        assignments.join(", "),
+        quote_ident("id"),
+        bound.len()
+    );
+    let changed = tx.execute(&sql, rusqlite::params_from_iter(bound))?;
+    if changed == 0 {
+        return Err(StorageError::NotFound(format!(
+            "{} #{}",
+            table.name, record.id
+        )));
+    }
+    Ok(())
+}
+
+fn delete_row_tx(tx: &Transaction<'_>, table: &str, id: RowId) -> Result<(), StorageError> {
+    let changed = tx.execute(
+        &format!(
+            "DELETE FROM {} WHERE {} = ?1",
+            quote_ident(table),
+            quote_ident("id")
+        ),
+        params![id],
+    )?;
+    if changed == 0 {
+        return Err(StorageError::NotFound(format!("{table} #{id}")));
+    }
+    Ok(())
+}
+
+fn capture_cascades(
+    conn: &Connection,
+    schema: &Schema,
+    table: &str,
+    id: RowId,
+    out: &mut Vec<slab_core::RecordRef>,
+) -> Result<(), StorageError> {
+    for relation in schema.relations.iter().filter(|relation| {
+        relation.parent_table == table && relation.on_delete == DeleteAction::Cascade
+    }) {
+        let Some(child) = schema.table(&relation.child_table) else {
+            continue;
+        };
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} = ?1 ORDER BY {}",
+            quote_ident("id"),
+            quote_ident(&child.name),
+            quote_ident(&relation.child_column),
+            quote_ident("id")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let ids = stmt.query_map(params![id], |row| row.get::<_, RowId>(0))?;
+        let mut child_ids = Vec::new();
+        for child_id in ids {
+            child_ids.push(child_id?);
+        }
+        drop(stmt);
+        for child_id in child_ids {
+            let Some(row) = read_stored_record(conn, child, child_id)? else {
+                continue;
+            };
+            out.push(slab_core::RecordRef {
+                table: child.name.clone(),
+                row,
+            });
+            capture_cascades(conn, schema, &child.name, child_id, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_fts_for_table(tx: &Transaction<'_>, table: &Table) -> Result<(), StorageError> {
+    tx.execute(
+        "DELETE FROM _slab_fts WHERE table_name = ?1",
+        params![table.name],
+    )?;
+    let columns = stored_columns(table);
+    let mut projections = vec![quote_ident("id")];
+    projections.extend(columns.iter().map(|column| quote_ident(&column.name)));
+    let sql = format!(
+        "SELECT {} FROM {}",
+        projections.join(", "),
+        quote_ident(&table.name)
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: RowId = row.get(0)?;
+        let mut values = RowData::new();
+        for (index, column) in columns.iter().enumerate() {
+            values.insert(
+                column.name.clone(),
+                decode_value(row, index + 1, &column.ty)?,
+            );
+        }
+        refresh_fts(tx, table, id, &values)?;
+    }
+    Ok(())
+}
+
+fn refresh_fts(
+    tx: &Transaction<'_>,
+    table: &Table,
+    id: RowId,
+    values: &RowData,
+) -> Result<(), StorageError> {
+    delete_fts(tx, &table.name, id)?;
+    let mut body = String::new();
+    for column in table.stored_columns() {
+        if let Some(value) = values.get(&column.name) {
+            if value.is_null() {
+                continue;
+            }
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&value.display_string());
+        }
+    }
+    if body.trim().is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO _slab_fts (table_name, row_id, body) VALUES (?1, ?2, ?3)",
+        params![table.name, id, body],
+    )?;
+    Ok(())
+}
+
+fn delete_fts(tx: &Transaction<'_>, table: &str, id: RowId) -> Result<(), StorageError> {
+    tx.execute(
+        "DELETE FROM _slab_fts WHERE table_name = ?1 AND CAST(row_id AS INTEGER) = ?2",
+        params![table, id],
+    )?;
+    Ok(())
+}
+
+fn insert_table_meta(tx: &Transaction<'_>, table: &Table) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO _slab_tables (id, name, created_at) VALUES (?1, ?2, ?3)",
+        params![table.id, table.name, table.created_at],
+    )?;
+    for column in &table.columns {
+        insert_column_meta(tx, column)?;
+    }
+    Ok(())
+}
+
+fn insert_column_meta(tx: &Transaction<'_>, column: &Column) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO _slab_columns
+            (id, table_name, name, type_json, required, unique_flag, default_json, position)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            column.id,
+            column.table,
+            column.name,
+            serde_json::to_string(&column.ty)?,
+            i64::from(column.required),
+            i64::from(column.unique),
+            column
+                .default
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            i64::from(column.position),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_relation_meta(tx: &Transaction<'_>, relation: &Relation) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO _slab_relations (id, name, parent_table, child_table, child_column, on_delete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            relation.id,
+            relation.name,
+            relation.parent_table,
+            relation.child_table,
+            relation.child_column,
+            match relation.on_delete {
+                DeleteAction::Cascade => "cascade",
+                DeleteAction::SetNull => "setNull",
+                DeleteAction::Restrict => "restrict",
+            },
+        ],
+    )?;
+    Ok(())
+}
+
+fn column_definition_alter(column: &Column) -> Result<String, StorageError> {
+    let definition = column_definition(column)?;
+    // ALTER TABLE cannot add a UNIQUE column; a unique index is created after.
+    Ok(definition.replace(" UNIQUE", ""))
+}
+
+fn ensure_relation_values_valid(
+    tx: &Transaction<'_>,
+    child_table: &str,
+    child_column: &str,
+    parent_table: &str,
+) -> Result<(), StorageError> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} AS child
+         LEFT JOIN {} AS parent ON child.{} = parent.{}
+         WHERE child.{} IS NOT NULL AND parent.{} IS NULL",
+        quote_ident(child_table),
+        quote_ident(parent_table),
+        quote_ident(child_column),
+        quote_ident("id"),
+        quote_ident(child_column),
+        quote_ident("id")
+    );
+    let violations: i64 = tx.query_row(&sql, [], |row| row.get(0))?;
+    if violations > 0 {
+        return Err(StorageError::ForeignKey(format!(
+            "{violations} child rows in {child_table}.{child_column} have no matching parent"
+        )));
+    }
+    Ok(())
+}
+
+fn rebuild_table(
+    tx: &Transaction<'_>,
+    table: &Table,
+    relations: &[Relation],
+) -> Result<(), StorageError> {
+    let temporary = format!("{}__slab_rebuild", table.name);
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(&temporary)))?;
+    let create = create_table_sql(table, &temporary, relations)?;
+    tx.execute_batch(&create)?;
+    let columns = stored_columns(table);
+    let column_list = {
+        let mut names = vec![quote_ident("id")];
+        names.extend(columns.iter().map(|column| quote_ident(&column.name)));
+        names.join(", ")
+    };
+    tx.execute_batch(&format!(
+        "INSERT INTO {} ({}) SELECT {} FROM {}",
+        quote_ident(&temporary),
+        column_list,
+        column_list,
+        quote_ident(&table.name)
+    ))?;
+    tx.execute_batch(&format!("DROP TABLE {}", quote_ident(&table.name)))?;
+    tx.execute_batch(&format!(
+        "ALTER TABLE {} RENAME TO {}",
+        quote_ident(&temporary),
+        quote_ident(&table.name)
+    ))?;
+    for relation in relations
+        .iter()
+        .filter(|relation| relation.child_table == table.name)
+    {
+        tx.execute_batch(&relation_index_sql(&table.name, &relation.child_column))?;
+    }
+    let violations: i64 =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations > 0 {
+        return Err(StorageError::ForeignKey(format!(
+            "{violations} rows violate foreign keys after rebuilding {}",
+            table.name
+        )));
+    }
+    Ok(())
+}
+
+fn append_audit(
+    tx: &Transaction<'_>,
+    command: &Command,
+    hlc: &Hlc,
+    actor: &str,
+    operation: &str,
+    summary: &str,
+) -> Result<(), StorageError> {
+    let (before, after) = audit_payload(command)?;
+    let before = before
+        .map(|value| serde_json::to_string(&value))
+        .transpose()?;
+    let after = after
+        .map(|value| serde_json::to_string(&value))
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO _slab_audit_log
+            (hlc, timestamp_ms, actor, transaction_id, table_name, row_id, operation, summary,
+             schema_change, before_json, after_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            hlc.to_string(),
+            hlc.wall_ms,
+            actor,
+            format!("tx-{hlc}"),
+            command.table_name(),
+            command.row_id(),
+            operation,
+            summary,
+            i64::from(command.is_schema_change()),
+            before,
+            after,
+        ],
+    )?;
+    Ok(())
+}
+
+fn audit_payload(
+    command: &Command,
+) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), StorageError> {
+    let row_value = |row: &slab_core::Record, children: &[slab_core::RecordRef]| {
+        if children.is_empty() {
+            serde_json::to_value(row)
+        } else {
+            serde_json::to_value(serde_json::json!({
+                "row": row,
+                "children": children,
+            }))
+        }
+    };
+    Ok(match command {
+        Command::InsertRow { row, children, .. } => (None, Some(row_value(row, children)?)),
+        Command::UpdateRow { before, after, .. } => (
+            Some(serde_json::to_value(before)?),
+            Some(serde_json::to_value(after)?),
+        ),
+        Command::DeleteRow { row, children, .. } => (Some(row_value(row, children)?), None),
+        Command::CreateTable { table } => (None, Some(serde_json::to_value(table)?)),
+        Command::DropTable { table } => (Some(serde_json::to_value(table)?), None),
+        Command::AddColumn { column, .. } => (None, Some(serde_json::to_value(column)?)),
+        Command::DropColumn { column, .. } => (Some(serde_json::to_value(column)?), None),
+        Command::CreateRelation { relation } => (None, Some(serde_json::to_value(relation)?)),
+        Command::DropRelation { relation } => (Some(serde_json::to_value(relation)?), None),
+        Command::SaveLayout { before, after } => (
+            before.as_ref().map(serde_json::to_value).transpose()?,
+            Some(serde_json::to_value(after)?),
+        ),
+        Command::DeleteLayout { layout } => (Some(serde_json::to_value(layout)?), None),
+    })
+}
+
+fn sql_value_literal(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Null => "NULL".to_owned(),
+        rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+        rusqlite::types::ValueRef::Real(value) => {
+            if value.is_finite() {
+                format!("{value}")
+            } else {
+                "NULL".to_owned()
+            }
+        }
+        rusqlite::types::ValueRef::Text(bytes) => {
+            format!("'{}'", String::from_utf8_lossy(bytes).replace('\'', "''"))
+        }
+        rusqlite::types::ValueRef::Blob(bytes) => {
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                hex.push_str(&format!("{byte:02X}"));
+            }
+            format!("X'{hex}'")
+        }
+    }
+}
