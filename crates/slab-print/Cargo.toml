@@ -1,0 +1,16 @@
+[package]
+name = "slab-print"
+description = "Paginated HTML and PDF rendering for SlabBase forms and tables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+slab-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
