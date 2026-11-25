@@ -250,9 +250,102 @@ fn concurrency(directory: &tempfile::TempDir) {
 }
 
 fn ivm(directory: &tempfile::TempDir) {
-    let path = directory.path().join("ivm.slab");
+    for children in [10_000_usize, 100_000_usize] {
+        ivm_case(directory, children);
+    }
+}
+
+fn ivm_case(directory: &tempfile::TempDir, children: usize) {
+    let stem = format!("ivm-{children}");
+    let ivm_path = directory.path().join(format!("{stem}-ivm.slab"));
+    let plain_path = directory.path().join(format!("{stem}-plain.slab"));
+    let invoice = create_ivm_workspace(&ivm_path, true);
+    let plain_invoice = create_ivm_workspace(&plain_path, false);
+    assert_eq!(invoice, plain_invoice, "parent ids must align");
+    seed_children(&ivm_path, invoice, children);
+    seed_children(&plain_path, plain_invoice, children);
+
+    let mut ivm_workspace =
+        Workspace::open(&ivm_path, Box::new(BenchClock::new())).expect("open ivm");
+    let mut plain_workspace =
+        Workspace::open(&plain_path, Box::new(BenchClock::new())).expect("open plain");
+    let plain_connection = rusqlite::Connection::open(&plain_path).expect("plain reader");
+    plain_connection
+        .busy_timeout(Duration::from_millis(5_000))
+        .expect("timeout");
+
+    let warm = ivm_workspace
+        .aggregate_for_parent("Invoices", invoice, "Items", "Amount", Aggregate::Sum)
+        .expect("warm rollup");
+    let mut cached = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let value = ivm_workspace
+            .aggregate_for_parent("Invoices", invoice, "Items", "Amount", Aggregate::Sum)
+            .expect("cached rollup");
+        cached.push(started.elapsed());
+        assert_eq!(value, warm);
+    }
+    let mut cold = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let value: Option<i64> = plain_connection
+            .query_row(
+                "SELECT SUM(\"Amount\") FROM \"Items\" WHERE \"Invoice\" = ?1",
+                rusqlite::params![plain_invoice],
+                |row| row.get(0),
+            )
+            .expect("cold sum");
+        cold.push(started.elapsed());
+        assert!(value.is_some());
+    }
+
+    let mut warm_edits = Vec::new();
+    for step in 0..10_i64 {
+        let started = Instant::now();
+        ivm_workspace
+            .update_row("Items", 1, &row(&[("Amount", Value::Integer(step))]))
+            .expect("ivm update");
+        let _ = ivm_workspace
+            .aggregate_for_parent("Invoices", invoice, "Items", "Amount", Aggregate::Sum)
+            .expect("ivm read");
+        warm_edits.push(started.elapsed());
+    }
+    let mut cold_edits = Vec::new();
+    for step in 0..10_i64 {
+        let started = Instant::now();
+        plain_workspace
+            .update_row("Items", 1, &row(&[("Amount", Value::Integer(step))]))
+            .expect("plain update");
+        let _: Option<i64> = plain_connection
+            .query_row(
+                "SELECT SUM(\"Amount\") FROM \"Items\" WHERE \"Invoice\" = ?1",
+                rusqlite::params![plain_invoice],
+                |row| row.get(0),
+            )
+            .expect("plain sum");
+        cold_edits.push(started.elapsed());
+    }
+
+    cached.sort();
+    cold.sort();
+    warm_edits.sort();
+    cold_edits.sort();
+    println!(
+        "ivm_{} children read_cached_ms={:.3} read_cold_sum_ms={:.3} edit_cached_ms={:.3} edit_cold_sum_ms={:.3}",
+        children,
+        cached[cached.len() / 2].as_secs_f64() * 1_000.0,
+        cold[cold.len() / 2].as_secs_f64() * 1_000.0,
+        warm_edits[warm_edits.len() / 2].as_secs_f64() * 1_000.0,
+        cold_edits[cold_edits.len() / 2].as_secs_f64() * 1_000.0,
+    );
+    ivm_workspace.close().expect("close ivm");
+    plain_workspace.close().expect("close plain");
+}
+
+fn create_ivm_workspace(path: &std::path::Path, with_lookup: bool) -> i64 {
     let mut workspace =
-        Workspace::create(&path, "IVM", Box::new(BenchClock::new())).expect("create");
+        Workspace::create(path, "IVM", Box::new(BenchClock::new())).expect("create");
     workspace
         .create_table(&TableDraft {
             name: "Invoices".into(),
@@ -274,80 +367,54 @@ fn ivm(directory: &tempfile::TempDir) {
             on_delete: slab_core::DeleteAction::Cascade,
         })
         .expect("relation");
-    workspace
-        .add_column(
-            "Invoices",
-            &ColumnDraft {
-                name: "Total".into(),
-                ty: ColumnType::Lookup {
-                    relation: "Items".into(),
-                    column: "Amount".into(),
-                    aggregate: Aggregate::Sum,
+    if with_lookup {
+        workspace
+            .add_column(
+                "Invoices",
+                &ColumnDraft {
+                    name: "Total".into(),
+                    ty: ColumnType::Lookup {
+                        relation: "Items".into(),
+                        column: "Amount".into(),
+                        aggregate: Aggregate::Sum,
+                    },
+                    required: false,
+                    unique: false,
+                    default: None,
                 },
-                required: false,
-                unique: false,
-                default: None,
-            },
-        )
-        .expect("lookup");
+            )
+            .expect("lookup");
+    }
     let invoice = workspace
         .insert_row("Invoices", &row(&[("Number", Value::from("INV"))]))
         .expect("invoice")
         .id;
-    workspace.begin_import().expect("begin");
-    for batch in 0..20 {
-        let rows: Vec<RowData> = (0..500)
-            .map(|index| {
-                row(&[
-                    ("Invoice", Value::Integer(invoice)),
-                    ("Amount", Value::Integer(i64::from(batch * 500 + index))),
-                ])
-            })
-            .collect();
-        workspace
-            .insert_import_rows("Items", &rows)
-            .expect("import");
-    }
-    workspace.commit_import().expect("commit");
-    let child = workspace
-        .page(&PageQuery {
-            table: "Items".into(),
-            limit: 1,
-            ..PageQuery::default()
-        })
-        .expect("page")
-        .rows[0]
-        .id;
-    let _ = workspace.read_record("Invoices", invoice).expect("read");
-
-    let mut durations = Vec::new();
-    for step in 0..40_i64 {
-        let started = Instant::now();
-        workspace
-            .update_row("Items", child, &row(&[("Amount", Value::Integer(step))]))
-            .expect("update");
-        let _ = workspace.read_record("Invoices", invoice).expect("read");
-        durations.push(started.elapsed());
-    }
-    durations.sort();
-    println!(
-        "ivm_10k_children edits={} median_ms={:.3} p95_ms={:.3}",
-        durations.len(),
-        durations[durations.len() / 2].as_secs_f64() * 1_000.0,
-        percentile(&durations, 95).as_secs_f64() * 1_000.0,
-    );
-    {
-        let raw = rusqlite::Connection::open(&path).expect("raw");
-        raw.execute("DELETE FROM _slab_rollups", []).expect("clear");
-        let started = Instant::now();
-        let record = workspace.read_record("Invoices", invoice).expect("read");
-        let cold = started.elapsed().as_secs_f64() * 1_000.0;
-        println!(
-            "ivm_cold_full_scan total={:?} ms={cold:.3}",
-            record.get("Total")
-        );
-    }
     workspace.close().expect("close");
+    invoice
+}
+
+fn seed_children(path: &std::path::Path, invoice: i64, children: usize) {
+    let connection = rusqlite::Connection::open(path).expect("raw");
+    connection
+        .busy_timeout(Duration::from_millis(5_000))
+        .expect("timeout");
+    connection.execute_batch("BEGIN IMMEDIATE").expect("begin");
+    {
+        let mut insert = connection
+            .prepare("INSERT INTO \"Items\" (\"id\", \"Invoice\", \"Amount\") VALUES (?1, ?2, ?3)")
+            .expect("prepare");
+        for index in 1..=children {
+            let amount = i64::try_from(index % 1_000).unwrap_or(0);
+            insert
+                .execute(rusqlite::params![
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    invoice,
+                    amount
+                ])
+                .expect("insert");
+        }
+    }
+    connection.execute_batch("COMMIT").expect("commit");
 }
 
 fn ipc() {
