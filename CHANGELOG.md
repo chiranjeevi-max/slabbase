@@ -24,6 +24,7 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 ### Changed
 
 - Version 1.0.0 is locked across `Cargo.toml`, `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`.
+- Pull request macOS CI and Rust CodeQL run only with the `ok-to-test` label; every push gets a quick Ubuntu check and a single `CI gate` status.
 
 ### Fixed
 

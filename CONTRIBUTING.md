@@ -54,6 +54,10 @@ cargo test -p slab-core --features ts
 
 The generated files live in `apps/desktop/src/bindings` and are committed. Do not edit them by hand.
 
+### CI on pull requests
+
+Every push to a pull request runs a quick Ubuntu check (`cargo fmt --check` and the frontend typecheck) and the JavaScript CodeQL analysis. The macOS gates (Rust gate, desktop UI audit shards, bundle check, and Rust CodeQL) run only when the pull request has the `ok-to-test` label, so review-driven pushes do not each start a full macOS run. Add the label when the branch is ready for full verification; every later push re-runs the macOS gates while the label stays on. The `CI gate` check fails until the label is present and every gated job has passed.
+
 ## Commit style
 
 Conventional Commits, imperative mood, subject under 55 characters, one logical change per commit. Examples:

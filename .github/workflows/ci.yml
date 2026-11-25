@@ -5,6 +5,9 @@ name: CI
     branches: [main]
   pull_request:
     branches: [main]
+    # labeled/unlabeled re-evaluate the ok-to-test gate. Any label change
+    # restarts the run; label churn is rare enough not to filter by name.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 permissions:
@@ -19,8 +22,38 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  quick:
+    name: Quick check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Install frontend dependencies
+        run: npm --prefix apps/desktop ci
+      - name: Typecheck frontend
+        run: npm --prefix apps/desktop run typecheck
+
+  # The macOS jobs below run on PRs only when the ok-to-test label is present.
+  # They always run on pushes to main and manual dispatch.
   rust:
     name: Rust gate
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
@@ -52,6 +85,7 @@ jobs:
 
   desktop:
     name: Desktop gate (${{ matrix.shard }}/4)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -131,3 +165,31 @@ jobs:
         run: otool -l target/release/slabbase-desktop | grep -q dep-v0
       - name: Build macOS application bundle
         run: npm --prefix apps/desktop run tauri build
+
+  # Single required check. GitHub treats a skipped job as passing, so this
+  # job fails explicitly when a PR lacks ok-to-test or any gated job failed.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [quick, rust, desktop, bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check gate results
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          if [[ "$IS_PR" == "true" && "$HAS_LABEL" != "true" ]]; then
+            echo "::error::Add the ok-to-test label to run the macOS gates."
+            exit 1
+          fi
+          for result in $RESULTS; do
+            if [[ "$result" != "success" ]]; then
+              echo "::error::A gated job finished with '$result'."
+              exit 1
+            fi
+          done
