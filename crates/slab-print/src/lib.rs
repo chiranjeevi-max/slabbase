@@ -913,22 +913,109 @@ fn write_pdf(page_width: f64, page_height: f64, pages: &[String]) -> Result<Vec<
     Ok(pdf.into_bytes())
 }
 
+/// Maps a character to its WinAnsi byte. The base-14 Helvetica fonts use
+/// WinAnsiEncoding, which covers Latin-1 plus a small CP1252 punctuation block.
+fn winansi_byte(ch: char) -> Option<u8> {
+    match ch {
+        '\u{20AC}' => Some(0x80),
+        '\u{201A}' => Some(0x82),
+        '\u{0192}' => Some(0x83),
+        '\u{201E}' => Some(0x84),
+        '\u{2026}' => Some(0x85),
+        '\u{2020}' => Some(0x86),
+        '\u{2021}' => Some(0x87),
+        '\u{02C6}' => Some(0x88),
+        '\u{2030}' => Some(0x89),
+        '\u{0160}' => Some(0x8A),
+        '\u{2039}' => Some(0x8B),
+        '\u{0152}' => Some(0x8C),
+        '\u{017D}' => Some(0x8E),
+        '\u{2018}' => Some(0x91),
+        '\u{2019}' => Some(0x92),
+        '\u{201C}' => Some(0x93),
+        '\u{201D}' => Some(0x94),
+        '\u{2022}' => Some(0x95),
+        '\u{2013}' => Some(0x96),
+        '\u{2014}' => Some(0x97),
+        '\u{02DC}' => Some(0x98),
+        '\u{2122}' => Some(0x99),
+        '\u{0161}' => Some(0x9A),
+        '\u{203A}' => Some(0x9B),
+        '\u{0153}' => Some(0x9C),
+        '\u{017E}' => Some(0x9E),
+        '\u{0178}' => Some(0x9F),
+        '\u{00A0}' => Some(b' '),
+        ch if ch.is_ascii() => Some(ch as u8),
+        ch if (0xA0..=0xFF).contains(&(ch as u32)) => Some(ch as u8),
+        _ => None,
+    }
+}
+
+/// Deterministic ASCII fallbacks for symbols that WinAnsi cannot encode.
+fn ascii_fallback(ch: char) -> Option<&'static str> {
+    match ch {
+        '\u{20B9}' => Some("INR"),
+        '\u{20BD}' => Some("RUB"),
+        '\u{20A9}' => Some("KRW"),
+        '\u{20AA}' => Some("ILS"),
+        '\u{20AB}' => Some("VND"),
+        '\u{20B4}' => Some("UAH"),
+        '\u{20A6}' => Some("NGN"),
+        '\u{20B1}' => Some("PHP"),
+        '\u{0E3F}' => Some("THB"),
+        '\u{20BA}' => Some("TRY"),
+        '\u{20A1}' => Some("CRC"),
+        '\u{20B2}' => Some("PYG"),
+        '\u{20B8}' => Some("KZT"),
+        '\u{20AE}' => Some("MNT"),
+        '\u{20B5}' => Some("GHS"),
+        '\u{20AD}' => Some("LAK"),
+        '\u{20BE}' => Some("GEL"),
+        '\u{20BC}' => Some("AZN"),
+        '\u{09F3}' => Some("BDT"),
+        '\u{17DB}' => Some("KHR"),
+        '\u{2212}' => Some("-"),
+        '\u{2264}' => Some("<="),
+        '\u{2265}' => Some(">="),
+        '\u{2260}' => Some("!="),
+        '\u{2190}' => Some("<-"),
+        '\u{2192}' => Some("->"),
+        '\u{2191}' => Some("^"),
+        '\u{2193}' => Some("v"),
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => Some(""),
+        '\u{2028}' | '\u{2029}' => Some("\n"),
+        _ => None,
+    }
+}
+
+fn push_pdf_byte(output: &mut String, byte: u8) {
+    match byte {
+        b'(' => output.push_str("\\("),
+        b')' => output.push_str("\\)"),
+        b'\\' => output.push_str("\\\\"),
+        b'\n' => output.push_str("\\n"),
+        b'\r' => output.push_str("\\r"),
+        b'\t' => output.push_str("\\t"),
+        0x20..=0x7E => output.push(char::from(byte)),
+        other => {
+            let _ = write!(output, "\\{other:03o}");
+        }
+    }
+}
+
 fn pdf_string(value: &str) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('(');
-    for byte in value.chars() {
-        match byte {
-            '(' => output.push_str("\\("),
-            ')' => output.push_str("\\)"),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_ascii_graphic() || ch == ' ' => output.push(ch),
-            ch if (ch as u32) <= 0xFF => {
-                let _ = write!(output, "\\{:03o}", ch as u32);
+    for ch in value.chars() {
+        if let Some(byte) = winansi_byte(ch) {
+            push_pdf_byte(&mut output, byte);
+        } else if let Some(fallback) = ascii_fallback(ch) {
+            for byte in fallback.bytes() {
+                push_pdf_byte(&mut output, byte);
             }
-            _ => output.push('?'),
+        } else {
+            // Unsupported scripts and emoji are replaced deterministically.
+            output.push('?');
         }
     }
     output.push(')');
