@@ -295,6 +295,7 @@ jobs:
           commit="$(git rev-parse HEAD)"
           VERSION="$version" ARCH="$arch" DMG="$dmg" SIGNED="${{ steps.signing.outputs.signed }}" COMMIT="$commit" python3 - <<'PY'
           import os
+          import platform
 
           version = os.environ["VERSION"]
           arch = os.environ["ARCH"]
@@ -315,7 +316,7 @@ jobs:
 
           notes = f"""# SlabBase {version}
 
-          Draft release built from `{commit}` on macOS 15 ({arch}).
+          Draft release built from `{commit}` on macOS {platform.mac_ver()[0]} ({arch}).
           {signing_note}
 
           ## Install
