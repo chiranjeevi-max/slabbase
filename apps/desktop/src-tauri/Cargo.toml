@@ -29,5 +29,8 @@ slab-import = { workspace = true }
 slab-print = { workspace = true }
 slab-sync = { workspace = true }
 
+[dev-dependencies]
+regex = "1"
+
 [lints]
 workspace = true

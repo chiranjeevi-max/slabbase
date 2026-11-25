@@ -96,6 +96,10 @@ pub struct ImportOptionsDto {
     pub max_issues: u32,
     /// Skip invalid rows instead of stopping.
     pub skip_invalid: bool,
+    /// Rows used for type inference.
+    pub inference_limit: u32,
+    /// Rows per sink transaction.
+    pub batch_size: u32,
 }
 
 impl Default for ImportOptionsDto {
@@ -106,6 +110,8 @@ impl Default for ImportOptionsDto {
             max_preview_rows: 20,
             max_issues: 100,
             skip_invalid: false,
+            inference_limit: 5_000,
+            batch_size: 500,
         }
     }
 }
@@ -131,6 +137,8 @@ impl ImportOptionsDto {
             max_preview_rows: self.max_preview_rows.clamp(1, 200),
             max_issues: self.max_issues.clamp(1, 1_000),
             skip_invalid: self.skip_invalid,
+            inference_limit: self.inference_limit.clamp(1, 100_000),
+            batch_size: self.batch_size.clamp(1, 10_000),
         })
     }
 }
@@ -197,6 +205,10 @@ pub struct ImportPreviewDto {
     pub sample: Vec<ImportSampleDto>,
     /// Rows scanned.
     pub rows_scanned: u64,
+    /// Rows used for type inference.
+    pub inference_rows: u64,
+    /// True when inference stopped at the configured prefix.
+    pub inference_limited: bool,
     /// Structural issues.
     pub issues: Vec<ImportIssueDto>,
 }
@@ -224,6 +236,8 @@ impl From<ImportPreview> for ImportPreviewDto {
                 })
                 .collect(),
             rows_scanned: preview.rows_scanned,
+            inference_rows: preview.inference_rows,
+            inference_limited: preview.inference_limited,
             issues: preview
                 .issues
                 .into_iter()
@@ -285,6 +299,32 @@ impl From<ImportSummary> for ImportSummaryDto {
                 .collect(),
         }
     }
+}
+
+/// The result of a streamed table PDF.
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/bindings/")]
+#[serde(rename_all = "camelCase")]
+pub struct TablePdfResultDto {
+    /// Rows written to the PDF.
+    pub rows: u64,
+    /// Number of PDF pages.
+    pub pages: u64,
+    /// True when the safety ceiling stopped the export.
+    pub truncated: bool,
+}
+
+/// A rendered table HTML proof with its scope.
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/bindings/")]
+#[serde(rename_all = "camelCase")]
+pub struct TableHtmlResultDto {
+    /// Self-contained HTML.
+    pub html: String,
+    /// Rows included.
+    pub rows: u64,
+    /// True when the safety ceiling stopped the proof.
+    pub truncated: bool,
 }
 
 /// Print options selected in the shell.

@@ -10,9 +10,9 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use slab_core::{
-    AuditEntry, Column, ColumnDraft, GridSpec, Layout, LayoutItem, LayoutItemKind, Page, PageQuery,
-    Record, RecordBundle, Relation, RelationDraft, RowData, RowId, Schema, SearchHit, Table,
-    TableDraft, UndoState,
+    AuditEntry, Column, ColumnDraft, GridSpec, IndexSpec, Layout, LayoutItem, LayoutItemKind, Page,
+    PageQuery, PortalPage, PortalQuery, Record, RecordBundle, Relation, RelationDraft, RowData,
+    RowId, Schema, SearchHit, Table, TableDraft, UndoState,
 };
 use slab_import::{CsvAdapter, ImportAdapter, ImportError, ImportSink, JsonAdapter};
 use slab_storage::Workspace;
@@ -21,7 +21,7 @@ use tauri::State;
 use crate::AppState;
 use crate::dto::{
     ImportOptionsDto, ImportPreviewDto, ImportSummaryDto, ImportValidationDto, IntegrityReportDto,
-    PrintOptionsDto, WorkspaceInfoDto,
+    PrintOptionsDto, TableHtmlResultDto, TablePdfResultDto, WorkspaceInfoDto,
 };
 use crate::error::ApiError;
 
@@ -134,8 +134,106 @@ pub async fn delete_layout(state: State<'_, AppState>, id: String) -> Result<(),
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn rename_table(
+    state: State<'_, AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<(), ApiError> {
+    run_db(&state, move |workspace| {
+        workspace.rename_table(&old_name, &new_name)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn rename_column(
+    state: State<'_, AppState>,
+    table: String,
+    old_name: String,
+    new_name: String,
+) -> Result<(), ApiError> {
+    run_db(&state, move |workspace| {
+        workspace.rename_column(&table, &old_name, &new_name)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn drop_table(state: State<'_, AppState>, name: String) -> Result<(), ApiError> {
+    run_db(&state, move |workspace| {
+        workspace.drop_table(&name)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn drop_column(
+    state: State<'_, AppState>,
+    table: String,
+    column: String,
+) -> Result<(), ApiError> {
+    run_db(&state, move |workspace| {
+        workspace.drop_column(&table, &column)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn drop_relation(state: State<'_, AppState>, name: String) -> Result<(), ApiError> {
+    run_db(&state, move |workspace| {
+        workspace.drop_relation(&name)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_indexes(
+    state: State<'_, AppState>,
+    table: String,
+) -> Result<Vec<IndexSpec>, ApiError> {
+    run_db(&state, move |workspace| Ok(workspace.list_indexes(&table)?)).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn toggle_index(
+    state: State<'_, AppState>,
+    table: String,
+    column: String,
+    enabled: bool,
+) -> Result<Vec<IndexSpec>, ApiError> {
+    run_db(&state, move |workspace| {
+        if enabled {
+            workspace.create_index(&table, &column)?;
+        } else {
+            let indexes = workspace.list_indexes(&table)?;
+            if let Some(index) = indexes
+                .into_iter()
+                .find(|index| index.columns.len() == 1 && index.columns.first() == Some(&column))
+            {
+                workspace.drop_index(&index.name)?;
+            }
+        }
+        Ok(workspace.list_indexes(&table)?)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn page_rows(state: State<'_, AppState>, query: PageQuery) -> Result<Page, ApiError> {
     run_db(&state, move |workspace| Ok(workspace.page(&query)?)).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn page_portal(
+    state: State<'_, AppState>,
+    query: PortalQuery,
+) -> Result<PortalPage, ApiError> {
+    run_db(&state, move |workspace| Ok(workspace.page_portal(&query)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -376,19 +474,25 @@ pub async fn apply_import(
     .await
 }
 
-fn collect_rows(
+fn collect_rows_bounded(
     workspace: &Workspace,
     query: &PageQuery,
     maximum: usize,
-) -> Result<Vec<Record>, ApiError> {
+) -> Result<(Vec<Record>, bool), ApiError> {
     let mut query = query.clone();
     query.limit = 500;
     let mut rows = Vec::new();
+    let mut truncated = false;
     loop {
         let page = workspace.page(&query).map_err(ApiError::from)?;
-        rows.extend(page.rows);
-        if rows.len() >= maximum {
-            rows.truncate(maximum);
+        for row in page.rows {
+            if rows.len() >= maximum {
+                truncated = true;
+                break;
+            }
+            rows.push(row);
+        }
+        if truncated {
             break;
         }
         match page.next_cursor {
@@ -396,7 +500,7 @@ fn collect_rows(
             None => break,
         }
     }
-    Ok(rows)
+    Ok((rows, truncated))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -586,16 +690,22 @@ pub async fn render_table_html(
     table: String,
     query: PageQuery,
     options: PrintOptionsDto,
-) -> Result<String, ApiError> {
+) -> Result<TableHtmlResultDto, ApiError> {
     run_db(&state, move |workspace| {
         let schema = workspace.schema()?;
-        let rows = collect_rows(workspace, &query, 1_000)?;
-        Ok(slab_print::render_table_html(
+        let (rows, truncated) = collect_rows_bounded(workspace, &query, 25_000)?;
+        let html = slab_print::render_table_html_with_status(
             &schema,
             &table,
             &rows,
             &options.to_options(),
-        )?)
+            truncated,
+        )?;
+        Ok(TableHtmlResultDto {
+            html,
+            rows: u64::try_from(rows.len()).unwrap_or(0),
+            truncated,
+        })
     })
     .await
 }
@@ -630,13 +740,33 @@ pub async fn export_table_pdf(
     table: String,
     query: PageQuery,
     options: PrintOptionsDto,
-) -> Result<(), ApiError> {
+) -> Result<TablePdfResultDto, ApiError> {
     run_db(&state, move |workspace| {
         let schema = workspace.schema()?;
-        let rows = collect_rows(workspace, &query, 1_000)?;
-        let bytes = slab_print::render_table_pdf(&schema, &table, &rows, &options.to_options())?;
-        std::fs::write(&path, bytes)?;
-        Ok(())
+        let mut report = slab_print::TableReport::new(&schema, &table, &options.to_options())?;
+        let mut query = query;
+        query.limit = 500;
+        loop {
+            let page = workspace.page(&query)?;
+            report.push(&page.rows);
+            if report.is_full() {
+                if page.next_cursor.is_some() {
+                    report.mark_truncated();
+                }
+                break;
+            }
+            match page.next_cursor {
+                Some(cursor) => query.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        let result = report.finish()?;
+        std::fs::write(&path, result.pdf)?;
+        Ok(TablePdfResultDto {
+            rows: u64::try_from(result.rows_printed).unwrap_or(0),
+            pages: u64::try_from(result.pages).unwrap_or(0),
+            truncated: result.truncated,
+        })
     })
     .await
 }

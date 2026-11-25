@@ -3294,6 +3294,7 @@ name = "slab-import"
 version = "1.0.0"
 dependencies = [
  "csv",
+ "serde",
  "serde_json",
  "slab-core",
  "tempfile",
@@ -3316,6 +3317,7 @@ dependencies = [
  "serde_json",
  "slab-core",
  "slab-formula",
+ "slab-print",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -3335,6 +3337,7 @@ name = "slabbase-desktop"
 version = "1.0.0"
 dependencies = [
  "csv",
+ "regex",
  "serde",
  "serde_json",
  "slab-core",
