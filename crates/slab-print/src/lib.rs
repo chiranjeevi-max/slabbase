@@ -270,6 +270,18 @@ pub fn render_table_html(
     rows: &[Record],
     options: &PrintOptions,
 ) -> Result<String, PrintError> {
+    render_table_html_with_status(schema, table_name, rows, options, false)
+}
+
+/// Renders a table of rows as HTML, with an explicit warning when the caller
+/// stopped at a safety ceiling.
+pub fn render_table_html_with_status(
+    schema: &Schema,
+    table_name: &str,
+    rows: &[Record],
+    options: &PrintOptions,
+    truncated: bool,
+) -> Result<String, PrintError> {
     let table = schema
         .table(table_name)
         .ok_or_else(|| PrintError::Data(format!("missing table {table_name}")))?;
@@ -310,6 +322,11 @@ pub fn render_table_html(
             );
         }
         html.push_str("</tr>");
+    }
+    if truncated {
+        html.push_str(
+            "<p style=\"margin:14px 0 0;padding:8px 10px;border:1px solid #a23b2a;color:#a23b2a;font-size:9pt\">Export stopped at 25,000 rows. Filter the table to continue.</p>",
+        );
     }
     html.push_str("</tbody></table></body></html>");
     Ok(html)
@@ -407,6 +424,139 @@ pub fn render_pdf(
     pdf.finish()
 }
 
+/// Maximum rows written to one table PDF. Reaching it is reported explicitly.
+pub const TABLE_ROW_CEILING: usize = 25_000;
+
+/// The result of a streamed table report.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TablePrintResult {
+    /// PDF bytes.
+    pub pdf: Vec<u8>,
+    /// Rows written before the ceiling or end of input.
+    pub rows_printed: usize,
+    /// True when the safety ceiling stopped the export.
+    pub truncated: bool,
+    /// Number of PDF pages.
+    pub pages: usize,
+}
+
+/// A stateful table report that accepts keyset pages incrementally.
+pub struct TableReport {
+    pdf: PdfBuilder,
+    columns: Vec<Column>,
+    column_width: f64,
+    rows_printed: usize,
+    truncated: bool,
+}
+
+impl TableReport {
+    /// Creates a report and writes the header for the first page.
+    pub fn new(
+        schema: &Schema,
+        table_name: &str,
+        options: &PrintOptions,
+    ) -> Result<Self, PrintError> {
+        let table = schema
+            .table(table_name)
+            .ok_or_else(|| PrintError::Data(format!("missing table {table_name}")))?;
+        let title = options.title.clone().unwrap_or_else(|| table.name.clone());
+        let (page_width, page_height) = options.page_size.dimensions();
+        let margin = options.margin_pt;
+        let content_width = page_width - margin * 2.0;
+        let mut pdf = PdfBuilder::new(page_width, page_height, margin, title);
+        let columns: Vec<Column> = table.columns.clone();
+        if columns.is_empty() {
+            pdf.text(margin, pdf.y, 10.0, "No columns", false);
+        } else {
+            let column_width = content_width / count_to_f64(columns.len());
+            pdf.table_header_refs(&columns, column_width);
+            return Ok(Self {
+                pdf,
+                columns,
+                column_width,
+                rows_printed: 0,
+                truncated: false,
+            });
+        }
+        Ok(Self {
+            pdf,
+            columns,
+            column_width: content_width,
+            rows_printed: 0,
+            truncated: false,
+        })
+    }
+
+    /// True when the safety ceiling has been reached.
+    pub fn is_full(&self) -> bool {
+        self.rows_printed >= TABLE_ROW_CEILING
+    }
+
+    /// Marks the report as truncated when the caller knows more rows exist.
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
+    /// Appends rows and returns how many were written.
+    pub fn push(&mut self, rows: &[Record]) -> usize {
+        let mut accepted = 0;
+        for row in rows {
+            if self.rows_printed >= TABLE_ROW_CEILING {
+                self.truncated = true;
+                break;
+            }
+            if self.columns.is_empty() {
+                break;
+            }
+            if self.pdf.y - 16.0 < self.pdf.margin + 20.0 {
+                self.pdf.begin_page();
+                self.pdf.table_header_refs(&self.columns, self.column_width);
+            }
+            for (index, column) in self.columns.iter().enumerate() {
+                let value = row.get(&column.name).cloned().unwrap_or(Value::Null);
+                self.pdf.text(
+                    self.pdf.margin + self.column_width * count_to_f64(index) + 2.0,
+                    self.pdf.y,
+                    7.5,
+                    &fit_text(&value.display_string(), self.column_width - 6.0, 7.5),
+                    false,
+                );
+            }
+            self.pdf.y -= 14.0;
+            self.pdf.rule_light();
+            self.rows_printed += 1;
+            accepted += 1;
+        }
+        accepted
+    }
+
+    /// Finishes the report, drawing an explicit warning when the ceiling was hit.
+    pub fn finish(mut self) -> Result<TablePrintResult, PrintError> {
+        if self.truncated {
+            self.pdf.ensure(30.0);
+            self.pdf.y -= 8.0;
+            self.pdf.text(
+                self.pdf.margin,
+                self.pdf.y,
+                8.0,
+                &format!(
+                    "Export stopped at {TABLE_ROW_CEILING} rows; filter the table to continue."
+                ),
+                true,
+            );
+            self.pdf.y -= 12.0;
+        }
+        let pages = self.pdf.page_count();
+        let pdf = self.pdf.finish()?;
+        Ok(TablePrintResult {
+            pdf,
+            rows_printed: self.rows_printed,
+            truncated: self.truncated,
+            pages,
+        })
+    }
+}
+
 /// Renders a table as a PDF.
 pub fn render_table_pdf(
     schema: &Schema,
@@ -414,40 +564,9 @@ pub fn render_table_pdf(
     rows: &[Record],
     options: &PrintOptions,
 ) -> Result<Vec<u8>, PrintError> {
-    let table = schema
-        .table(table_name)
-        .ok_or_else(|| PrintError::Data(format!("missing table {table_name}")))?;
-    let title = options.title.clone().unwrap_or_else(|| table.name.clone());
-    let (page_width, page_height) = options.page_size.dimensions();
-    let margin = options.margin_pt;
-    let content_width = page_width - margin * 2.0;
-    let mut pdf = PdfBuilder::new(page_width, page_height, margin, title);
-    let columns: Vec<&Column> = table.columns.iter().collect();
-    if columns.is_empty() {
-        pdf.text(margin, pdf.y, 10.0, "No columns", false);
-        return pdf.finish();
-    }
-    let column_width = content_width / count_to_f64(columns.len());
-    pdf.table_header(&columns, column_width);
-    for row in rows {
-        if pdf.y - 16.0 < margin + 20.0 {
-            pdf.begin_page();
-            pdf.table_header(&columns, column_width);
-        }
-        for (index, column) in columns.iter().enumerate() {
-            let value = row.get(&column.name).cloned().unwrap_or(Value::Null);
-            pdf.text(
-                margin + column_width * count_to_f64(index) + 2.0,
-                pdf.y,
-                7.5,
-                &fit_text(&value.display_string(), column_width - 6.0, 7.5),
-                false,
-            );
-        }
-        pdf.y -= 14.0;
-        pdf.rule_light();
-    }
-    pdf.finish()
+    let mut report = TableReport::new(schema, table_name, options)?;
+    report.push(rows);
+    Ok(report.finish()?.pdf)
 }
 
 fn draw_pdf_portal(
@@ -695,6 +814,11 @@ impl PdfBuilder {
         );
     }
 
+    fn table_header_refs(&mut self, columns: &[Column], width: f64) {
+        let refs: Vec<&Column> = columns.iter().collect();
+        self.table_header(&refs, width);
+    }
+
     fn table_header(&mut self, columns: &[&Column], width: f64) {
         let _ = writeln!(
             self.current,
@@ -713,6 +837,10 @@ impl PdfBuilder {
             );
         }
         self.y -= 15.0;
+    }
+
+    fn page_count(&self) -> usize {
+        self.pages.len() + usize::from(!self.current.is_empty())
     }
 
     fn finish(mut self) -> Result<Vec<u8>, PrintError> {
@@ -929,6 +1057,48 @@ mod tests {
         assert!(text.contains("xref"));
         assert!(text.contains("%%EOF"));
         assert!(text.contains("INV-2026-001"));
+    }
+
+    #[test]
+    fn table_report_renders_all_rows_across_pages() {
+        let mut schema = Schema::default();
+        schema.tables.push(Table {
+            id: "t_items".into(),
+            name: "Items".into(),
+            columns: vec![Column {
+                id: "c_name".into(),
+                table: "Items".into(),
+                name: "Name".into(),
+                ty: slab_core::ColumnType::Text,
+                required: true,
+                unique: false,
+                default: None,
+                position: 0,
+            }],
+            created_at: 0,
+        });
+        let rows: Vec<Record> = (0..1_500)
+            .map(|index| {
+                let mut values = std::collections::BTreeMap::new();
+                values.insert("Name".to_owned(), Value::Text(format!("Row {index}")));
+                Record {
+                    id: i64::from(index),
+                    values,
+                }
+            })
+            .collect();
+        let mut report =
+            TableReport::new(&schema, "Items", &PrintOptions::default()).expect("report");
+        for chunk in rows.chunks(500) {
+            assert_eq!(report.push(chunk), chunk.len());
+        }
+        let result = report.finish().expect("pdf");
+        assert_eq!(result.rows_printed, 1_500);
+        assert!(!result.truncated);
+        assert!(result.pages > 10, "pages was {}", result.pages);
+        let text = String::from_utf8_lossy(&result.pdf);
+        assert!(text.contains("Row 0"));
+        assert!(text.contains("Row 1499"));
     }
 
     #[test]
