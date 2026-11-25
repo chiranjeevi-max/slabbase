@@ -1,8 +1,8 @@
 //! Tauri command handlers.
 //!
-//! Every handler moves its database work onto the `slabbase-db` worker thread.
-//! The webview thread never touches SQLite or the filesystem for workspace
-//! operations.
+//! Read commands lease a read-only workspace and run concurrently through
+//! `spawn_blocking`. Write commands serialize on the writer mutex. The webview
+//! thread never touches SQLite or the filesystem for workspace operations.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -35,13 +35,22 @@ where
         .map_err(|error| ApiError::internal(format!("database task failed: {error}")))?
 }
 
-async fn run_db<T, F>(state: &State<'_, AppState>, work: F) -> Result<T, ApiError>
+async fn run_read<T, F>(state: &State<'_, AppState>, work: F) -> Result<T, ApiError>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&Workspace) -> Result<T, ApiError> + Send + 'static,
+{
+    let db = Arc::clone(&state.db);
+    blocking(move || db.read(work)).await
+}
+
+async fn run_write<T, F>(state: &State<'_, AppState>, work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
     F: FnOnce(&mut Workspace) -> Result<T, ApiError> + Send + 'static,
 {
     let db = Arc::clone(&state.db);
-    blocking(move || db.run(work)).await
+    blocking(move || db.write(work)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -115,7 +124,7 @@ pub async fn load_sample(state: State<'_, AppState>) -> Result<WorkspaceInfoDto,
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_schema(state: State<'_, AppState>) -> Result<Schema, ApiError> {
-    run_db(&state, |workspace| Ok(workspace.schema()?)).await
+    run_read(&state, |workspace| Ok(workspace.schema()?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -123,7 +132,7 @@ pub async fn create_table(
     state: State<'_, AppState>,
     draft: TableDraft,
 ) -> Result<Table, ApiError> {
-    run_db(&state, move |workspace| Ok(workspace.create_table(&draft)?)).await
+    run_write(&state, move |workspace| Ok(workspace.create_table(&draft)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -132,7 +141,7 @@ pub async fn add_column(
     table: String,
     draft: ColumnDraft,
 ) -> Result<Column, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         Ok(workspace.add_column(&table, &draft)?)
     })
     .await
@@ -143,7 +152,7 @@ pub async fn create_relation(
     state: State<'_, AppState>,
     draft: RelationDraft,
 ) -> Result<Relation, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         Ok(workspace.create_relation(&draft)?)
     })
     .await
@@ -151,12 +160,12 @@ pub async fn create_relation(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn save_layout(state: State<'_, AppState>, layout: Layout) -> Result<Layout, ApiError> {
-    run_db(&state, move |workspace| Ok(workspace.save_layout(layout)?)).await
+    run_write(&state, move |workspace| Ok(workspace.save_layout(layout)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn delete_layout(state: State<'_, AppState>, id: String) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.delete_layout(&id)?;
         Ok(())
     })
@@ -169,7 +178,7 @@ pub async fn rename_table(
     old_name: String,
     new_name: String,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.rename_table(&old_name, &new_name)?;
         Ok(())
     })
@@ -183,7 +192,7 @@ pub async fn rename_column(
     old_name: String,
     new_name: String,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.rename_column(&table, &old_name, &new_name)?;
         Ok(())
     })
@@ -192,7 +201,7 @@ pub async fn rename_column(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn drop_table(state: State<'_, AppState>, name: String) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.drop_table(&name)?;
         Ok(())
     })
@@ -205,7 +214,7 @@ pub async fn drop_column(
     table: String,
     column: String,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.drop_column(&table, &column)?;
         Ok(())
     })
@@ -214,7 +223,7 @@ pub async fn drop_column(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn drop_relation(state: State<'_, AppState>, name: String) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.drop_relation(&name)?;
         Ok(())
     })
@@ -226,7 +235,7 @@ pub async fn list_indexes(
     state: State<'_, AppState>,
     table: String,
 ) -> Result<Vec<IndexSpec>, ApiError> {
-    run_db(&state, move |workspace| Ok(workspace.list_indexes(&table)?)).await
+    run_read(&state, move |workspace| Ok(workspace.list_indexes(&table)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -236,7 +245,7 @@ pub async fn toggle_index(
     column: String,
     enabled: bool,
 ) -> Result<Vec<IndexSpec>, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         if enabled {
             workspace.create_index(&table, &column)?;
         } else {
@@ -259,7 +268,7 @@ pub async fn create_index(
     table: String,
     column: String,
 ) -> Result<IndexSpec, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         Ok(workspace.create_index(&table, &column)?)
     })
     .await
@@ -275,7 +284,7 @@ pub async fn page_rows(
     state: State<'_, AppState>,
     query: PageQuery,
 ) -> Result<PageFrame, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let table = schema
             .table(&query.table)
@@ -295,7 +304,7 @@ pub async fn page_portal(
     state: State<'_, AppState>,
     query: PortalQuery,
 ) -> Result<PortalFrame, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let relation = schema
             .relation(&query.relation)
@@ -319,7 +328,7 @@ pub async fn read_record(
     table: String,
     id: RowId,
 ) -> Result<Record, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         Ok(workspace.read_record(&table, id)?)
     })
     .await
@@ -332,7 +341,7 @@ pub async fn read_bundle(
     id: RowId,
     portal_limit: u32,
 ) -> Result<RecordBundle, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         Ok(workspace.bundle(&table, id, portal_limit)?)
     })
     .await
@@ -344,7 +353,7 @@ pub async fn insert_row(
     table: String,
     values: RowData,
 ) -> Result<Record, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         Ok(workspace.insert_row(&table, &values)?)
     })
     .await
@@ -357,7 +366,7 @@ pub async fn update_row(
     id: RowId,
     values: RowData,
 ) -> Result<Record, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         Ok(workspace.update_row(&table, id, &values)?)
     })
     .await
@@ -369,7 +378,7 @@ pub async fn delete_row(
     table: String,
     id: RowId,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.delete_row(&table, id)?;
         Ok(())
     })
@@ -378,17 +387,17 @@ pub async fn delete_row(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn undo(state: State<'_, AppState>) -> Result<UndoState, ApiError> {
-    run_db(&state, |workspace| Ok(workspace.undo()?)).await
+    run_write(&state, |workspace| Ok(workspace.undo()?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn redo(state: State<'_, AppState>) -> Result<UndoState, ApiError> {
-    run_db(&state, |workspace| Ok(workspace.redo()?)).await
+    run_write(&state, |workspace| Ok(workspace.redo()?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn undo_state(state: State<'_, AppState>) -> Result<UndoState, ApiError> {
-    run_db(&state, |workspace| Ok(workspace.undo_state())).await
+    run_write(&state, |workspace| Ok(workspace.undo_state())).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -397,7 +406,7 @@ pub async fn search(
     term: String,
     limit: u32,
 ) -> Result<Vec<SearchHit>, ApiError> {
-    run_db(&state, move |workspace| Ok(workspace.search(&term, limit)?)).await
+    run_read(&state, move |workspace| Ok(workspace.search(&term, limit)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -406,7 +415,7 @@ pub async fn audit_entries(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<AuditEntry>, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         Ok(workspace.audit_entries(limit, offset)?)
     })
     .await
@@ -418,7 +427,7 @@ pub async fn record_history(
     table: String,
     row_id: RowId,
 ) -> Result<Vec<RecordRevision>, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         Ok(workspace.record_history(&table, row_id)?)
     })
     .await
@@ -431,7 +440,7 @@ pub async fn restore_record_revision(
     row_id: RowId,
     audit_id: i64,
 ) -> Result<Record, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         Ok(workspace.restore_record_revision(&table, row_id, audit_id)?)
     })
     .await
@@ -439,7 +448,7 @@ pub async fn restore_record_revision(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn backup_workspace(state: State<'_, AppState>, path: String) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         workspace.snapshot_to(&path)?;
         Ok(())
     })
@@ -448,7 +457,7 @@ pub async fn backup_workspace(state: State<'_, AppState>, path: String) -> Resul
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn integrity_check(state: State<'_, AppState>) -> Result<IntegrityReportDto, ApiError> {
-    run_db(&state, |workspace| {
+    run_read(&state, |workspace| {
         Ok(IntegrityReportDto::from(workspace.integrity_check()?))
     })
     .await
@@ -476,7 +485,7 @@ pub async fn preview_import(
     format: String,
     options: ImportOptionsDto,
 ) -> Result<ImportPreviewDto, ApiError> {
-    run_db(&state, move |_workspace| {
+    run_read(&state, move |_workspace| {
         let options = options.to_options()?;
         let mut reader = open_file(&path)?;
         let mut adapter = adapter_for(&format)?;
@@ -495,7 +504,7 @@ pub async fn validate_import(
     mapping: BTreeMap<String, String>,
     options: ImportOptionsDto,
 ) -> Result<ImportValidationDto, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let options = options.to_options()?;
         let schema = workspace.schema()?;
         let table = schema
@@ -541,7 +550,7 @@ pub async fn apply_import(
     mapping: BTreeMap<String, String>,
     options: ImportOptionsDto,
 ) -> Result<ImportSummaryDto, ApiError> {
-    run_db(&state, move |workspace| {
+    run_write(&state, move |workspace| {
         let options = options.to_options()?;
         let schema = workspace.schema()?;
         let table = schema
@@ -632,7 +641,7 @@ pub async fn export_csv(
     path: String,
     query: PageQuery,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let table = schema
             .table(&query.table)
@@ -683,7 +692,7 @@ pub async fn export_json(
     path: String,
     query: PageQuery,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let file = File::create(&path)?;
         let mut out = BufWriter::new(file);
         out.write_all(b"[\n")?;
@@ -718,7 +727,7 @@ pub async fn export_json(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn export_sql(state: State<'_, AppState>, path: String) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         workspace.export_sql(&path)?;
         Ok(())
     })
@@ -790,7 +799,7 @@ pub async fn render_form_html(
     layout_id: Option<String>,
     options: PrintOptionsDto,
 ) -> Result<String, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let definition = schema
             .table(&table)
@@ -814,7 +823,7 @@ pub async fn render_table_html(
     query: PageQuery,
     options: PrintOptionsDto,
 ) -> Result<TableHtmlResultDto, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let (rows, truncated) = collect_rows_bounded(workspace, &query, 25_000)?;
         let html = slab_print::render_table_html_with_status(
@@ -842,7 +851,7 @@ pub async fn export_form_pdf(
     layout_id: Option<String>,
     options: PrintOptionsDto,
 ) -> Result<(), ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let definition = schema
             .table(&table)
@@ -864,7 +873,7 @@ pub async fn export_table_pdf(
     query: PageQuery,
     options: PrintOptionsDto,
 ) -> Result<TablePdfResultDto, ApiError> {
-    run_db(&state, move |workspace| {
+    run_read(&state, move |workspace| {
         let schema = workspace.schema()?;
         let mut report = slab_print::TableReport::new(&schema, &table, &options.to_options())?;
         let mut query = query;

@@ -1,109 +1,141 @@
-//! A worker thread that exclusively owns the SQLite workspace.
+//! Concurrent database state for the Tauri shell.
+//!
+//! Writes are serialized behind one writer mutex. Reads lease a read-only
+//! `Workspace` from a bounded pool, so pagination, search, history, and PDF
+//! reads run on their own WAL connections while an import or schema write is
+//! still in flight. `Workspace` itself remains single-threaded; the shell owns
+//! the synchronization boundary.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use slab_storage::{QueryCancel, Workspace};
 use slab_sync::HybridLogicalClock;
 
 use crate::dto::WorkspaceInfoDto;
 use crate::error::ApiError;
 
-type Work = Box<dyn FnOnce(&mut Option<Workspace>) -> Result<ApiErrorOrJson, ApiError> + Send>;
-type ApiErrorOrJson = String;
+const READER_POOL_SIZE: usize = 4;
 
-struct Job {
-    work: Work,
-    reply: Sender<Result<String, ApiError>>,
-}
-
-/// Handle to the database worker.
+/// Handle to the shared workspace state.
 pub struct DbHandle {
-    sender: Mutex<Option<Sender<Job>>>,
-    join: Mutex<Option<JoinHandle<()>>>,
+    writer: Mutex<Option<Workspace>>,
+    readers: Mutex<Vec<Workspace>>,
+    path: Mutex<Option<PathBuf>>,
+    lifecycle: RwLock<()>,
     cancel: Arc<QueryCancel>,
+    generation: AtomicU64,
+    read_gate: ReadGate,
 }
 
 impl DbHandle {
-    /// Starts the worker thread.
+    /// Creates an empty handle.
     pub fn new() -> Result<Self, ApiError> {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let join = thread::Builder::new()
-            .name("slabbase-db".into())
-            .spawn(move || run_worker(receiver))
-            .map_err(|error| {
-                ApiError::new(
-                    "SLAB_E_INTERNAL",
-                    format!("could not start the database thread: {error}"),
-                )
-            })?;
         Ok(Self {
-            sender: Mutex::new(Some(sender)),
-            join: Mutex::new(Some(join)),
+            writer: Mutex::new(None),
+            readers: Mutex::new(Vec::new()),
+            path: Mutex::new(None),
+            lifecycle: RwLock::new(()),
             cancel: Arc::new(QueryCancel::new()),
+            generation: AtomicU64::new(0),
+            read_gate: ReadGate::new(),
         })
     }
 
-    /// Interrupts a superseded interactive query without queueing work.
+    /// Interrupts a superseded interactive query without taking a lock.
     pub fn cancel_query(&self) -> bool {
         self.cancel.interrupt()
     }
 
     /// Opens a workspace, replacing any current one.
     pub fn open(&self, path: String) -> Result<WorkspaceInfoDto, ApiError> {
-        let cancel = Arc::clone(&self.cancel);
-        self.submit(move |slot| {
-            let mut workspace =
-                Workspace::open(&path, Box::new(HybridLogicalClock::new("desktop")))
-                    .map_err(ApiError::from)?;
-            workspace.set_cancel_handle(Arc::clone(&cancel));
-            let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
-            close_slot(slot)?;
-            *slot = Some(workspace);
-            Ok(info)
-        })
+        let _gate = self
+            .lifecycle
+            .write()
+            .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
+        let mut workspace = Workspace::open(&path, Box::new(HybridLogicalClock::new("desktop")))
+            .map_err(ApiError::from)?;
+        workspace.set_cancel_handle(Arc::clone(&self.cancel));
+        let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
+        self.clear_readers();
+        close_writer(&self.writer)?;
+        *self
+            .path
+            .lock()
+            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
+            Some(PathBuf::from(&path));
+        *self
+            .writer
+            .lock()
+            .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
+        self.fill_readers(Path::new(&path));
+        Ok(info)
     }
 
     /// Creates a workspace, replacing any current one.
     pub fn create(&self, path: String, name: String) -> Result<WorkspaceInfoDto, ApiError> {
-        let cancel = Arc::clone(&self.cancel);
-        self.submit(move |slot| {
-            close_slot(slot)?;
-            let mut workspace =
-                Workspace::create(&path, &name, Box::new(HybridLogicalClock::new("desktop")))
-                    .map_err(ApiError::from)?;
-            workspace.set_cancel_handle(cancel);
-            let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
-            *slot = Some(workspace);
-            Ok(info)
-        })
+        let _gate = self
+            .lifecycle
+            .write()
+            .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
+        self.clear_readers();
+        close_writer(&self.writer)?;
+        *self
+            .path
+            .lock()
+            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? = None;
+        let mut workspace =
+            Workspace::create(&path, &name, Box::new(HybridLogicalClock::new("desktop")))
+                .map_err(ApiError::from)?;
+        workspace.set_cancel_handle(Arc::clone(&self.cancel));
+        let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
+        *self
+            .path
+            .lock()
+            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
+            Some(PathBuf::from(&path));
+        *self
+            .writer
+            .lock()
+            .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
+        self.fill_readers(Path::new(&path));
+        Ok(info)
     }
 
     /// Closes the current workspace.
     pub fn close(&self) -> Result<(), ApiError> {
-        self.submit(|slot| {
-            close_slot(slot)?;
-            Ok(())
-        })
+        let _gate = self
+            .lifecycle
+            .write()
+            .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
+        self.clear_readers();
+        close_writer(&self.writer)?;
+        *self
+            .path
+            .lock()
+            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? = None;
+        Ok(())
     }
 
     /// Returns workspace info when one is open.
     pub fn info(&self) -> Result<Option<WorkspaceInfoDto>, ApiError> {
-        self.submit(|slot| match slot.as_ref() {
-            Some(workspace) => Ok(Some(WorkspaceInfoDto::from(
-                workspace.info().map_err(ApiError::from)?,
-            ))),
-            None => Ok(None),
-        })
+        let open = self
+            .path
+            .lock()
+            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))?
+            .is_some();
+        if !open {
+            return Ok(None);
+        }
+        Ok(Some(self.read(|workspace| {
+            Ok(WorkspaceInfoDto::from(workspace.info()?))
+        })?))
     }
 
-    /// Loads the sample workspace.
+    /// Loads the sample workspace. This is a write and serializes with writers.
     pub fn load_sample(&self) -> Result<WorkspaceInfoDto, ApiError> {
-        self.run(|workspace| {
+        self.write(|workspace| {
             workspace.seed_studio().map_err(ApiError::from)?;
             Ok(WorkspaceInfoDto::from(
                 workspace.info().map_err(ApiError::from)?,
@@ -111,76 +143,163 @@ impl DbHandle {
         })
     }
 
-    /// Runs a closure against an open workspace on the worker thread.
-    pub fn run<T, F>(&self, work: F) -> Result<T, ApiError>
+    /// Runs a read against a leased read-only workspace.
+    pub fn read<T, F>(&self, work: F) -> Result<T, ApiError>
     where
-        T: Serialize + DeserializeOwned + Send + 'static,
-        F: FnOnce(&mut Workspace) -> Result<T, ApiError> + Send + 'static,
+        T: Send,
+        F: FnOnce(&Workspace) -> Result<T, ApiError> + Send,
     {
-        self.submit(move |slot| {
-            let workspace = slot.as_mut().ok_or_else(ApiError::no_workspace)?;
-            work(workspace)
-        })
+        let _gate = self
+            .lifecycle
+            .read()
+            .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
+        let _permit = self.read_gate.acquire();
+        let path = self
+            .path
+            .lock()
+            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))?
+            .clone()
+            .ok_or_else(ApiError::no_workspace)?;
+        let generation = self.generation.load(Ordering::Acquire);
+        let workspace = self.checkout_reader(&path)?;
+        let outcome = work(&workspace);
+        self.checkin_reader(workspace, generation);
+        outcome
     }
 
-    fn submit<T, F>(&self, work: F) -> Result<T, ApiError>
+    /// Runs a write against the serialized writer workspace.
+    pub fn write<T, F>(&self, work: F) -> Result<T, ApiError>
     where
-        T: Serialize + DeserializeOwned + Send + 'static,
-        F: FnOnce(&mut Option<Workspace>) -> Result<T, ApiError> + Send + 'static,
+        T: Send,
+        F: FnOnce(&mut Workspace) -> Result<T, ApiError> + Send,
     {
-        let (reply, response) = mpsc::channel();
-        {
-            let guard = self
-                .sender
+        let _gate = self
+            .lifecycle
+            .read()
+            .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
+        let outcome = {
+            let mut writer = self
+                .writer
                 .lock()
-                .map_err(|_| ApiError::internal("database channel lock is poisoned"))?;
-            let sender = guard
-                .as_ref()
-                .ok_or_else(|| ApiError::internal("database worker is closed"))?;
-            sender
-                .send(Job {
-                    work: Box::new(move |slot| {
-                        let value = work(slot)?;
-                        serde_json::to_string(&value).map_err(ApiError::from)
-                    }),
-                    reply,
-                })
-                .map_err(|_| ApiError::internal("database worker is not running"))?;
+                .map_err(|_| ApiError::internal("writer lock is poisoned"))?;
+            let workspace = writer.as_mut().ok_or_else(ApiError::no_workspace)?;
+            work(workspace)
+        };
+        // A write may have changed the schema or audit metadata. Recycle idle
+        // reader connections so the next read sees a fresh schema snapshot.
+        self.clear_readers();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        outcome
+    }
+
+    fn checkout_reader(&self, path: &Path) -> Result<Workspace, ApiError> {
+        let pooled = self
+            .readers
+            .lock()
+            .map_err(|_| ApiError::internal("reader pool lock is poisoned"))?
+            .pop();
+        match pooled {
+            Some(workspace) => Ok(workspace),
+            None => self.open_reader(path),
         }
-        let json = response
-            .recv()
-            .map_err(|_| ApiError::internal("database worker stopped before replying"))??;
-        serde_json::from_str(&json).map_err(ApiError::from)
+    }
+
+    fn checkin_reader(&self, workspace: Workspace, generation: u64) {
+        if self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Ok(mut readers) = self.readers.lock()
+            && readers.len() < READER_POOL_SIZE
+        {
+            readers.push(workspace);
+        }
+    }
+
+    fn open_reader(&self, path: &Path) -> Result<Workspace, ApiError> {
+        let mut workspace =
+            Workspace::open_read_only(path, Box::new(HybridLogicalClock::new("desktop-read")))
+                .map_err(ApiError::from)?;
+        workspace.set_cancel_handle(Arc::clone(&self.cancel));
+        Ok(workspace)
+    }
+
+    fn fill_readers(&self, path: &Path) {
+        if let Ok(mut readers) = self.readers.lock() {
+            while readers.len() < READER_POOL_SIZE {
+                match self.open_reader(path) {
+                    Ok(workspace) => readers.push(workspace),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    fn clear_readers(&self) {
+        if let Ok(mut readers) = self.readers.lock() {
+            readers.clear();
+        }
     }
 }
 
-fn close_slot(slot: &mut Option<Workspace>) -> Result<(), ApiError> {
-    if let Some(workspace) = slot.take() {
+fn close_writer(slot: &Mutex<Option<Workspace>>) -> Result<(), ApiError> {
+    let workspace = slot
+        .lock()
+        .map_err(|_| ApiError::internal("writer lock is poisoned"))?
+        .take();
+    if let Some(workspace) = workspace {
         workspace.close().map_err(ApiError::from)?;
     }
     Ok(())
 }
 
-fn run_worker(receiver: Receiver<Job>) {
-    let mut workspace: Option<Workspace> = None;
-    while let Ok(job) = receiver.recv() {
-        let result = (job.work)(&mut workspace);
-        let _ = job.reply.send(result);
+/// Bounds concurrent read leases so the reader pool never grows past four.
+struct ReadGate {
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl ReadGate {
+    fn new() -> Self {
+        Self {
+            available: Mutex::new(READER_POOL_SIZE),
+            ready: Condvar::new(),
+        }
     }
-    if let Some(workspace) = workspace.take() {
-        let _ = workspace.close();
+
+    fn acquire(&self) -> ReadPermit<'_> {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *available == 0 {
+            available = self
+                .ready
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *available = available.saturating_sub(1);
+        ReadPermit { gate: self }
+    }
+}
+
+struct ReadPermit<'a> {
+    gate: &'a ReadGate,
+}
+
+impl Drop for ReadPermit<'_> {
+    fn drop(&mut self) {
+        let mut available = self
+            .gate
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = available.saturating_add(1);
+        self.gate.ready.notify_one();
     }
 }
 
 impl Drop for DbHandle {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.sender.lock() {
-            guard.take();
-        }
-        if let Ok(mut join) = self.join.lock()
-            && let Some(handle) = join.take()
-        {
-            let _ = handle.join();
-        }
+        let _ = self.close();
     }
 }

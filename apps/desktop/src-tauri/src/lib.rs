@@ -22,7 +22,8 @@ use tauri::{AppHandle, Emitter, Manager};
 pub use dto::*;
 pub use error::ApiError;
 
-/// Shared application state. The database itself lives on the worker thread.
+/// Shared application state. Writes serialize on one writer mutex; reads lease
+/// a bounded pool of read-only workspaces.
 pub struct AppState {
     /// Handle used by commands to submit work.
     pub db: Arc<worker::DbHandle>,
