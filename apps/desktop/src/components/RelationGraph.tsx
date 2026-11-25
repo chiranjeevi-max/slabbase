@@ -127,11 +127,12 @@ export function RelationGraph({
             >
               <span className="schema-node-name">{table.name}</span>
               <span className="schema-node-meta">
-                {table.columns.length} columns
-                <span className="dot-sep" />
-                {schema.relations.filter((relation) => relation.parent_table === table.name).length} out
-                <span className="dot-sep" />
-                {schema.relations.filter((relation) => relation.child_table === table.name).length} in
+                <span>{table.columns.length} columns</span>
+                <span className="schema-node-links">
+                  {schema.relations.filter((relation) => relation.parent_table === table.name).length} out
+                  <span className="dot-sep" />
+                  {schema.relations.filter((relation) => relation.child_table === table.name).length} in
+                </span>
               </span>
             </button>
           );

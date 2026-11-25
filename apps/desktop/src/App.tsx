@@ -144,7 +144,7 @@ export function App() {
   }, [isNarrowSidebar, sidebarOverlay]);
 
   const sidebarVisible = isNarrowSidebar ? sidebarOverlay : sidebarDocked;
-  const showSidebar = Boolean(info);
+  const showSidebar = Boolean(info) && (isNarrowSidebar || sidebarDocked);
   const reserveTrafficLights = native && (!info || isNarrowSidebar || !sidebarDocked);
   const inspectorMaxWidth = isInspectorOverlay
     ? INSPECTOR_MAX
@@ -762,7 +762,13 @@ function Sidebar({
 
 function Statusbar() {
   const info = useStore((state) => state.info);
+  const view = useStore((state) => state.view);
+  const schema = useStore((state) => state.schema);
   const activeTable = useStore((state) => state.activeTable);
+  const activeLayoutId = useStore((state) => state.activeLayoutId);
+  const formStatus = useStore((state) => state.formStatus);
+  const auditOpen = useStore((state) => state.auditOpen);
+  const audit = useStore((state) => state.audit);
   const rows = useStore((state) => state.rows);
   const elapsedMs = useStore((state) => state.elapsedMs);
   const integrity = useStore((state) => state.integrity);
@@ -788,20 +794,48 @@ function Statusbar() {
     : 0;
   const healthy = integrity === "ok";
   const showLatency = rows.length > 0 && elapsedMs > 0;
+  const formLayout =
+    schema?.layouts.find((layout) => layout.id === activeLayoutId) ??
+    schema?.layouts.find((layout) => layout.table === activeTable) ??
+    null;
+  const formName = formStatus?.name ?? formLayout?.name ?? "Form Studio";
+  const formItems = formStatus?.items ?? formLayout?.items.length ?? 0;
 
   return (
     <footer className="statusbar" data-testid="status-bar" aria-label="Status">
       <div className="status-left">
         {!info ? (
           <span>Empty workspace</span>
+        ) : auditOpen ? (
+          <span>{audit.length.toLocaleString()} audit entries</span>
+        ) : view === "form" ? (
+          <>
+            <span className="status-table">{formName}</span>
+            <span className="status-separator" aria-hidden="true">
+              ·
+            </span>
+            <span>{formItems.toLocaleString()} items</span>
+          </>
+        ) : view === "schema" ? (
+          <>
+            <span>{(schema?.tables.length ?? 0).toLocaleString()} tables</span>
+            <span className="status-separator" aria-hidden="true">
+              ·
+            </span>
+            <span>{(schema?.relations.length ?? 0).toLocaleString()} relations</span>
+          </>
         ) : activeTable ? (
           <>
             <span className="status-table">{activeTable}</span>
-            <span className="status-separator" />
+            <span className="status-separator" aria-hidden="true">
+              ·
+            </span>
             <span>{count.toLocaleString()} rows</span>
             {showLatency && (
               <>
-                <span className="status-separator" />
+                <span className="status-separator" aria-hidden="true">
+                  ·
+                </span>
                 <span className="status-mono">{elapsedMs.toFixed(1)} ms</span>
               </>
             )}

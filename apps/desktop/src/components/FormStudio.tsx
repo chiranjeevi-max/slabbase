@@ -20,6 +20,7 @@ export function FormStudio() {
   const activeLayoutId = useStore((state) => state.activeLayoutId);
   const inspectorOpen = useStore((state) => state.inspectorOpen);
   const saveLayout = useStore((state) => state.saveLayout);
+  const setFormStatus = useStore((state) => state.setFormStatus);
   const [layout, setLayout] = useState<Layout | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [snap, setSnap] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
@@ -46,6 +47,15 @@ export function FormStudio() {
     setSelectedId(null);
     setPortalRelation(relations[0]?.name ?? "");
   }, [schema, activeTable, activeLayoutId, relations]);
+
+  useEffect(() => {
+    if (!layout) {
+      setFormStatus(null);
+      return;
+    }
+    setFormStatus({ name: layout.name, items: layout.items.length });
+    return () => setFormStatus(null);
+  }, [layout, setFormStatus]);
 
   if (!table) {
     return <div className="canvas-empty">Select a table to design a form.</div>;

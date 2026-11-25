@@ -70,7 +70,10 @@ async function boot(page: Page, options: BootOptions = {}): Promise<string[]> {
   }
   if (options.tauri) {
     await page.addInitScript(() => {
-      window.__TAURI_INTERNALS__ = {};
+      window.__TAURI_INTERNALS__ = {
+        transformCallback: () => 0,
+        invoke: async () => 0,
+      };
     });
   }
   if (options.colorScheme) {
@@ -134,25 +137,30 @@ async function openInspector(page: Page): Promise<void> {
 const VIEWS: Array<{
   name: string;
   fixture?: "design-studio" | "empty";
+  status: string;
   open: (page: Page) => Promise<void>;
 }> = [
   {
     name: "empty workspace",
     fixture: "empty",
+    status: "No table selected",
     open: async () => {},
   },
   {
     name: "clients table",
+    status: "3 rows",
     open: async () => {},
   },
   {
     name: "clients with inspector",
+    status: "3 rows",
     open: async (page) => {
       await openInspector(page);
     },
   },
   {
     name: "invoices with portal",
+    status: "4 rows",
     open: async (page) => {
       await selectTable(page, "Invoices");
       await openInspector(page);
@@ -164,6 +172,7 @@ const VIEWS: Array<{
   },
   {
     name: "form studio",
+    status: "8 items",
     open: async (page) => {
       await page.getByRole("tab", { name: "Form" }).click();
       await expect(page.locator(".studio")).toBeVisible();
@@ -171,6 +180,7 @@ const VIEWS: Array<{
   },
   {
     name: "relations and schema",
+    status: "4 tables",
     open: async (page) => {
       await selectSidebarItem(page, "Relations & Schema");
       await expect(page.locator(".schema-view")).toBeVisible();
@@ -178,6 +188,7 @@ const VIEWS: Array<{
   },
   {
     name: "audit log",
+    status: "audit entries",
     open: async (page) => {
       await selectSidebarItem(page, "Audit Log");
       await expect(page.getByTestId("audit-drawer")).toBeVisible();
@@ -185,6 +196,7 @@ const VIEWS: Array<{
   },
   {
     name: "command palette",
+    status: "3 rows",
     open: async (page) => {
       await page.getByTestId("search-trigger").click();
       await expect(page.getByTestId("command-palette")).toBeVisible();
@@ -192,6 +204,7 @@ const VIEWS: Array<{
   },
   {
     name: "appearance popover",
+    status: "3 rows",
     open: async (page) => {
       await page.getByTestId("appearance-button").click();
       await expect(page.getByTestId("appearance-popover")).toBeVisible();
@@ -492,6 +505,7 @@ for (const theme of ["light", "dark"] as const) {
           fixture: view.fixture,
         });
         await view.open(page);
+        await expect(page.getByTestId("status-bar")).toContainText(view.status);
         await assertLayout(page);
         expect(errors, "console errors and warnings").toEqual([]);
       });
@@ -598,6 +612,34 @@ test.describe("geometry", () => {
     });
     expect(Math.abs(axis.idHeader - axis.idCell)).toBeLessThanOrEqual(1);
     expect(Math.abs(axis.budgetHeader - axis.budgetCell)).toBeLessThanOrEqual(1);
+    expect(errors).toEqual([]);
+  });
+
+  test("schema rows and graph metadata align", async ({ page }) => {
+    const errors = await boot(page);
+    await selectSidebarItem(page, "Relations & Schema");
+    await expect(page.locator(".schema-view")).toBeVisible();
+    const typeLefts = await page.locator(".manage-type").evaluateAll((elements) =>
+      elements.map((element) => element.getBoundingClientRect().left),
+    );
+    expect(typeLefts.length).toBeGreaterThan(0);
+    const first = typeLefts[0] ?? 0;
+    for (const left of typeLefts) {
+      expect(Math.abs(left - first)).toBeLessThanOrEqual(1);
+    }
+    const metadata = await page
+      .locator(".schema-node-meta")
+      .first()
+      .evaluate((element) =>
+        Array.from(element.children).map((child) => ({
+          top: child.getBoundingClientRect().top,
+          text: (child.textContent ?? "").trim(),
+        })),
+      );
+    expect(metadata).toHaveLength(2);
+    expect(metadata[1]?.text).toContain("out");
+    expect(metadata[1]?.text).toContain("in");
+    expect(metadata[1]?.top ?? 0).toBeGreaterThan(metadata[0]?.top ?? 0);
     expect(errors).toEqual([]);
   });
 
@@ -960,6 +1002,7 @@ test.describe("interaction polish", () => {
 
     if (viewport.width >= 1080) {
       await page.getByTestId("sidebar-header-toggle").click();
+      await expect(page.getByTestId("sidebar")).toBeHidden();
       await expect(page.getByTestId("toolbar")).toHaveClass(/traffic-space/);
       await expect
         .poll(() =>
@@ -1007,6 +1050,13 @@ test.describe("interaction polish", () => {
         const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
         return node ? node.getBoundingClientRect().x < 0 : true;
       });
+    } else {
+      const sidebar = page.getByTestId("sidebar");
+      await expect(sidebar).toBeVisible();
+      await page.getByTestId("sidebar-header-toggle").click();
+      await expect(sidebar).toBeHidden();
+      await page.getByTestId("sidebar-toggle").click();
+      await expect(sidebar).toBeVisible();
     }
 
     await page.locator('[data-testid="grid-row"]').first().click();

@@ -37,6 +37,11 @@ export interface Toast {
   code?: string;
 }
 
+export interface FormStatus {
+  name: string;
+  items: number;
+}
+
 const PAGE_SIZE = 200;
 
 const EMPTY_UNDO: UndoState = {
@@ -98,6 +103,7 @@ export interface AppStore {
   appearance: AppearancePrefs;
   resolvedTheme: ResolvedTheme;
   appearanceOpen: boolean;
+  formStatus: FormStatus | null;
   toast: Toast | null;
 
   activeTable: string | null;
@@ -143,6 +149,7 @@ export interface AppStore {
   clearToast: () => void;
   setAppearance: (patch: Partial<Omit<AppearancePrefs, "version">>) => void;
   setAppearanceOpen: (open: boolean) => void;
+  setFormStatus: (status: FormStatus | null) => void;
 
   selectTable: (table: string) => Promise<void>;
   selectLayout: (id: string) => void;
@@ -283,6 +290,7 @@ export const useStore = create<AppStore>((set, get) => {
     appearance: initialAppearance,
     resolvedTheme: resolveTheme(initialAppearance.theme),
     appearanceOpen: false,
+    formStatus: null,
     toast: null,
 
     activeTable: null,
@@ -418,6 +426,8 @@ export const useStore = create<AppStore>((set, get) => {
     },
 
     setAppearanceOpen: (open) => set({ appearanceOpen: open }),
+
+    setFormStatus: (status) => set({ formStatus: status }),
 
     selectTable: async (table) => {
       const state = get();
