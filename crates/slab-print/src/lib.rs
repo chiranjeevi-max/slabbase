@@ -1102,6 +1102,35 @@ mod tests {
     }
 
     #[test]
+    fn table_report_draws_a_visible_ceiling_warning() {
+        let mut schema = Schema::default();
+        schema.tables.push(Table {
+            id: "t_items".into(),
+            name: "Items".into(),
+            columns: vec![Column {
+                id: "c_name".into(),
+                table: "Items".into(),
+                name: "Name".into(),
+                ty: slab_core::ColumnType::Text,
+                required: false,
+                unique: false,
+                default: None,
+                position: 0,
+            }],
+            created_at: 0,
+        });
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("Name".to_owned(), Value::Text("Only".into()));
+        let mut report =
+            TableReport::new(&schema, "Items", &PrintOptions::default()).expect("report");
+        report.push(&[Record { id: 1, values }]);
+        report.mark_truncated();
+        let result = report.finish().expect("pdf");
+        assert!(result.truncated);
+        assert!(String::from_utf8_lossy(&result.pdf).contains("Export stopped at 25000 rows"));
+    }
+
+    #[test]
     fn currency_formats_with_code() {
         let currency = CurrencyCode::parse("USD").expect("usd");
         let money =
