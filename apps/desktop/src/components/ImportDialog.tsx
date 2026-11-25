@@ -204,7 +204,23 @@ export function ImportDialog() {
                 onChange={(event) =>
                   setOptions({
                     ...options,
-                    inferenceLimit: Number(event.target.value),
+                    inferenceLimit: Math.max(1, Number(event.target.value) || 1),
+                  })
+                }
+              />
+            </label>
+            <label className="compact-field">
+              <span>Batch</span>
+              <input
+                className="field-input small"
+                type="number"
+                min={1}
+                max={10_000}
+                value={options.batchSize}
+                onChange={(event) =>
+                  setOptions({
+                    ...options,
+                    batchSize: Math.max(1, Number(event.target.value) || 1),
                   })
                 }
               />
