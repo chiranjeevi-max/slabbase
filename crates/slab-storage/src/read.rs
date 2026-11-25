@@ -43,22 +43,34 @@ impl Workspace {
             .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
         let record = self.read_record(table_name, id)?;
         let mut bundle = RecordBundle::new(record);
-        let limit = portal_limit.clamp(1, MAX_PAGE_SIZE);
+        let maximum = portal_limit.clamp(1, 25_000);
         for relation in schema.child_relations(&table.name) {
-            let query = PageQuery {
-                table: relation.child_table.clone(),
-                limit,
-                cursor: None,
-                sort: Vec::new(),
-                filters: vec![slab_core::Filter {
-                    column: relation.child_column.clone(),
-                    op: FilterOp::Eq,
-                    value: Some(Value::Integer(id)),
-                }],
-                search: None,
-            };
-            let page = self.page(&query)?;
-            bundle.portals.insert(relation.name.clone(), page.rows);
+            let mut rows = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = self.page(&PageQuery {
+                    table: relation.child_table.clone(),
+                    limit: MAX_PAGE_SIZE,
+                    cursor,
+                    sort: Vec::new(),
+                    filters: vec![slab_core::Filter {
+                        column: relation.child_column.clone(),
+                        op: FilterOp::Eq,
+                        value: Some(Value::Integer(id)),
+                    }],
+                    search: None,
+                })?;
+                rows.extend(page.rows);
+                if rows.len() >= usize::try_from(maximum).unwrap_or(usize::MAX) {
+                    rows.truncate(usize::try_from(maximum).unwrap_or(usize::MAX));
+                    break;
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            bundle.portals.insert(relation.name.clone(), rows);
         }
         Ok(bundle)
     }
