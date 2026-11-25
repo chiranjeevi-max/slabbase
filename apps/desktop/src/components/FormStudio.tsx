@@ -32,6 +32,7 @@ export function FormStudio() {
   const canvasRef = useRef<HTMLDivElement>(null);
   const layoutRef = useRef<Layout | null>(null);
   const loadedLayout = useRef<{ key: string; updatedAt: number } | null>(null);
+  const dirtyRef = useRef(false);
   layoutRef.current = layout;
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
@@ -52,18 +53,24 @@ export function FormStudio() {
     if (
       loaded &&
       loaded.key === key &&
-      loaded.updatedAt === updatedAt &&
-      layoutRef.current !== null
+      layoutRef.current !== null &&
+      (dirtyRef.current || loaded.updatedAt === updatedAt)
     ) {
       // A schema refresh (undo, column add, relation change) replaces the
       // schema object but not this persisted layout. Keep the in-progress form
-      // and its selection instead of discarding unsaved drags.
+      // and its selection instead of discarding unsaved drags. Only resync the
+      // portal picker, which is not part of the layout.
+      const names = relations.map((relation) => relation.name);
+      setPortalRelation((current) =>
+        names.includes(current) ? current : (names[0] ?? ""),
+      );
       return;
     }
     setLayout(existing ?? null);
     setSelectedId(null);
     setPortalRelation(relations[0]?.name ?? "");
     loadedLayout.current = { key, updatedAt };
+    dirtyRef.current = false;
   }, [schema, activeTable, activeLayoutId, relations]);
 
   useEffect(() => {
@@ -112,7 +119,10 @@ export function FormStudio() {
     Math.max(0, ...layout.items.map((item) => item.y + item.h)) * ROW_HEIGHT + 80,
   );
 
-  const update = (next: Layout) => setLayout({ ...next, items: [...next.items] });
+  const update = (next: Layout) => {
+    dirtyRef.current = true;
+    setLayout({ ...next, items: [...next.items] });
+  };
 
   const updateItem = (id: string, patch: Partial<LayoutItem>) => {
     update({
@@ -172,9 +182,21 @@ export function FormStudio() {
   };
 
   const save = async () => {
+    const snapshot = { ...layout, updated_at: Date.now() };
+    dirtyRef.current = false;
     setSaving(true);
-    await saveLayout({ ...layout, updated_at: Date.now() });
+    const saved = await saveLayout(snapshot);
     setSaving(false);
+    if (saved) {
+      // Edits made while the save was in flight set dirtyRef again; the effect
+      // will preserve them instead of replacing the form with this snapshot.
+      loadedLayout.current = {
+        key: `${activeTable ?? ""}|${snapshot.id}`,
+        updatedAt: snapshot.updated_at,
+      };
+    } else {
+      dirtyRef.current = true;
+    }
   };
 
   return (
@@ -724,13 +746,24 @@ function ItemInspector({
               className="field-input inspector-number"
               type="number"
               min={key === "w" || key === "h" ? 1 : 0}
-              max={key === "x" ? 11 : key === "w" ? 12 : 40}
+              max={
+                key === "x"
+                  ? Math.max(0, 12 - item.w)
+                  : key === "w"
+                    ? Math.max(1, 12 - item.x)
+                    : 40
+              }
               value={item[key]}
               onChange={(event) => {
                 const parsed = Number(event.target.value);
                 if (!Number.isFinite(parsed)) return;
                 const minimum = key === "w" || key === "h" ? 1 : 0;
-                const maximum = key === "x" ? 11 : key === "w" ? 12 : 40;
+                const maximum =
+                  key === "x"
+                    ? Math.max(0, 12 - item.w)
+                    : key === "w"
+                      ? Math.max(1, 12 - item.x)
+                      : 40;
                 const value = Math.max(minimum, Math.min(maximum, Math.trunc(parsed)));
                 onChange({ [key]: value });
               }}

@@ -388,7 +388,16 @@ export function DataGrid() {
                             window.clearTimeout(selectTimer.current);
                             selectTimer.current = null;
                           }
-                          useStore.setState({ selectedId: record.id });
+                          const state = useStore.getState();
+                          if (state.inspectorOpen && !state.creating) {
+                            // The panel is already visible; load the row so the
+                            // heading and fields do not blank out after the
+                            // selection changes. An open New Record draft stays
+                            // in front and must not be cancelled by a grid click.
+                            void state.selectRow(record.id);
+                          } else {
+                            useStore.setState({ selectedId: record.id });
+                          }
                           setEditing({ id: record.id, column: column.name });
                         }}
                       >

@@ -361,7 +361,13 @@ export const useStore = create<AppStore>((set, get) => {
     initialize: async () => {
       pageRequest += 1;
       inspectorRequest += 1;
-      set({ booting: true, bundle: null, bundleTable: null, selectedId: null });
+      set({
+        booting: true,
+        bundle: null,
+        bundleTable: null,
+        selectedId: null,
+        loadingRows: false,
+      });
       try {
         const info = await api.workspaceInfo();
         if (!info) {
@@ -453,6 +459,7 @@ export const useStore = create<AppStore>((set, get) => {
           activeTable: null,
           view: "table",
           inspectorOpen: false,
+          loadingRows: false,
         });
       } catch (error) {
         notifyError(error);
@@ -488,6 +495,7 @@ export const useStore = create<AppStore>((set, get) => {
         rows: [],
         nextCursor: null,
         hasMore: true,
+        loadingRows: false,
         sort: [],
         filters: [],
         filterText: "",
@@ -763,13 +771,14 @@ export const useStore = create<AppStore>((set, get) => {
       const state = get();
       if (!state.activeTable) return false;
       const table = state.activeTable;
+      const token = inspectorRequest;
       try {
         const record = await api.insertRow(table, values);
         const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        if (get().activeTable !== table) {
-          // The user moved to another table while the insert was in flight.
-          // Commit the row, refresh what is on screen, but do not hijack the
-          // inspector with a record from the previous table.
+        if (get().activeTable !== table || token !== inspectorRequest) {
+          // The user moved to another table or selected another row while the
+          // insert was in flight. Commit the row, refresh what is on screen,
+          // but do not hijack the inspector.
           set({
             creating: false,
             undoState,
@@ -780,7 +789,7 @@ export const useStore = create<AppStore>((set, get) => {
           notify("success", "Record created");
           return true;
         }
-        const token = ++inspectorRequest;
+        const claim = ++inspectorRequest;
         set({
           creating: false,
           selectedId: record.id,
@@ -791,7 +800,7 @@ export const useStore = create<AppStore>((set, get) => {
         });
         await loadFirstPage();
         if (
-          token !== inspectorRequest ||
+          claim !== inspectorRequest ||
           get().activeTable !== table ||
           get().selectedId !== record.id
         ) {
@@ -813,8 +822,17 @@ export const useStore = create<AppStore>((set, get) => {
       try {
         await api.deleteRow(table, id);
         const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        if (get().activeTable !== table) {
-          set({ undoState, info: info ?? get().info });
+        const current = get();
+        if (current.activeTable !== table) {
+          set({ undoState, info: info ?? current.info });
+          return;
+        }
+        if (current.selectedId !== id) {
+          // The user selected another row, or opened a draft, while the delete
+          // was in flight. Leave that selection alone.
+          set({ undoState, info: info ?? current.info });
+          await loadFirstPage();
+          notify("success", "Record deleted");
           return;
         }
         inspectorRequest += 1;
@@ -823,7 +841,7 @@ export const useStore = create<AppStore>((set, get) => {
           bundle: null,
           bundleTable: null,
           undoState,
-          info: info ?? get().info,
+          info: info ?? current.info,
           inspectorOpen: false,
         });
         await loadFirstPage();

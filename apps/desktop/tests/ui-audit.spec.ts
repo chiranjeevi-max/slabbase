@@ -1926,14 +1926,8 @@ test.describe("async races", () => {
   test("a stale inspector read cannot replace a newer table selection", async ({ page }) => {
     const errors = await boot(page);
 
-    const clientsRow = page.locator('[data-testid="grid-row"]').first();
-    const clientsName = (
-      await clientsRow.locator('[data-column="Name"] .cell-text').innerText()
-    ).trim();
-    await clientsRow.click();
-
-    // Arm the delay after the click but before the 180 ms inspector timer
-    // fires, so the delayed request is unambiguously the Clients read.
+    // Arm the delay before the click so the Clients read (whether the focus
+    // select or the 180 ms timer wins) is unambiguously the delayed one.
     await page.evaluate(() => {
       (
         window as unknown as {
@@ -1941,6 +1935,11 @@ test.describe("async races", () => {
         }
       ).__slabFixtureDelay = { command: "read_record", ms: 2_500, once: true };
     });
+    const clientsRow = page.locator('[data-testid="grid-row"]').first();
+    const clientsName = (
+      await clientsRow.locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+    await clientsRow.click();
     await page.waitForTimeout(300);
 
     await selectSidebarItem(page, "Invoices");
@@ -2007,20 +2006,47 @@ test.describe("form studio state", () => {
 
     const item = page.locator(".studio-item").first();
     await item.click();
-    const x = page.locator(".inspector-grid input").first();
-    await expect(x).toBeVisible();
-    await x.fill("3");
-    await expect(x).toHaveValue("3");
+    const y = page.locator(".inspector-grid input").nth(1);
+    await expect(y).toBeVisible();
+    await y.fill("5");
+    await expect(y).toHaveValue("5");
 
     // Blur the number input so Cmd+Z is an app undo, not native text undo.
     await item.click();
     await page.keyboard.press("Meta+z");
     await page.waitForTimeout(500);
 
-    // The undo refreshed the schema object. The unsaved X position and the
+    // The undo refreshed the schema object. The unsaved Y position and the
     // item selection must still be there.
-    await expect(page.locator(".inspector-grid input").first()).toHaveValue("3");
+    await expect(page.locator(".inspector-grid input").nth(1)).toHaveValue("5");
     await expect(page.locator(".studio-item.selected")).toHaveCount(1);
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe("inspector state", () => {
+  test("double-clicking another row refreshes an open inspector", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "inspector double-click runs once at the laptop size");
+    const errors = await boot(page);
+    const rows = page.locator('[data-testid="grid-row"]');
+    const firstTitle = (
+      await rows.nth(0).locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+    const secondTitle = (
+      await rows.nth(1).locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+
+    await rows.nth(0).click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      firstTitle,
+    );
+
+    await rows.nth(1).locator('[data-column="Name"]').dblclick();
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      secondTitle,
+    );
     expect(errors).toEqual([]);
   });
 });
