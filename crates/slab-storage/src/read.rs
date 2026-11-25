@@ -503,7 +503,7 @@ impl Workspace {
         let state =
             self.compute_aggregate_state(schema, relation, child, column, parent_id, aggregate)?;
         let value = rollup::finalize_state(&state, aggregate, column)?;
-        if use_cache && column.ty.is_stored() {
+        if use_cache && column.ty.is_stored() && !self.read_only {
             rollup::store_computed(
                 self.write_conn(),
                 parent_table,

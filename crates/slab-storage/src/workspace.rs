@@ -103,7 +103,7 @@ const READER_POOL_SIZE: usize = 4;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A shared handle that lets the shell interrupt a superseded interactive
-/// query without entering the database worker queue.
+/// query without taking the writer lock.
 #[derive(Clone, Default)]
 pub struct QueryCancel {
     active: Arc<Mutex<Option<InterruptHandle>>>,
@@ -168,9 +168,9 @@ pub struct SnapshotReport {
 
 /// A live SQLite workspace.
 ///
-/// The type is not `Sync`. Callers that need concurrent access place it on one
-/// worker thread and communicate through a channel, which is what the desktop
-/// shell does.
+/// `Workspace` is not `Sync`. The storage crate keeps its connections
+/// single-threaded; the desktop shell wraps a writer in a mutex and leases
+/// read-only replicas behind another mutex.
 pub struct Workspace {
     pub(crate) conn: Connection,
     pub(crate) readers: Vec<Connection>,
@@ -185,6 +185,7 @@ pub struct Workspace {
     pub(crate) policy: Arc<dyn PolicyHook>,
     pub(crate) name: String,
     pub(crate) cancel: Arc<QueryCancel>,
+    pub(crate) read_only: bool,
 }
 
 /// A summary of the open workspace.
@@ -256,6 +257,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
             cancel: Arc::new(QueryCancel::new()),
+            read_only: false,
         };
         workspace.validate_schema()?;
         Ok(workspace)
@@ -335,6 +337,72 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name,
             cancel: Arc::new(QueryCancel::new()),
+            read_only: false,
+        };
+        workspace.validate_schema()?;
+        Ok(workspace)
+    }
+
+    /// Opens an existing workspace in read-only mode for a concurrent reader.
+    ///
+    /// The caller must have opened the file for writing first so migrations and
+    /// derived tables are current. This mode never checkpoints, migrates, or
+    /// writes rollup cache entries.
+    pub fn open_read_only(
+        path: impl AsRef<Path>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(StorageError::NotFound(path.display().to_string()));
+        }
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() == 0 {
+            return Err(StorageError::Workspace(format!(
+                "{} is empty; it is not a SlabBase workspace",
+                path.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(5_000))?;
+        let has_meta: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_slab_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| workspace_open_error(error, path))?;
+        if !has_meta {
+            return Err(StorageError::Workspace(format!(
+                "{} is not a SlabBase workspace",
+                path.display()
+            )));
+        }
+        configure_read_only(&conn)?;
+        let name = read_meta(&conn, "name")?.unwrap_or_else(|| "Workspace".into());
+        let format_version = read_meta(&conn, "format_version")?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if format_version > FORMAT_VERSION {
+            return Err(StorageError::Workspace(format!(
+                "workspace format {format_version} is newer than this build supports ({FORMAT_VERSION})"
+            )));
+        }
+        let mut workspace = Self {
+            conn,
+            readers: Vec::new(),
+            reader_cursor: Cell::new(0),
+            path: Some(path.to_path_buf()),
+            clock,
+            actor: "local".into(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            pending_import: None,
+            id_seed: 0,
+            policy: Arc::new(slab_core::NoopPolicy),
+            name,
+            cancel: Arc::new(QueryCancel::new()),
+            read_only: true,
         };
         workspace.validate_schema()?;
         Ok(workspace)
@@ -360,6 +428,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
             cancel: Arc::new(QueryCancel::new()),
+            read_only: false,
         })
     }
 
@@ -410,7 +479,7 @@ impl Workspace {
     }
 
     fn refresh_readers(&mut self) {
-        if self.path.is_none() {
+        if self.path.is_none() || self.read_only {
             return;
         }
         self.readers.clear();
@@ -722,7 +791,7 @@ impl Workspace {
     /// Checkpoints the WAL and consumes the workspace, leaving one
     /// self-contained `.slab` file.
     pub fn close(mut self) -> Result<(), StorageError> {
-        if self.path.is_some() {
+        if self.path.is_some() && !self.read_only {
             // Reader connections must close before the final checkpoint so
             // SQLite can truncate the WAL and delete both sidecars.
             self.readers.clear();
@@ -2053,6 +2122,16 @@ fn configure(conn: &Connection) -> Result<(), StorageError> {
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -64000;
+         PRAGMA mmap_size = 268435456;",
+    )?;
+    Ok(())
+}
+
+fn configure_read_only(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "PRAGMA query_only = ON;
          PRAGMA temp_store = MEMORY;
          PRAGMA cache_size = -64000;
          PRAGMA mmap_size = 268435456;",
