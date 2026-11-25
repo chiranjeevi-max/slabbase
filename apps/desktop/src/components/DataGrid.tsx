@@ -3,13 +3,13 @@ import { save } from "@tauri-apps/plugin-dialog";
 import type { Column } from "../bindings";
 import { api } from "../api";
 import { pageQueryFor, useStore } from "../store";
-import { cellText, isComputedColumn, isNumericColumn } from "../types";
+import { cellText, columnTypeGlyph, isComputedColumn, isNull, isNumericColumn } from "../types";
 import { FieldInput } from "./FieldInput";
 import { Icon } from "./Icons";
 
-const ROW_HEIGHT = 34;
-const HEADER_HEIGHT = 38;
-const COLUMN_WIDTH = 190;
+const ROW_HEIGHT = 29;
+const HEADER_HEIGHT = 28;
+const MIN_COLUMN_WIDTH = 150;
 
 export function DataGrid() {
   const schema = useStore((state) => state.schema);
@@ -17,7 +17,6 @@ export function DataGrid() {
   const rows = useStore((state) => state.rows);
   const hasMore = useStore((state) => state.hasMore);
   const loadingRows = useStore((state) => state.loadingRows);
-  const elapsedMs = useStore((state) => state.elapsedMs);
   const sort = useStore((state) => state.sort);
   const filterText = useStore((state) => state.filterText);
   const filterColumn = useStore((state) => state.filterColumn);
@@ -30,17 +29,15 @@ export function DataGrid() {
   const selectRow = useStore((state) => state.selectRow);
   const beginCreate = useStore((state) => state.beginCreate);
   const openSchema = useStore((state) => state.openSchema);
-  const setView = useStore((state) => state.setView);
-  const setPrintOpen = useStore((state) => state.setPrintOpen);
   const updateCell = useStore((state) => state.updateCell);
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
   const columns = table?.columns ?? [];
   const gridTemplate = useMemo(
-    () => `56px ${columns.map(() => `${COLUMN_WIDTH}px`).join(" ")}`,
+    () =>
+      `56px ${columns.map(() => `minmax(${MIN_COLUMN_WIDTH}px, 1fr)`).join(" ")}`.trim(),
     [columns],
   );
-  const minWidth = 56 + columns.length * COLUMN_WIDTH;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -136,71 +133,30 @@ export function DataGrid() {
 
   if (!table) {
     return (
-      <div className="grid-empty-state">
-        <Icon name="table" size={24} />
-        <h3>No table selected</h3>
-        <p>Create a table or load the sample workspace to begin.</p>
+      <div className="canvas-empty">
+        <span className="empty-glyph">
+          <Icon name="table" size={32} strokeWidth={1.2} />
+        </span>
+        <h2>No table selected</h2>
+        <p>Choose a table in the sidebar, or create one to begin.</p>
+        <div className="empty-actions">
+          <button type="button" className="button primary" onClick={() => openSchema("table")}>
+            New Table
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="data-grid">
-      <div className="grid-toolbar">
-        <div className="grid-title">
-          <h1>{table.name}</h1>
-          <span className="row-count">
-            {rows.length.toLocaleString()}
-            {hasMore ? "+" : ""} rows
-            <span className="dot" />
-            {elapsedMs.toFixed(1)} ms
-          </span>
-        </div>
-        <div className="toolbar-actions">
-          <button type="button" className="button ghost" onClick={() => setView("form")}>
-            <Icon name="form" size={14} /> Form
-          </button>
-          <button type="button" className="button ghost" onClick={() => openSchema("column")}>
-            <Icon name="sliders" size={14} /> Column
-          </button>
-          <div className="menu-anchor">
-            <button
-              type="button"
-              className="button ghost"
-              onClick={() => setExportOpen((open) => !open)}
-            >
-              <Icon name="download" size={14} /> Export
-              <Icon name="chevronDown" size={12} />
-            </button>
-            {exportOpen && (
-              <div className="menu" onMouseLeave={() => setExportOpen(false)}>
-                <button type="button" onClick={() => void exportTable("csv")}>
-                  CSV
-                </button>
-                <button type="button" onClick={() => void exportTable("json")}>
-                  JSON
-                </button>
-                <button type="button" onClick={() => void exportTable("sql")}>
-                  SQL script
-                </button>
-              </div>
-            )}
-          </div>
-          <button type="button" className="button ghost" onClick={() => setPrintOpen(true)}>
-            <Icon name="printer" size={14} /> Print
-          </button>
-          <button type="button" className="button primary" onClick={beginCreate}>
-            <Icon name="plus" size={14} /> New record
-          </button>
-        </div>
-      </div>
-
-      <div className="filter-bar">
-        <div className="filter-input">
-          <Icon name="search" size={14} />
+      <div className="table-toolbar">
+        <div className="table-filter">
+          <Icon name="search" size={13} strokeWidth={1.5} />
           <input
             value={filterDraft}
-            placeholder={`Filter by ${filterColumn}…`}
+            placeholder={`Filter ${filterColumn}`}
+            aria-label={`Filter by ${filterColumn}`}
             onChange={(event) => setFilterDraft(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") void applyFilter(filterDraft);
@@ -213,20 +169,22 @@ export function DataGrid() {
           {filterDraft && (
             <button
               type="button"
-              className="icon-button tiny"
+              className="icon-control micro"
               title="Clear filter"
+              aria-label="Clear filter"
               onClick={() => {
                 setFilterDraft("");
                 void clearFilter();
               }}
             >
-              <Icon name="x" size={12} />
+              <Icon name="x" size={10} />
             </button>
           )}
         </div>
         <select
-          className="select compact-select"
+          className="select toolbar-select"
           value={filterColumn}
+          aria-label="Filter column"
           onChange={(event) => setFilterColumn(event.target.value)}
         >
           {columns
@@ -237,28 +195,58 @@ export function DataGrid() {
               </option>
             ))}
         </select>
-        {sortSpec && (
-          <button type="button" className="chip" onClick={() => void setSort(sortSpec.column)}>
-            {sortSpec.column} {sortSpec.direction === "asc" ? "↑" : "↓"}
-          </button>
-        )}
         {filterText && (
-          <span className="chip muted">
+          <span className="filter-chip">
             contains “{filterText}”
-            <button type="button" className="chip-x" onClick={() => void clearFilter()}>
-              <Icon name="x" size={11} />
+            <button
+              type="button"
+              className="chip-x"
+              aria-label="Clear filter"
+              onClick={() => void clearFilter()}
+            >
+              <Icon name="x" size={9} />
             </button>
           </span>
         )}
-        <span className="filter-spacer" />
-        <span className="keyboard-hint">
-          <Icon name="keyboard" size={13} /> ↑↓ navigate · Enter edit
-        </span>
+        <span className="toolbar-spacer" />
+        <button
+          type="button"
+          className="button compact"
+          onClick={() => openSchema("column")}
+        >
+          + Column
+        </button>
+        <div className="menu-anchor">
+          <button
+            type="button"
+            className="button compact"
+            onClick={() => setExportOpen((open) => !open)}
+          >
+            Export
+            <Icon name="chevronDown" size={10} />
+          </button>
+          {exportOpen && (
+            <div className="menu" onMouseLeave={() => setExportOpen(false)}>
+              <button type="button" onClick={() => void exportTable("csv")}>
+                CSV
+              </button>
+              <button type="button" onClick={() => void exportTable("json")}>
+                JSON
+              </button>
+              <button type="button" onClick={() => void exportTable("sql")}>
+                SQL Script
+              </button>
+            </div>
+          )}
+        </div>
+        <button type="button" className="button primary compact" onClick={beginCreate}>
+          + New Record
+        </button>
       </div>
 
       <div
         ref={scrollRef}
-        className="grid-scroll"
+        className="grid-viewport"
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onScroll={(event) => {
@@ -273,32 +261,34 @@ export function DataGrid() {
           }
         }}
       >
-        <div className="grid-inner" style={{ minWidth }}>
+        <div className="grid-inner">
           <div className="grid-header" style={{ gridTemplateColumns: gridTemplate }}>
-            <div className="grid-head-cell id-cell">ID</div>
-            {columns.map((column) => (
-              <button
-                type="button"
-                className={`grid-head-cell ${
-                  sortSpec?.column === column.name ? "sorted" : ""
-                }`}
-                key={column.name}
-                onClick={() => void setSort(column.name)}
-                title={column.name}
-              >
-                <span className="head-name">
-                  {column.name}
-                  {isComputedColumn(column) && <span className="computed-mark"> ƒ</span>}
-                </span>
-                <span className="head-kind">{kindLabel(column)}</span>
-                {sortSpec?.column === column.name && (
-                  <Icon
-                    name={sortSpec.direction === "asc" ? "arrowUp" : "arrowDown"}
-                    size={11}
-                  />
-                )}
-              </button>
-            ))}
+            <div className="grid-head-cell id-header">
+              <span className="type-glyph">#</span>
+              <span>ID</span>
+            </div>
+            {columns.map((column) => {
+              const sorted = sortSpec?.column === column.name;
+              return (
+                <button
+                  type="button"
+                  className={`grid-head-cell column-header ${sorted ? "sorted" : ""}`}
+                  key={column.name}
+                  onClick={() => void setSort(column.name)}
+                  title={`${column.name} · ${kindLabel(column)}`}
+                >
+                  <span className="type-glyph">{columnTypeGlyph(column.ty)}</span>
+                  <span className="column-name">{column.name}</span>
+                  {sorted && (
+                    <Icon
+                      name={sortSpec.direction === "asc" ? "arrowUp" : "arrowDown"}
+                      size={10}
+                      className="sort-chevron"
+                    />
+                  )}
+                </button>
+              );
+            })}
           </div>
 
           <div className="grid-body" style={{ height: rows.length * ROW_HEIGHT }}>
@@ -306,15 +296,15 @@ export function DataGrid() {
               const index = start + offset;
               return (
                 <div
-                  className={`grid-row ${selectedId === record.id ? "selected" : ""} ${
-                    active?.row === index ? "active" : ""
-                  }`}
+                  className={`grid-row ${selectedId === record.id ? "selected" : ""}`}
                   key={record.id}
                   style={{
                     gridTemplateColumns: gridTemplate,
                     transform: `translateY(${index * ROW_HEIGHT}px)`,
                   }}
-                  onMouseDown={() => setActive({ row: index, column: active?.column ?? 0 })}
+                  onMouseDown={() =>
+                    setActive({ row: index, column: active?.column ?? 0 })
+                  }
                   onClick={() => void selectRow(record.id)}
                 >
                   <div className="grid-cell id-cell">{record.id}</div>
@@ -328,7 +318,9 @@ export function DataGrid() {
                         className={`grid-cell ${
                           isNumericColumn(column) ? "numeric" : ""
                         } ${isComputedColumn(column) ? "computed" : ""} ${
-                          active?.row === index && active.column === columnIndex ? "focused" : ""
+                          active?.row === index && active.column === columnIndex
+                            ? "focused"
+                            : ""
                         }`}
                         onDoubleClick={() => {
                           if (!isComputedColumn(column)) {
@@ -341,15 +333,23 @@ export function DataGrid() {
                             autoFocus
                             column={column}
                             value={value}
+                            onCancel={() => setEditing(null)}
                             onCommit={async (next) => {
-                              const ok = await updateCell(table.name, record.id, column.name, next);
+                              const ok = await updateCell(
+                                table.name,
+                                record.id,
+                                column.name,
+                                next,
+                              );
                               if (ok) setEditing(null);
                               return ok;
                             }}
                           />
+                        ) : isNull(value) ? (
+                          <span className="cell-null">NULL</span>
                         ) : (
                           <span className="cell-text" title={cellText(value)}>
-                            {cellText(value) || <span className="dash">—</span>}
+                            {cellText(value)}
                           </span>
                         )}
                       </div>
@@ -361,10 +361,11 @@ export function DataGrid() {
           </div>
         </div>
         {rows.length === 0 && !loadingRows && (
-          <div className="grid-empty">
-            <p>No records in {table.name}.</p>
+          <div className="grid-empty-state">
+            <Icon name="table" size={22} strokeWidth={1.3} />
+            <p>No records in {table.name}</p>
             <button type="button" className="button primary" onClick={beginCreate}>
-              <Icon name="plus" size={14} /> Create the first record
+              + New Record
             </button>
           </div>
         )}
@@ -382,6 +383,6 @@ function kindLabel(column: Column): string {
   const kind = column.ty.kind;
   if (kind === "formula" || kind === "lookup") return "computed";
   if (kind === "currency") return column.ty.currency;
-  if (kind === "decimal") return `dec ${column.ty.scale}`;
+  if (kind === "decimal") return `decimal ${column.ty.scale}`;
   return kind;
 }

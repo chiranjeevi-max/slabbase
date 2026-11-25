@@ -18,8 +18,8 @@ export function FormStudio() {
   const schema = useStore((state) => state.schema);
   const activeTable = useStore((state) => state.activeTable);
   const activeLayoutId = useStore((state) => state.activeLayoutId);
+  const inspectorOpen = useStore((state) => state.inspectorOpen);
   const saveLayout = useStore((state) => state.saveLayout);
-  const setView = useStore((state) => state.setView);
   const [layout, setLayout] = useState<Layout | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [snap, setSnap] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
@@ -48,25 +48,26 @@ export function FormStudio() {
   }, [schema, activeTable, activeLayoutId, relations]);
 
   if (!table) {
-    return <div className="grid-empty-state">Select a table first.</div>;
+    return <div className="canvas-empty">Select a table to design a form.</div>;
   }
 
   if (!layout) {
     return (
-      <div className="studio-empty">
-        <Icon name="form" size={24} />
+      <div className="canvas-empty">
+        <span className="empty-glyph">
+          <Icon name="form" size={32} strokeWidth={1.2} />
+        </span>
         <h2>No form for {table.name}</h2>
-        <p>Start with every field placed, then drag items onto the grid.</p>
-        <button
-          type="button"
-          className="button primary"
-          onClick={() => setLayout(defaultLayout(table))}
-        >
-          <Icon name="plus" size={14} /> Create form
-        </button>
-        <button type="button" className="button ghost" onClick={() => setView("table")}>
-          Back to table
-        </button>
+        <p>Start with every field placed, then drag items on the grid.</p>
+        <div className="empty-actions">
+          <button
+            type="button"
+            className="button primary"
+            onClick={() => setLayout(defaultLayout(table))}
+          >
+            Create Form
+          </button>
+        </div>
       </div>
     );
   }
@@ -148,198 +149,206 @@ export function FormStudio() {
 
   return (
     <div className="studio">
-      <div className="studio-main">
-        <div className="studio-toolbar">
-          <div className="studio-title">
-            <button type="button" className="text-button" onClick={() => setView("table")}>
-              <Icon name="chevronLeft" size={13} /> Table
-            </button>
-            <input
-              className="layout-name"
-              value={layout.name}
-              onChange={(event) => update({ ...layout, name: event.target.value })}
-            />
+      <div className="studio-toolbar">
+        <div className="studio-title">
+          <span className="studio-caption">{table.name}</span>
+          <input
+            className="layout-name"
+            value={layout.name}
+            aria-label="Form name"
+            onChange={(event) => update({ ...layout, name: event.target.value })}
+          />
+        </div>
+        <div className="studio-actions">
+          <select
+            className="select toolbar-select"
+            value={layout.id}
+            aria-label="Form layout"
+            onChange={(event) => useStore.getState().selectLayout(event.target.value)}
+          >
+            {schema?.layouts
+              .filter((candidate) => candidate.table === table.name)
+              .map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.name}
+                </option>
+              ))}
+            {layout.id === "" && <option value="">Unsaved Form</option>}
+          </select>
+          <button
+            type="button"
+            className="button compact"
+            onClick={() => setLayout(defaultLayout(table))}
+          >
+            New Form
+          </button>
+          <button
+            type="button"
+            className="button primary compact"
+            onClick={() => void save()}
+            disabled={saving}
+          >
+            {saving ? "Saving…" : "Save Form"}
+          </button>
+        </div>
+      </div>
+
+      <div className="studio-body">
+        <aside className="studio-palette" aria-label="Form elements">
+          <span className="palette-heading">Fields</span>
+          {available.length === 0 && <p className="studio-palette-empty">All fields placed</p>}
+          {available.map((column) => (
+            <div
+              key={column.name}
+              className="studio-source-item"
+              draggable
+              onDragStart={(event) => {
+                event.dataTransfer.setData("text/plain", `slab-column:${column.name}`);
+                setDragging(true);
+              }}
+              onDragEnd={() => setDragging(false)}
+              onClick={() => {
+                const item: LayoutItem = {
+                  id: newItemId("field"),
+                  kind: { kind: "field", column: column.name },
+                  x: 0,
+                  y: nextRow(layout),
+                  w: 6,
+                  h: 2,
+                };
+                update({ ...layout, items: [...layout.items, item] });
+                setSelectedId(item.id);
+              }}
+              title={`Add ${column.name}`}
+            >
+              <span className="palette-item-name">{column.name}</span>
+              <small>{columnTypeLabel(column.ty)}</small>
+            </div>
+          ))}
+
+          <span className="palette-heading">Elements</span>
+          <div
+            className="studio-source-item"
+            draggable
+            onDragStart={(event) => {
+              event.dataTransfer.setData("text/plain", "slab-kind:section");
+              setDragging(true);
+            }}
+            onDragEnd={() => setDragging(false)}
+            onClick={() => addKind("section")}
+          >
+            <span className="palette-item-name">Section</span>
+            <small>Heading</small>
           </div>
-          <div className="toolbar-actions">
-            <select
-              className="select"
-              value={layout.id}
-              onChange={(event) => useStore.getState().selectLayout(event.target.value)}
-            >
-              {schema?.layouts
-                .filter((candidate) => candidate.table === table.name)
-                .map((candidate) => (
-                  <option key={candidate.id} value={candidate.id}>
-                    {candidate.name}
-                  </option>
-                ))}
-              {layout.id === "" && <option value="">Unsaved form</option>}
-            </select>
-            <button
-              type="button"
-              className="button ghost"
-              onClick={() => setLayout(defaultLayout(table))}
-            >
-              <Icon name="form" size={14} /> New form
-            </button>
-            <button
-              type="button"
-              className="button primary"
-              onClick={() => void save()}
-              disabled={saving}
-            >
-              {saving ? "Saving…" : "Save form"}
-            </button>
+          <div
+            className="studio-source-item"
+            draggable
+            onDragStart={(event) => {
+              event.dataTransfer.setData("text/plain", "slab-kind:label");
+              setDragging(true);
+            }}
+            onDragEnd={() => setDragging(false)}
+            onClick={() => addKind("label")}
+          >
+            <span className="palette-item-name">Label</span>
+            <small>Static text</small>
+          </div>
+
+          <span className="palette-heading">Portal</span>
+          <select
+            className="select palette-select"
+            value={portalRelation}
+            aria-label="Child relation"
+            onChange={(event) => setPortalRelation(event.target.value)}
+          >
+            {relations.length === 0 && <option value="">No child relation</option>}
+            {relations.map((relation) => (
+              <option key={relation.name} value={relation.name}>
+                {relation.name}
+              </option>
+            ))}
+          </select>
+          <div
+            className={`studio-source-item ${!portalRelation ? "disabled" : ""}`}
+            draggable={Boolean(portalRelation)}
+            onDragStart={(event) => {
+              if (!portalRelation) return;
+              event.dataTransfer.setData("text/plain", "slab-kind:portal");
+              setDragging(true);
+            }}
+            onDragEnd={() => setDragging(false)}
+            onClick={() => portalRelation && addKind("portal")}
+          >
+            <span className="palette-item-name">Portal</span>
+            <small>Child table</small>
+          </div>
+        </aside>
+
+        <div className="canvas-wrap">
+          <div
+            ref={canvasRef}
+            className={`canvas ${dragging ? "dragging" : ""}`}
+            style={{ height: canvasHeight }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              const position = dropPosition(event);
+              if (position) setSnap({ x: position.x, y: position.y, w: 6, h: 2 });
+            }}
+            onDragLeave={() => setSnap(null)}
+            onDrop={handleDrop}
+            onClick={() => setSelectedId(null)}
+          >
+            {snap && (
+              <div
+                className="snap-preview"
+                style={{
+                  left: `${(snap.x / 12) * 100}%`,
+                  top: snap.y * ROW_HEIGHT,
+                  width: `${(snap.w / 12) * 100}%`,
+                  height: snap.h * ROW_HEIGHT,
+                }}
+              />
+            )}
+            {layout.items.map((item) => (
+              <StudioItem
+                key={item.id}
+                item={item}
+                table={table}
+                schemaRelations={relations}
+                schema={schema}
+                selected={item.id === selectedId}
+                onSelect={() => {
+                  setSelectedId(item.id);
+                  useStore.getState().setInspectorOpen(true);
+                }}
+                onDragState={setDragging}
+                onResize={(patch) => updateItem(item.id, patch)}
+                onGuide={setGuide}
+              />
+            ))}
+            {guide && (
+              <div
+                className="resize-guide-box"
+                style={{
+                  left: `${(guide.x / 12) * 100}%`,
+                  top: guide.y * ROW_HEIGHT,
+                  width: `${(guide.w / 12) * 100}%`,
+                  height: guide.h * ROW_HEIGHT - 4,
+                }}
+              >
+                <span>
+                  {guide.w} × {guide.h}
+                </span>
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="studio-body">
-          <aside className="palette">
-            <h3>Fields</h3>
-            {available.length === 0 && <p className="palette-empty">All fields placed.</p>}
-            {available.map((column) => (
-              <div
-                key={column.name}
-                className="palette-item"
-                draggable
-                onDragStart={(event) => {
-                  event.dataTransfer.setData("text/plain", `slab-column:${column.name}`);
-                  setDragging(true);
-                }}
-                onDragEnd={() => setDragging(false)}
-                onClick={() => {
-                  const item: LayoutItem = {
-                    id: newItemId("field"),
-                    kind: { kind: "field", column: column.name },
-                    x: 0,
-                    y: nextRow(layout),
-                    w: 6,
-                    h: 2,
-                  };
-                  update({ ...layout, items: [...layout.items, item] });
-                  setSelectedId(item.id);
-                }}
-              >
-                <span>{column.name}</span>
-                <small>{columnTypeLabel(column.ty)}</small>
-              </div>
-            ))}
-            <h3>Elements</h3>
-            <div
-              className="palette-item"
-              draggable
-              onDragStart={(event) => {
-                event.dataTransfer.setData("text/plain", "slab-kind:section");
-                setDragging(true);
-              }}
-              onDragEnd={() => setDragging(false)}
-              onClick={() => addKind("section")}
-            >
-              <span>Section</span>
-              <small>Rule and title</small>
-            </div>
-            <div
-              className="palette-item"
-              draggable
-              onDragStart={(event) => {
-                event.dataTransfer.setData("text/plain", "slab-kind:label");
-                setDragging(true);
-              }}
-              onDragEnd={() => setDragging(false)}
-              onClick={() => addKind("label")}
-            >
-              <span>Label</span>
-              <small>Static text</small>
-            </div>
-            <div className="portal-palette">
-              <select
-                className="select"
-                value={portalRelation}
-                onChange={(event) => setPortalRelation(event.target.value)}
-              >
-                {relations.length === 0 && <option value="">No child relation</option>}
-                {relations.map((relation) => (
-                  <option key={relation.name} value={relation.name}>
-                    {relation.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="palette-item"
-                disabled={!portalRelation}
-                draggable={Boolean(portalRelation)}
-                onDragStart={(event) => {
-                  event.dataTransfer.setData("text/plain", "slab-kind:portal");
-                  setDragging(true);
-                }}
-                onDragEnd={() => setDragging(false)}
-                onClick={() => addKind("portal")}
-              >
-                <span>Portal</span>
-                <small>Editable child table</small>
-              </button>
-            </div>
-          </aside>
-
-          <div className="canvas-wrap">
-            <div
-              ref={canvasRef}
-              className={`canvas ${dragging ? "dragging" : ""}`}
-              style={{ height: canvasHeight }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                const position = dropPosition(event);
-                if (position) setSnap({ x: position.x, y: position.y, w: 6, h: 2 });
-              }}
-              onDragLeave={() => setSnap(null)}
-              onDrop={handleDrop}
-              onClick={() => setSelectedId(null)}
-            >
-              {snap && (
-                <div
-                  className="snap-preview"
-                  style={{
-                    left: `${(snap.x / 12) * 100}%`,
-                    top: snap.y * ROW_HEIGHT,
-                    width: `${(snap.w / 12) * 100}%`,
-                    height: snap.h * ROW_HEIGHT,
-                  }}
-                />
-              )}
-              {layout.items.map((item) => (
-                <StudioItem
-                  key={item.id}
-                  item={item}
-                  table={table}
-                  schemaRelations={relations}
-                  schema={schema}
-                  selected={item.id === selectedId}
-                  onSelect={() => setSelectedId(item.id)}
-                  onDragState={setDragging}
-                  onResize={(patch) => updateItem(item.id, patch)}
-                  onGuide={setGuide}
-                />
-              ))}
-              {guide && (
-                <div
-                  className="resize-guide-box"
-                  style={{
-                    left: `${(guide.x / 12) * 100}%`,
-                    top: guide.y * ROW_HEIGHT,
-                    width: `${(guide.w / 12) * 100}%`,
-                    height: guide.h * ROW_HEIGHT - 4,
-                  }}
-                >
-                  <span>
-                    {guide.w} × {guide.h}
-                  </span>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <aside className="inspector">
+        {inspectorOpen && (
+          <aside className="studio-inspector" aria-label="Form item inspector">
+            <header className="inspector-header">
+              <span>Inspector</span>
+            </header>
             {selected ? (
               <ItemInspector
                 item={selected}
@@ -355,14 +364,29 @@ export function FormStudio() {
                 }}
               />
             ) : (
-              <div className="inspector-empty">
-                <Icon name="grid" size={20} />
-                <p>Select an item to adjust its place on the grid.</p>
-                <p className="muted">Drag from the palette, then drag items to snap them.</p>
+              <div className="inspector-body">
+                <span className="palette-heading">Form</span>
+                <div className="inspector-readout">
+                  <span>Layout</span>
+                  <span>{layout.name || "Unsaved"}</span>
+                </div>
+                <div className="inspector-readout">
+                  <span>Grid</span>
+                  <span>{layout.grid.columns} columns</span>
+                </div>
+                <div className="inspector-readout">
+                  <span>Row Height</span>
+                  <span>{ROW_HEIGHT} px</span>
+                </div>
+                <div className="inspector-readout">
+                  <span>Items</span>
+                  <span>{layout.items.length}</span>
+                </div>
+                <p className="inspector-hint">Select an item to adjust its grid position.</p>
               </div>
             )}
           </aside>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -579,7 +603,7 @@ function ItemInspector({
   const kind = item.kind;
   return (
     <div className="inspector-body">
-      <h3>Item</h3>
+      <span className="palette-heading">Item</span>
       <label className="inspector-field">
         <span>Type</span>
         <input className="field-input" value={kindLabel(kind)} readOnly />
@@ -643,9 +667,9 @@ function ItemInspector({
             </select>
           </label>
           <label className="inspector-field">
-            <span>Visible rows</span>
+            <span>Visible Rows</span>
             <input
-              className="field-input"
+              className="field-input inspector-number"
               type="number"
               value={kind.rows}
               onChange={(event) =>
@@ -655,12 +679,13 @@ function ItemInspector({
           </label>
         </>
       )}
+      <span className="palette-heading">Position</span>
       <div className="inspector-grid">
         {(["x", "y", "w", "h"] as const).map((key) => (
           <label className="inspector-field" key={key}>
             <span>{key.toUpperCase()}</span>
             <input
-              className="field-input"
+              className="field-input inspector-number"
               type="number"
               min={key === "w" || key === "h" ? 1 : 0}
               max={key === "x" ? 11 : key === "w" ? 12 : 40}
@@ -676,8 +701,8 @@ function ItemInspector({
           </label>
         ))}
       </div>
-      <button type="button" className="button danger-ghost" onClick={onRemove}>
-        <Icon name="trash" size={14} /> Remove item
+      <button type="button" className="button danger-ghost compact" onClick={onRemove}>
+        <Icon name="trash" size={13} strokeWidth={1.5} /> Remove Item
       </button>
     </div>
   );
@@ -765,7 +790,7 @@ function defaultLayout(table: Table): Layout {
   });
   return {
     id: "",
-    name: `${table.name} form`,
+    name: `${table.name} Form`,
     table: table.name,
     grid: { columns: 12, row_height: 28 },
     items,

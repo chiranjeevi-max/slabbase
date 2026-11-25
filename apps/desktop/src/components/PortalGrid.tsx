@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import type { Column, Cursor, Record as SlabRecord, Value } from "../bindings";
 import { api } from "../api";
 import { useStore } from "../store";
-import { columnTypeLabel, isComputedColumn } from "../types";
+import { columnTypeGlyph, isComputedColumn } from "../types";
+import { confirmDestructive } from "../native";
 import { fallbackValue } from "./DraftFields";
 import { FieldInput } from "./FieldInput";
 import { Icon } from "./Icons";
 
-const ROW_HEIGHT = 30;
-const PORTAL_HEIGHT = 240;
+const ROW_HEIGHT = 28;
+const PORTAL_HEIGHT = 224;
 const PAGE_SIZE = 100;
 
 interface PortalGridProps {
@@ -161,7 +162,7 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
     if (record) reload();
   };
 
-  const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 3);
+  const start = Math.max(0, Math.floor(Math.max(0, scrollTop - ROW_HEIGHT) / ROW_HEIGHT) - 3);
   const visibleCount = Math.ceil(PORTAL_HEIGHT / ROW_HEIGHT) + 6;
   const end = Math.min(rows.length, start + visibleCount);
   const bodyHeight = Math.max(
@@ -172,37 +173,36 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
   return (
     <div className="form-portal">
       <div className="portal-header">
-        <span>
+        <span className="portal-title">
           {relation.name}
           <small className="portal-count">
             {rows.length.toLocaleString()} of {total.toLocaleString()}
           </small>
         </span>
         <button type="button" className="text-button" onClick={() => void addRow()}>
-          <Icon name="plus" size={13} /> Add line
+          <Icon name="plus" size={11} strokeWidth={1.5} /> Add Line
         </button>
-      </div>
-      <div className="portal-grid-head" style={{ gridTemplateColumns: gridColumns(visible) }}>
-        {visible.map((column) => (
-          <span key={column.name} className={isComputedColumn(column) ? "computed" : ""}>
-            {column.name}
-            {isComputedColumn(column) && <span className="computed-mark"> ƒ</span>}
-            <small>{columnTypeLabel(column.ty)}</small>
-          </span>
-        ))}
-        <span aria-hidden="true" />
       </div>
       <div
         className="portal-scroll"
-        style={{ height: bodyHeight }}
+        style={{ height: bodyHeight + ROW_HEIGHT }}
         onScroll={(event) => {
           const element = event.currentTarget;
           setScrollTop(element.scrollTop);
           const remaining =
-            rows.length * ROW_HEIGHT - (element.scrollTop + element.clientHeight);
+            rows.length * ROW_HEIGHT - (element.scrollTop - ROW_HEIGHT + element.clientHeight);
           if (remaining < ROW_HEIGHT * 4) loadMore();
         }}
       >
+        <div className="portal-grid-head" style={{ gridTemplateColumns: gridColumns(visible) }}>
+          {visible.map((column) => (
+            <span key={column.name} className={isComputedColumn(column) ? "computed" : ""}>
+              <span className="type-glyph">{columnTypeGlyph(column.ty)}</span>
+              <span className="portal-column-name">{column.name}</span>
+            </span>
+          ))}
+          <span aria-hidden="true" />
+        </div>
         <div className="portal-spacer" style={{ height: rows.length * ROW_HEIGHT }}>
           {rows.slice(start, end).map((row, offset) => {
             const index = start + offset;
@@ -234,22 +234,30 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
                 <div className="portal-grid-cell portal-actions">
                   <button
                     type="button"
-                    className="icon-button tiny"
+                    className="icon-control micro"
                     title="Delete line"
+                    aria-label="Delete line"
                     onClick={() => {
-                      if (!window.confirm("Delete this line?")) return;
-                      void useStore
-                        .getState()
-                        .deletePortalRow(child.name, row.id)
-                        .then((ok) => {
-                          if (ok) {
-                            setRows((current) => current.filter((candidate) => candidate.id !== row.id));
-                            setTotal((current) => Math.max(0, current - 1));
-                          }
-                        });
+                      void (async () => {
+                        const ok = await confirmDestructive(
+                          "Delete this line? Undo can restore it.",
+                          "Delete Line",
+                          "Delete",
+                        );
+                        if (!ok) return;
+                        const deleted = await useStore
+                          .getState()
+                          .deletePortalRow(child.name, row.id);
+                        if (deleted) {
+                          setRows((current) =>
+                            current.filter((candidate) => candidate.id !== row.id),
+                          );
+                          setTotal((current) => Math.max(0, current - 1));
+                        }
+                      })();
                     }}
                   >
-                    <Icon name="x" size={12} />
+                    <Icon name="x" size={10} />
                   </button>
                 </div>
               </div>
@@ -257,18 +265,16 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
           })}
         </div>
         {rows.length === 0 && !loading && (
-          <div className="portal-empty">
-            {error ?? "No child rows yet."}
-          </div>
+          <div className="portal-empty">{error ?? "No child rows"}</div>
         )}
         {loading && (
           <div className="portal-loading">
-            <span className="loader" /> Loading lines
+            <span className="loader" /> Loading
           </div>
         )}
         {hasMore && !loading && (
           <button type="button" className="portal-more" onClick={loadMore}>
-            Load more
+            Load More
           </button>
         )}
       </div>
@@ -279,7 +285,14 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
 function gridColumns(columns: Column[]): string {
   if (columns.length === 0) return "1fr 26px";
   return `${columns
-    .map((_, index) => (index === 0 ? "minmax(100px, 1.3fr)" : "minmax(64px, 1fr)"))
+    .map((column, index) => {
+      const kind = column.ty.kind;
+      if (index === 0) return "minmax(96px, 1.4fr)";
+      if (kind === "date" || kind === "timestamp") return "minmax(104px, 1.1fr)";
+      if (kind === "select") return "minmax(76px, 0.9fr)";
+      if (kind === "currency" || kind === "decimal" || kind === "integer") return "minmax(88px, 1fr)";
+      return "minmax(88px, 1fr)";
+    })
     .join(" ")} 26px`;
 }
 

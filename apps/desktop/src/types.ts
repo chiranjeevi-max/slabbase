@@ -63,8 +63,7 @@ export function isComputedColumn(column: Column): boolean {
   return kind === "formula" || kind === "lookup";
 }
 
-export function columnTypeLabel(ty: ColumnType): string {
-  switch (ty.kind) {
+export function columnTypeLabel(ty: ColumnType): string {  switch (ty.kind) {
     case "text":
       return "Text";
     case "integer":
@@ -87,6 +86,22 @@ export function columnTypeLabel(ty: ColumnType): string {
       return "Formula";
     case "lookup":
       return "Rollup";
+  }
+}
+
+export function columnTypeGlyph(ty: ColumnType): string {
+  switch (ty.kind) {
+    case "currency":
+      return "$";
+    case "integer":
+    case "decimal":
+      return "#";
+    case "formula":
+      return "fx";
+    case "lookup":
+      return "→";
+    default:
+      return "Aa";
   }
 }
 

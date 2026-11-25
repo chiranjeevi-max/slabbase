@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   Aggregate,
   ColumnDraft,
@@ -10,9 +10,8 @@ import type {
 } from "../bindings";
 import { useStore } from "../store";
 import { Icon } from "./Icons";
-import { SchemaManage } from "./SchemaManage";
 
-type Tab = "table" | "column" | "relation" | "map" | "manage";
+type Tab = "table" | "column" | "relation";
 type Kind =
   | "text"
   | "integer"
@@ -59,6 +58,7 @@ export function SchemaDialog() {
   const initialTab = useStore((state) => state.schemaTab);
   const schema = useStore((state) => state.schema);
   const activeTable = useStore((state) => state.activeTable);
+  const targetTable = useStore((state) => state.schemaTargetTable);
   const setOpen = useStore((state) => state.setSchemaOpen);
   const createTable = useStore((state) => state.createTable);
   const addColumn = useStore((state) => state.addColumn);
@@ -82,12 +82,18 @@ export function SchemaDialog() {
   useEffect(() => {
     if (!open) return;
     setTab(initialTab);
-    setColumnTable((current) => current || activeTable || schema?.tables[0]?.name || "");
+    const parent = targetTable || activeTable || schema?.tables[0]?.name || "";
+    setColumnTable(parent);
     if (schema && schema.tables.length >= 2) {
-      setParentTable((current) => current || schema.tables[0]?.name || "");
-      setChildTable((current) => current || schema.tables[1]?.name || "");
+      setParentTable(parent);
+      setChildTable(
+        schema.tables.find((table) => table.name !== parent)?.name ??
+          schema.tables[1]?.name ??
+          "",
+      );
+      setChildColumn("");
     }
-  }, [open, initialTab, activeTable, schema]);
+  }, [open, initialTab, activeTable, schema, targetTable]);
 
   if (!open) return null;
 
@@ -152,26 +158,31 @@ export function SchemaDialog() {
     >
       <div className="modal schema-modal" role="dialog" aria-modal="true" aria-label="Schema">
         <header className="modal-header">
-          <div>
+          <div className="modal-title">
             <span className="eyebrow">Schema</span>
-            <h2>Structure</h2>
+            <h2>{tab === "table" ? "New Table" : tab === "column" ? "Add Column" : "New Relation"}</h2>
           </div>
-          <button type="button" className="icon-button" onClick={() => setOpen(false)}>
-            <Icon name="x" size={15} />
+          <button
+            type="button"
+            className="icon-control"
+            onClick={() => setOpen(false)}
+            aria-label="Close"
+          >
+            <Icon name="x" size={14} strokeWidth={1.5} />
           </button>
         </header>
-        <div className="tabs">
+        <div className="tabs" role="tablist" aria-label="Schema">
           {(
             [
-              ["table", "New table"],
-              ["column", "Add column"],
-              ["relation", "Relation"],
-              ["map", "Map"],
-              ["manage", "Manage"],
+              ["table", "New Table"],
+              ["column", "Add Column"],
+              ["relation", "New Relation"],
             ] as const
           ).map(([value, label]) => (
             <button
               type="button"
+              role="tab"
+              aria-selected={tab === value}
               key={value}
               className={`tab ${tab === value ? "active" : ""}`}
               onClick={() => setTab(value)}
@@ -303,7 +314,7 @@ export function SchemaDialog() {
                 ))}
               </div>
               <footer className="modal-footer">
-                <button type="button" className="button ghost" onClick={() => setOpen(false)}>
+                <button type="button" className="button" onClick={() => setOpen(false)}>
                   Cancel
                 </button>
                 <button type="submit" className="button primary" disabled={busy}>
@@ -389,7 +400,7 @@ export function SchemaDialog() {
                 </label>
               </div>
               <footer className="modal-footer">
-                <button type="button" className="button ghost" onClick={() => setOpen(false)}>
+                <button type="button" className="button" onClick={() => setOpen(false)}>
                   Cancel
                 </button>
                 <button type="submit" className="button primary" disabled={busy}>
@@ -480,7 +491,7 @@ export function SchemaDialog() {
                 </select>
               </label>
               <footer className="modal-footer">
-                <button type="button" className="button ghost" onClick={() => setOpen(false)}>
+                <button type="button" className="button" onClick={() => setOpen(false)}>
                   Cancel
                 </button>
                 <button
@@ -492,27 +503,6 @@ export function SchemaDialog() {
                 </button>
               </footer>
             </form>
-          )}
-
-          {tab === "manage" && (
-            <SchemaManage
-              schema={schema}
-              activeTable={columnTable}
-              onTableSelected={(name) => setColumnTable(name)}
-              onClose={() => setOpen(false)}
-            />
-          )}
-
-          {tab === "map" && (
-            <SchemaMap
-              schema={schema}
-              activeTable={columnTable}
-              onSelect={(name) => {
-                setColumnTable(name);
-                setTab("column");
-              }}
-              onAddRelation={() => setTab("relation")}
-            />
           )}
         </div>
       </div>
@@ -658,153 +648,6 @@ function ColumnOptions({
     );
   }
   return null;
-}
-
-function SchemaMap({
-  schema,
-  activeTable,
-  onSelect,
-  onAddRelation,
-}: {
-  schema: Schema | null;
-  activeTable: string;
-  onSelect: (name: string) => void;
-  onAddRelation: () => void;
-}) {
-  const canvasRef = useRef<HTMLDivElement>(null);
-  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
-  const [drag, setDrag] = useState<{
-    name: string;
-    pointerId: number;
-    offsetX: number;
-    offsetY: number;
-  } | null>(null);
-
-  useEffect(() => {
-    if (!schema) return;
-    const next: Record<string, { x: number; y: number }> = {};
-    schema.tables.forEach((table, index) => {
-      next[table.name] = {
-        x: 5 + (index % 3) * 30,
-        y: 7 + Math.floor(index / 3) * 30,
-      };
-    });
-    setPositions(next);
-  }, [schema]);
-
-  if (!schema || schema.tables.length === 0) {
-    return <p className="muted pad">Create a table to see the relation map.</p>;
-  }
-
-  const move = (event: React.PointerEvent) => {
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const x = Math.max(0, Math.min(76, ((event.clientX - rect.left) / rect.width) * 100 - drag.offsetX));
-    const y = Math.max(0, Math.min(82, ((event.clientY - rect.top) / rect.height) * 100 - drag.offsetY));
-    setPositions((current) => ({ ...current, [drag.name]: { x, y } }));
-  };
-
-  return (
-    <div className="schema-map-wrap">
-      <div className="schema-map-note">
-        <span>Drag tables to arrange the map. Lines are live relations.</span>
-        <button type="button" className="text-button" onClick={onAddRelation}>
-          <Icon name="plus" size={13} /> Add relation
-        </button>
-      </div>
-      <div
-        ref={canvasRef}
-        className="schema-map"
-        onPointerMove={move}
-        onPointerUp={() => setDrag(null)}
-        onPointerLeave={() => setDrag(null)}
-      >
-        <svg className="schema-lines" viewBox="0 0 100 100" preserveAspectRatio="none">
-          <defs>
-            <marker
-              id="schema-arrow"
-              markerWidth="6"
-              markerHeight="6"
-              refX="5"
-              refY="3"
-              orient="auto"
-            >
-              <path d="M0,0 L6,3 L0,6 Z" fill="var(--line-strong)" />
-            </marker>
-          </defs>
-          {schema.relations.map((relation) => {
-            const parent = positions[relation.parent_table];
-            const child = positions[relation.child_table];
-            if (!parent || !child) return null;
-            const x1 = parent.x + 23;
-            const y1 = parent.y + 9;
-            const x2 = child.x;
-            const y2 = child.y + 9;
-            const midX = (x1 + x2) / 2;
-            return (
-              <g key={relation.name}>
-                <path
-                  d={`M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`}
-                  className="schema-line"
-                  markerEnd="url(#schema-arrow)"
-                  vectorEffect="non-scaling-stroke"
-                />
-                <text x={midX} y={(y1 + y2) / 2 - 1.5} className="schema-line-label">
-                  {relation.name}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
-        {schema.tables.map((table) => {
-          const position = positions[table.name] ?? { x: 5, y: 7 };
-          const isActive = table.name === activeTable;
-          return (
-            <button
-              type="button"
-              key={table.id}
-              className={`schema-node ${isActive ? "active" : ""} ${
-                drag?.name === table.name ? "dragging" : ""
-              }`}
-              style={{ left: `${position.x}%`, top: `${position.y}%` }}
-              onPointerDown={(event) => {
-                event.currentTarget.setPointerCapture(event.pointerId);
-                const canvas = canvasRef.current?.getBoundingClientRect();
-                if (!canvas) return;
-                const pointerX = ((event.clientX - canvas.left) / canvas.width) * 100;
-                const pointerY = ((event.clientY - canvas.top) / canvas.height) * 100;
-                setDrag({
-                  name: table.name,
-                  pointerId: event.pointerId,
-                  offsetX: pointerX - position.x,
-                  offsetY: pointerY - position.y,
-                });
-              }}
-              onPointerMove={move}
-              onPointerUp={(event) => {
-                event.currentTarget.releasePointerCapture(event.pointerId);
-                setDrag(null);
-              }}
-              onClick={() => onSelect(table.name)}
-            >
-              <span className="schema-node-name">{table.name}</span>
-              <span className="schema-node-meta">
-                {table.columns.length} columns
-                <span className="dot-sep" />
-                {schema.relations.filter((relation) => relation.parent_table === table.name).length} out
-                <span className="dot-sep" />
-                {schema.relations.filter((relation) => relation.child_table === table.name).length} in
-              </span>
-            </button>
-          );
-        })}
-        {schema.relations.length === 0 && (
-          <p className="schema-map-empty">No relations yet. Add one to draw the first line.</p>
-        )}
-      </div>
-    </div>
-  );
 }
 
 function columnDraftFromForm(form: ColumnForm): ColumnDraft {

@@ -74,13 +74,25 @@ export function Palette() {
       },
       {
         id: "form",
-        label: "Open form studio",
+        label: "Open Form Studio",
         hint: "",
         run: () => state.setView("form"),
       },
       {
+        id: "schema",
+        label: "Open Relations & Schema",
+        hint: "",
+        run: () => state.setView("schema"),
+      },
+      {
+        id: "inspector",
+        label: "Toggle Inspector",
+        hint: "",
+        run: () => state.toggleInspector(),
+      },
+      {
         id: "audit",
-        label: "Audit log",
+        label: "Audit Log",
         hint: "",
         run: () => void state.openAudit(),
       },

@@ -29,7 +29,8 @@ export type IconName =
   | "arrowUp"
   | "arrowDown"
   | "spark"
-  | "keyboard";
+  | "keyboard"
+  | "panelRight";
 
 const paths: Record<IconName, ReactElement> = {
   table: (
@@ -110,6 +111,12 @@ const paths: Record<IconName, ReactElement> = {
     <>
       <rect x="1.8" y="4" width="12.4" height="8" rx="1.4" />
       <path d="M4 6.5h.01M6.5 6.5h.01M9 6.5h.01M11.5 6.5h.01M4.5 9.5h7" />
+    </>
+  ),
+  panelRight: (
+    <>
+      <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+      <path d="M9.5 3v10" />
     </>
   ),
 };

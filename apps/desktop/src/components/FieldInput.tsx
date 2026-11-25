@@ -7,6 +7,7 @@ interface FieldInputProps {
   column: Column;
   value: Value | null | undefined;
   onCommit: (value: Value) => Promise<boolean>;
+  onCancel?: () => void;
   compact?: boolean;
   autoFocus?: boolean;
   pulse?: boolean;
@@ -16,6 +17,7 @@ export function FieldInput({
   column,
   value,
   onCommit,
+  onCancel,
   compact = false,
   autoFocus = false,
   pulse = false,
@@ -40,7 +42,10 @@ export function FieldInput({
 
   const commit = async () => {
     if (committed.current) return;
-    if (text === inputText(column, value)) return;
+    if (text === inputText(column, value)) {
+      onCancel?.();
+      return;
+    }
     const parsed = parseInput(column, text);
     if (parsed === null) {
       useStore.getState().notify("error", `${column.name} expects a valid ${column.ty.kind} value`);
@@ -61,6 +66,7 @@ export function FieldInput({
     } else if (event.key === "Escape") {
       event.preventDefault();
       setText(inputText(column, value));
+      onCancel?.();
       inputRef.current?.blur();
     }
   };

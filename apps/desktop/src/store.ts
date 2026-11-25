@@ -5,6 +5,7 @@ import type {
   ColumnDraft,
   Filter,
   IndexSpec,
+  IntegrityReportDto,
   Layout,
   PageQuery,
   Record as SlabRecord,
@@ -98,7 +99,8 @@ export interface AppStore {
 
   activeTable: string | null;
   activeLayoutId: string | null;
-  view: "table" | "form";
+  view: "table" | "form" | "schema";
+  inspectorOpen: boolean;
   rows: SlabRecord[];
   nextCursor: PageQuery["cursor"];
   hasMore: boolean;
@@ -116,7 +118,8 @@ export interface AppStore {
 
   paletteOpen: boolean;
   schemaOpen: boolean;
-  schemaTab: "table" | "column" | "relation" | "manage";
+  schemaTab: "table" | "column" | "relation";
+  schemaTargetTable: string | null;
   importOpen: boolean;
   printOpen: boolean;
   auditOpen: boolean;
@@ -124,6 +127,8 @@ export interface AppStore {
   saveTick: number;
   historyTick: number;
   integrity: string;
+  integrityReport: IntegrityReportDto | null;
+  integrityCheckedAt: number | null;
 
   initialize: () => Promise<void>;
   openWorkspace: (path: string) => Promise<void>;
@@ -138,7 +143,9 @@ export interface AppStore {
 
   selectTable: (table: string) => Promise<void>;
   selectLayout: (id: string) => void;
-  setView: (view: "table" | "form") => void;
+  setView: (view: "table" | "form" | "schema") => void;
+  toggleInspector: () => void;
+  setInspectorOpen: (open: boolean) => void;
   setSort: (column: string) => Promise<void>;
   setFilterColumn: (column: string) => void;
   applyFilter: (text: string) => Promise<void>;
@@ -192,7 +199,7 @@ export interface AppStore {
 
   setPaletteOpen: (open: boolean) => void;
   setSchemaOpen: (open: boolean) => void;
-  openSchema: (tab: "table" | "column" | "relation" | "manage") => void;
+  openSchema: (tab: "table" | "column" | "relation", table?: string) => void;
   setImportOpen: (open: boolean) => void;
   setPrintOpen: (open: boolean) => void;
 }
@@ -276,6 +283,7 @@ export const useStore = create<AppStore>((set, get) => {
     activeTable: null,
     activeLayoutId: null,
     view: "table",
+    inspectorOpen: false,
     rows: [],
     nextCursor: null,
     hasMore: false,
@@ -294,6 +302,7 @@ export const useStore = create<AppStore>((set, get) => {
     paletteOpen: false,
     schemaOpen: false,
     schemaTab: "table",
+    schemaTargetTable: null,
     importOpen: false,
     printOpen: false,
     auditOpen: false,
@@ -301,6 +310,8 @@ export const useStore = create<AppStore>((set, get) => {
     saveTick: 0,
     historyTick: 0,
     integrity: "ok",
+    integrityReport: null,
+    integrityCheckedAt: null,
 
     initialize: async () => {
       set({ booting: true });
@@ -325,6 +336,7 @@ export const useStore = create<AppStore>((set, get) => {
           selectedId: null,
           bundle: null,
           creating: false,
+          inspectorOpen: false,
         });
         if (activeTable) await loadFirstPage();
       } catch (error) {
@@ -337,7 +349,7 @@ export const useStore = create<AppStore>((set, get) => {
       set({ busy: true });
       try {
         await api.openWorkspace(path);
-        set({ busy: false, view: "table", sort: [], filters: [], filterText: "" });
+        set({ busy: false, view: "table", sort: [], filters: [], filterText: "", inspectorOpen: false });
         await get().initialize();
         notify("success", "Workspace opened");
       } catch (error) {
@@ -350,7 +362,7 @@ export const useStore = create<AppStore>((set, get) => {
       set({ busy: true });
       try {
         await api.createWorkspace(path, name);
-        set({ busy: false, view: "table", sort: [], filters: [], filterText: "" });
+        set({ busy: false, view: "table", sort: [], filters: [], filterText: "", inspectorOpen: false });
         await get().initialize();
         notify("success", "Workspace created");
       } catch (error) {
@@ -363,7 +375,7 @@ export const useStore = create<AppStore>((set, get) => {
       set({ busy: true });
       try {
         await api.loadSample();
-        set({ busy: false, view: "table", sort: [], filters: [], filterText: "" });
+        set({ busy: false, view: "table", sort: [], filters: [], filterText: "", inspectorOpen: false });
         await get().initialize();
         notify("success", "Sample studio loaded");
       } catch (error) {
@@ -383,6 +395,7 @@ export const useStore = create<AppStore>((set, get) => {
           selectedId: null,
           activeTable: null,
           view: "table",
+          inspectorOpen: false,
         });
       } catch (error) {
         notifyError(error);
@@ -421,15 +434,29 @@ export const useStore = create<AppStore>((set, get) => {
         filterText: "",
         filterColumn: definition?.columns[0]?.name ?? "id",
         view: "table",
+        inspectorOpen: false,
       });
       await loadFirstPage();
     },
 
     selectLayout: (id) => {
-      set({ activeLayoutId: id, view: "form" });
+      set({ activeLayoutId: id, view: "form", inspectorOpen: true });
     },
 
-    setView: (view) => set({ view }),
+    setView: (view) => {
+      if (view === "table") {
+        const state = get();
+        set({
+          view,
+          inspectorOpen: state.selectedId !== null || state.creating,
+        });
+      } else if (view === "form") set({ view, inspectorOpen: true });
+      else set({ view, inspectorOpen: false });
+    },
+
+    toggleInspector: () => set((state) => ({ inspectorOpen: !state.inspectorOpen })),
+
+    setInspectorOpen: (open) => set({ inspectorOpen: open }),
 
     setSort: async (column) => {
       const state = get();
@@ -503,7 +530,7 @@ export const useStore = create<AppStore>((set, get) => {
     selectRow: async (id) => {
       const state = get();
       if (!state.activeTable) return;
-      set({ selectedId: id, creating: false });
+      set({ selectedId: id, creating: false, inspectorOpen: true });
       try {
         const record = await api.readRecord(state.activeTable, id);
         set({ bundle: { record, portals: {} } });
@@ -519,7 +546,7 @@ export const useStore = create<AppStore>((set, get) => {
       await get().selectRow(id);
     },
 
-    closeRecord: () => set({ selectedId: null, bundle: null }),
+    closeRecord: () => set({ selectedId: null, bundle: null, inspectorOpen: false }),
 
     refreshBundle: async () => {
       const state = get();
@@ -532,7 +559,7 @@ export const useStore = create<AppStore>((set, get) => {
       }
     },
 
-    beginCreate: () => set({ creating: true, selectedId: null, bundle: null }),
+    beginCreate: () => set({ creating: true, selectedId: null, bundle: null, inspectorOpen: true }),
 
     cancelCreate: () => set({ creating: false }),
 
@@ -565,7 +592,7 @@ export const useStore = create<AppStore>((set, get) => {
       if (!state.activeTable) return false;
       try {
         const record = await api.insertRow(state.activeTable, values);
-        set({ creating: false, selectedId: record.id });
+        set({ creating: false, selectedId: record.id, inspectorOpen: true });
         await loadFirstPage();
         const bundle = { record, portals: {} };
         const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
@@ -589,6 +616,7 @@ export const useStore = create<AppStore>((set, get) => {
           bundle: null,
           undoState,
           info: info ?? state.info,
+          inspectorOpen: false,
         });
         await loadFirstPage();
         notify("success", "Record deleted");
@@ -669,10 +697,20 @@ export const useStore = create<AppStore>((set, get) => {
         await api.renameTable(oldName, newName);
         await refreshMeta();
         if (state.activeTable === oldName) {
-          await get().selectTable(newName);
-        } else {
-          await get().loadFirstPage();
+          const schema = get().schema;
+          set({
+            activeTable: newName,
+            activeLayoutId: layoutFor(schema, newName)?.id ?? null,
+            rows: [],
+            nextCursor: null,
+            hasMore: true,
+            selectedId: null,
+            bundle: null,
+            creating: false,
+            inspectorOpen: false,
+          });
         }
+        await get().loadFirstPage();
         notify("success", `Table renamed to ${newName}`);
         return true;
       } catch (error) {
@@ -699,8 +737,16 @@ export const useStore = create<AppStore>((set, get) => {
       try {
         await api.dropTable(name);
         await refreshMeta();
-        const next = get().activeTable;
-        if (next) await get().selectTable(next);
+        set({
+          rows: [],
+          nextCursor: null,
+          hasMore: true,
+          selectedId: null,
+          bundle: null,
+          creating: false,
+          inspectorOpen: false,
+        });
+        if (get().activeTable) await get().loadFirstPage();
         notify("success", `Table ${name} dropped`);
         return true;
       } catch (error) {
@@ -790,6 +836,8 @@ export const useStore = create<AppStore>((set, get) => {
             report.integrity === "ok" && report.foreignKeyViolations === 0
               ? "ok"
               : "check",
+          integrityReport: report,
+          integrityCheckedAt: Date.now(),
         });
         notify(
           report.integrity === "ok" && report.foreignKeyViolations === 0 ? "success" : "error",
@@ -808,7 +856,12 @@ export const useStore = create<AppStore>((set, get) => {
 
     setPaletteOpen: (open) => set({ paletteOpen: open }),
     setSchemaOpen: (open) => set({ schemaOpen: open }),
-    openSchema: (tab) => set({ schemaOpen: true, schemaTab: tab }),
+    openSchema: (tab, table) =>
+      set({
+        schemaOpen: true,
+        schemaTab: tab,
+        schemaTargetTable: table ?? get().activeTable,
+      }),
     setImportOpen: (open) => set({ importOpen: open }),
     setPrintOpen: (open) => set({ printOpen: open }),
 

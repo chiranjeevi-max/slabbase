@@ -1,26 +1,48 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useStore } from "./store";
 import { Icon } from "./components/Icons";
 import { DataGrid } from "./components/DataGrid";
 import { RecordPanel } from "./components/RecordPanel";
 import { FormStudio } from "./components/FormStudio";
+import { SchemaView } from "./components/SchemaView";
 import { SchemaDialog } from "./components/SchemaDialog";
 import { ImportDialog } from "./components/ImportDialog";
 import { PrintDialog } from "./components/PrintDialog";
 import { Palette } from "./components/Palette";
 import { AuditDrawer } from "./components/AuditDrawer";
 import { Toasts } from "./components/Toasts";
+import { formatTimestamp } from "./types";
+
+const SIDEBAR_DEFAULT = 220;
+const INSPECTOR_DEFAULT = 340;
 
 export function App() {
   const theme = useStore((state) => state.theme);
   const booting = useStore((state) => state.booting);
   const info = useStore((state) => state.info);
   const view = useStore((state) => state.view);
+  const inspectorOpen = useStore((state) => state.inspectorOpen);
+  const tables = useStore((state) => state.schema?.tables.length ?? 0);
+
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readWidth("slabbase.sidebarWidth", SIDEBAR_DEFAULT, 180, 280),
+  );
+  const [inspectorWidth, setInspectorWidth] = useState(() =>
+    readWidth("slabbase.inspectorWidth", INSPECTOR_DEFAULT, 280, 460),
+  );
 
   useEffect(() => {
     document.documentElement.dataset["theme"] = theme;
   }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem("slabbase.sidebarWidth", String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    window.localStorage.setItem("slabbase.inspectorWidth", String(inspectorWidth));
+  }, [inspectorWidth]);
 
   useEffect(() => {
     void useStore.getState().initialize();
@@ -28,24 +50,30 @@ export function App() {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      const meta = event.metaKey || event.ctrlKey;
       const state = useStore.getState();
-      if (meta && event.key.toLowerCase() === "k") {
+      const meta = event.metaKey || event.ctrlKey;
+      const key = event.key.toLowerCase();
+      const editing = isTextEntry(event.target);
+
+      if (meta && key === "k") {
+        if (!state.info) return;
         event.preventDefault();
         state.setPaletteOpen(true);
-      } else if (meta && event.key.toLowerCase() === "z" && !event.shiftKey) {
+      } else if (meta && key === "z") {
+        if (editing || !state.info) return;
         event.preventDefault();
-        void state.undo();
-      } else if (meta && event.shiftKey && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        void state.redo();
-      } else if (meta && event.key.toLowerCase() === "n") {
+        if (event.shiftKey) void state.redo();
+        else void state.undo();
+      } else if (meta && key === "n") {
+        if (editing || !state.info) return;
         event.preventDefault();
         state.beginCreate();
-      } else if (meta && event.key.toLowerCase() === "p") {
+      } else if (meta && key === "p") {
+        if (!state.info) return;
         event.preventDefault();
         state.setPrintOpen(true);
-      } else if (meta && event.shiftKey && event.key.toLowerCase() === "i") {
+      } else if (meta && event.shiftKey && key === "i") {
+        if (!state.info) return;
         event.preventDefault();
         state.setImportOpen(true);
       } else if (event.key === "Escape") {
@@ -65,17 +93,43 @@ export function App() {
       <Titlebar />
       {booting ? (
         <div className="splash">
-          <BrandMark />
-          <p>Opening local workspace…</p>
+          <Icon name="database" size={24} />
+          <p>Opening workspace…</p>
         </div>
       ) : info ? (
         <>
           <div className="app-body">
-            <Sidebar />
+            <Sidebar width={sidebarWidth} />
+            <PaneResizer
+              side="left"
+              width={sidebarWidth}
+              min={180}
+              max={280}
+              onResize={setSidebarWidth}
+            />
             <main className={`workspace ${view === "form" ? "studio-view" : ""}`}>
-              {view === "form" ? <FormStudio /> : <DataGrid />}
+              {tables === 0 ? (
+                <EmptyWorkspace />
+              ) : view === "schema" ? (
+                <SchemaView />
+              ) : view === "form" ? (
+                <FormStudio />
+              ) : (
+                <DataGrid />
+              )}
             </main>
-            {view === "table" && <RecordPanel />}
+            {view === "table" && inspectorOpen && (
+              <>
+                <PaneResizer
+                  side="right"
+                  width={inspectorWidth}
+                  min={280}
+                  max={460}
+                  onResize={setInspectorWidth}
+                />
+                <RecordPanel width={inspectorWidth} />
+              </>
+            )}
           </div>
           <Statusbar />
         </>
@@ -94,248 +148,487 @@ export function App() {
 
 function Titlebar() {
   const info = useStore((state) => state.info);
+  const view = useStore((state) => state.view);
+  const activeTable = useStore((state) => state.activeTable);
+  const hasTables = useStore((state) => (state.schema?.tables.length ?? 0) > 0);
   const theme = useStore((state) => state.theme);
+  const inspectorOpen = useStore((state) => state.inspectorOpen);
   const undoState = useStore((state) => state.undoState);
   const setPaletteOpen = useStore((state) => state.setPaletteOpen);
+  const setView = useStore((state) => state.setView);
+  const toggleInspector = useStore((state) => state.toggleInspector);
   const toggleTheme = useStore((state) => state.toggleTheme);
-  const openAudit = useStore((state) => state.openAudit);
-  const backup = useStore((state) => state.backup);
+  const setImportOpen = useStore((state) => state.setImportOpen);
+  const setPrintOpen = useStore((state) => state.setPrintOpen);
+
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (event: MouseEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [menuOpen]);
+
+  const openExisting = async () => {
+    setMenuOpen(false);
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: "SlabBase workspace", extensions: ["slab"] }],
+    });
+    if (typeof path !== "string") return;
+    window.localStorage.setItem("slabbase.recent", path);
+    await useStore.getState().openWorkspace(path);
+  };
 
   const runBackup = async () => {
-    const name = info?.name.replace(/[^\w -]+/g, "") || "workspace";
+    setMenuOpen(false);
+    const name = info?.name.replace(/\.slab$/i, "") || "Workspace";
     const path = await saveDialog({
       defaultPath: `${name} backup.slab`,
       filters: [{ name: "SlabBase workspace", extensions: ["slab"] }],
     });
-    if (path) await backup(path);
+    if (path) await useStore.getState().backup(path);
+  };
+
+  const loadSample = async () => {
+    setMenuOpen(false);
+    await useStore.getState().loadSample();
   };
 
   return (
     <header className="titlebar" data-tauri-drag-region>
-      <div className="titlebar-left">
-        <BrandMark />
-        <span className="brand-name">SlabBase</span>
-        {info && (
-          <>
-            <span className="titlebar-divider" />
-            <span className="workspace-name" title={info.path ?? undefined}>
-              {info.name}
-            </span>
-            <span className="wal-badge" title={info.journalMode.toUpperCase()}>
-              WAL
-            </span>
-          </>
+      <div className="titlebar-left" data-tauri-drag-region>
+        {info ? (
+          <div className="workspace-anchor" ref={menuRef}>
+            <button
+              type="button"
+              className={`workspace-switcher ${menuOpen ? "open" : ""}`}
+              onClick={() => setMenuOpen((open) => !open)}
+              title={info.path ?? info.name}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+            >
+              <span className="workspace-name">{fileLabel(info.name)}</span>
+              <Icon name="chevronDown" size={11} strokeWidth={1.5} />
+            </button>
+            {menuOpen && (
+              <div className="menu workspace-menu" role="menu">
+                <button type="button" role="menuitem" onClick={() => void openExisting()}>
+                  <Icon name="folder" size={13} />
+                  <span>Open Workspace…</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => void loadSample()}>
+                  <Icon name="spark" size={13} />
+                  <span>Load Sample Workspace</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => void runBackup()}>
+                  <Icon name="download" size={13} />
+                  <span>Backup Snapshot…</span>
+                </button>
+                <div className="menu-separator" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="danger"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void useStore.getState().closeWorkspace();
+                  }}
+                >
+                  <Icon name="x" size={13} />
+                  <span>Close Workspace</span>
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <span className="titlebar-drag" data-tauri-drag-region />
         )}
       </div>
-      <button
-        type="button"
-        className="search-trigger"
-        onClick={() => setPaletteOpen(true)}
-        disabled={!info}
-      >
-        <Icon name="search" size={14} />
-        <span>{info ? "Search records or commands" : "Open a workspace"}</span>
-        <kbd>⌘K</kbd>
-      </button>
-      <div className="titlebar-actions">
+
+      <div className="titlebar-center">
+        {info && activeTable && (
+          <div className="view-switcher" role="tablist" aria-label="Workspace view">
+            {(
+              [
+                ["table", "Table"],
+                ["form", "Form"],
+                ["schema", "Schema"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                type="button"
+                role="tab"
+                key={value}
+                aria-selected={view === value}
+                className={view === value ? "active" : ""}
+                onClick={() => setView(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+        {info && (
+          <button
+            type="button"
+            className="search-trigger"
+            onClick={() => setPaletteOpen(true)}
+            title="Search records and commands (⌘K)"
+          >
+            <Icon name="search" size={13} strokeWidth={1.5} />
+            <span>Search</span>
+            <kbd>⌘K</kbd>
+          </button>
+        )}
+      </div>
+
+      <div className="titlebar-right">
         {info && (
           <>
             <button
               type="button"
-              className="icon-button"
-              title={undoState.undo_label ?? "Undo"}
+              className="icon-control"
+              title={`${undoState.undo_label ?? "Undo"} (⌘Z)`}
+              aria-label={undoState.undo_label ?? "Undo"}
               disabled={!undoState.can_undo}
               onClick={() => void useStore.getState().undo()}
             >
-              <Icon name="undo" size={15} />
+              <Icon name="undo" size={14} strokeWidth={1.5} />
             </button>
             <button
               type="button"
-              className="icon-button"
-              title={undoState.redo_label ?? "Redo"}
+              className="icon-control"
+              title={`${undoState.redo_label ?? "Redo"} (⇧⌘Z)`}
+              aria-label={undoState.redo_label ?? "Redo"}
               disabled={!undoState.can_redo}
               onClick={() => void useStore.getState().redo()}
             >
-              <Icon name="redo" size={15} />
+              <Icon name="redo" size={14} strokeWidth={1.5} />
             </button>
-            <span className="titlebar-divider" />
+            <span className="toolbar-divider" />
             <button
               type="button"
-              className="icon-button"
-              title="Audit log"
-              onClick={() => void openAudit()}
+              className="icon-control"
+              title="Import CSV or JSON (⇧⌘I)"
+              aria-label="Import"
+              disabled={!hasTables}
+              onClick={() => setImportOpen(true)}
             >
-              <Icon name="history" size={15} />
+              <Icon name="upload" size={14} strokeWidth={1.5} />
             </button>
             <button
               type="button"
-              className="icon-button"
-              title="Atomic backup"
-              onClick={() => void runBackup()}
+              className="icon-control"
+              title="Print or Export PDF (⌘P)"
+              aria-label="Print or Export PDF"
+              disabled={!activeTable}
+              onClick={() => setPrintOpen(true)}
             >
-              <Icon name="download" size={15} />
+              <Icon name="printer" size={14} strokeWidth={1.5} />
             </button>
           </>
         )}
         <button
           type="button"
-          className="icon-button"
-          title={theme === "light" ? "Switch to dark" : "Switch to light"}
+          className="icon-control"
+          title="Switch Appearance"
+          aria-label="Switch appearance"
           onClick={toggleTheme}
         >
-          <Icon name={theme === "light" ? "moon" : "sun"} size={15} />
+          <Icon name={theme === "light" ? "moon" : "sun"} size={14} strokeWidth={1.5} />
         </button>
+        {info && (
+          <button
+            type="button"
+            className={`icon-control ${inspectorOpen && view !== "schema" ? "active" : ""}`}
+            title={
+              view === "schema"
+                ? "Inspector is available in Table and Form views"
+                : inspectorOpen
+                  ? "Hide Inspector"
+                  : "Show Inspector"
+            }
+            aria-label="Toggle Inspector"
+            aria-pressed={inspectorOpen}
+            disabled={view === "schema"}
+            onClick={toggleInspector}
+          >
+            <Icon name="panelRight" size={14} strokeWidth={1.5} />
+          </button>
+        )}
       </div>
     </header>
   );
 }
 
-function Sidebar() {
+function Sidebar({ width }: { width: number }) {
   const schema = useStore((state) => state.schema);
   const info = useStore((state) => state.info);
+  const view = useStore((state) => state.view);
   const activeTable = useStore((state) => state.activeTable);
   const activeLayoutId = useStore((state) => state.activeLayoutId);
   const selectTable = useStore((state) => state.selectTable);
   const selectLayout = useStore((state) => state.selectLayout);
+  const setView = useStore((state) => state.setView);
   const openSchema = useStore((state) => state.openSchema);
-  const setImportOpen = useStore((state) => state.setImportOpen);
-  const setPrintOpen = useStore((state) => state.setPrintOpen);
   const openAudit = useStore((state) => state.openAudit);
-  const checkIntegrity = useStore((state) => state.checkIntegrity);
-  const closeWorkspace = useStore((state) => state.closeWorkspace);
-  const integrity = useStore((state) => state.integrity);
-  const theme = useStore((state) => state.theme);
 
   const counts = new Map(info?.tables.map((table) => [table.name, table.rowCount]) ?? []);
   const layouts = schema?.layouts.filter((layout) => layout.table === activeTable) ?? [];
 
   return (
-    <nav className="sidebar" aria-label="Tables and actions">
-      <section className="sidebar-section">
-        <div className="sidebar-heading">
+    <nav className="sidebar" style={{ width }} aria-label="Workspace">
+      <section className="source-section">
+        <div className="source-heading">
           <span>Tables</span>
           <button
             type="button"
-            className="icon-button tiny"
+            className="icon-control tiny"
             title="New table"
+            aria-label="New table"
             onClick={() => openSchema("table")}
           >
-            <Icon name="plus" size={13} />
+            <Icon name="plus" size={12} strokeWidth={1.5} />
           </button>
         </div>
-        <div className="table-list">
+        <div className="source-list">
           {schema?.tables.map((table) => (
             <button
               type="button"
               key={table.name}
-              className={`table-row ${activeTable === table.name ? "active" : ""}`}
+              className={`source-row ${
+                view === "table" && activeTable === table.name ? "active" : ""
+              }`}
               onClick={() => void selectTable(table.name)}
+              title={table.name}
             >
-              <Icon name="table" size={14} />
-              <span className="table-name">{table.name}</span>
-              <span className="table-count">{counts.get(table.name) ?? 0}</span>
+              <Icon name="table" size={14} strokeWidth={1.5} />
+              <span className="source-name">{table.name}</span>
+              <span className="source-count">
+                {(counts.get(table.name) ?? 0).toLocaleString()}
+              </span>
             </button>
           ))}
-          {schema?.tables.length === 0 && (
-            <p className="sidebar-empty">No tables yet.</p>
-          )}
+          {schema?.tables.length === 0 && <p className="source-empty">No tables yet</p>}
         </div>
       </section>
 
-      <section className="sidebar-section">
-        <div className="sidebar-heading">
+      <section className="source-section">
+        <div className="source-heading">
           <span>Forms</span>
           <button
             type="button"
-            className="icon-button tiny"
-            title="Form studio"
-            onClick={() => useStore.getState().setView("form")}
+            className="icon-control tiny"
+            title="New form"
+            aria-label="New form"
+            onClick={() => setView("form")}
           >
-            <Icon name="form" size={13} />
+            <Icon name="plus" size={12} strokeWidth={1.5} />
           </button>
         </div>
-        <div className="layout-list">
+        <div className="source-list">
           {layouts.map((layout) => (
             <button
               type="button"
               key={layout.id}
-              className={`layout-row ${activeLayoutId === layout.id ? "active" : ""}`}
+              className={`source-row ${
+                view === "form" && activeLayoutId === layout.id ? "active" : ""
+              }`}
               onClick={() => selectLayout(layout.id)}
+              title={layout.name}
             >
-              <Icon name="form" size={13} />
-              <span>{layout.name}</span>
+              <Icon name="form" size={13} strokeWidth={1.5} />
+              <span className="source-name">{layout.name}</span>
             </button>
           ))}
           {layouts.length === 0 && (
-            <p className="sidebar-empty">No saved forms for this table.</p>
+            <p className="source-empty">
+              {activeTable ? "No forms for this table" : "Select a table"}
+            </p>
           )}
         </div>
       </section>
 
-      <section className="sidebar-section grow">
-        <div className="sidebar-heading">
-          <span>Actions</span>
+      <section className="source-section">
+        <div className="source-heading">
+          <span>Workspace</span>
         </div>
-        <button type="button" className="sidebar-action" onClick={() => setImportOpen(true)}>
-          <Icon name="upload" size={14} /> Import data
-        </button>
-        <button type="button" className="sidebar-action" onClick={() => setPrintOpen(true)}>
-          <Icon name="printer" size={14} /> Print / PDF
-        </button>
-        <button type="button" className="sidebar-action" onClick={() => openSchema("relation")}>
-          <Icon name="sliders" size={14} /> Add relation
-        </button>
-        <button type="button" className="sidebar-action" onClick={() => openSchema("manage")}>
-          <Icon name="shield" size={14} /> Manage schema
-        </button>
-        <button type="button" className="sidebar-action" onClick={() => void openAudit()}>
-          <Icon name="history" size={14} /> Audit log
-        </button>
-        <button type="button" className="sidebar-action" onClick={() => void checkIntegrity()}>
-          <Icon name="shield" size={14} /> Integrity
-          <span className={`status-dot ${integrity === "ok" ? "ok" : "warn"}`} />
-        </button>
-      </section>
-
-      <footer className="sidebar-footer">
-        <div className="workspace-path" title={info?.path ?? undefined}>
-          <Icon name="database" size={13} />
-          <span>{info?.path ? basename(info.path) : "In memory"}</span>
-        </div>
-        <div className="sidebar-footer-row">
-          <span className="muted">{theme === "light" ? "Warm light" : "Graphite"}</span>
-          <button type="button" className="text-button subtle" onClick={() => void closeWorkspace()}>
-            Close
+        <div className="source-list">
+          <button
+            type="button"
+            className={`source-row ${view === "schema" ? "active" : ""}`}
+            onClick={() => setView("schema")}
+          >
+            <Icon name="grid" size={14} strokeWidth={1.5} />
+            <span className="source-name">Relations &amp; Schema</span>
+          </button>
+          <button type="button" className="source-row" onClick={() => void openAudit()}>
+            <Icon name="history" size={14} strokeWidth={1.5} />
+            <span className="source-name">Audit Log</span>
           </button>
         </div>
-      </footer>
+      </section>
     </nav>
   );
 }
 
 function Statusbar() {
-  const rows = useStore((state) => state.rows);
-  const hasMore = useStore((state) => state.hasMore);
-  const elapsedMs = useStore((state) => state.elapsedMs);
   const info = useStore((state) => state.info);
   const activeTable = useStore((state) => state.activeTable);
-  const undoState = useStore((state) => state.undoState);
+  const rows = useStore((state) => state.rows);
+  const elapsedMs = useStore((state) => state.elapsedMs);
+  const integrity = useStore((state) => state.integrity);
+  const report = useStore((state) => state.integrityReport);
+  const checkedAt = useStore((state) => state.integrityCheckedAt);
+  const checkIntegrity = useStore((state) => state.checkIntegrity);
+
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const anchorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!detailsOpen) return;
+    const close = (event: MouseEvent) => {
+      if (!anchorRef.current?.contains(event.target as Node)) setDetailsOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [detailsOpen]);
+
+  const count = activeTable
+    ? (info?.tables.find((table) => table.name === activeTable)?.rowCount ??
+      rows.length)
+    : 0;
+  const healthy = integrity === "ok";
+  const showLatency = rows.length > 0 && elapsedMs > 0;
 
   return (
     <footer className="statusbar">
-      <span className="status-item">
-        <Icon name="table" size={12} /> {activeTable ?? "No table"}
-      </span>
-      <span className="status-item">
-        {rows.length.toLocaleString()}
-        {hasMore ? "+" : ""} loaded
-      </span>
-      <span className="status-item">{elapsedMs.toFixed(1)} ms page</span>
-      <span className="status-spacer" />
-      {undoState.undo_label && <span className="status-item">Last: {undoState.undo_label}</span>}
-      <span className="status-item mono">{info?.formatVersion ? `format ${info.formatVersion}` : ""}</span>
-      <span className="status-item mono">SQLite · WAL</span>
+      <div className="status-left">
+        {!info ? (
+          <span>Empty workspace</span>
+        ) : activeTable ? (
+          <>
+            <span className="status-table">{activeTable}</span>
+            <span className="status-separator" />
+            <span>
+              {count.toLocaleString()} rows
+            </span>
+            {showLatency && (
+              <>
+                <span className="status-separator" />
+                <span className="status-mono">{elapsedMs.toFixed(1)} ms</span>
+              </>
+            )}
+          </>
+        ) : (
+          <span>No table selected</span>
+        )}
+      </div>
+      <div className="status-right">
+        <div className="status-anchor" ref={anchorRef}>
+          <button
+            type="button"
+            className="integrity-button"
+            onClick={() => {
+              if (report) setDetailsOpen((open) => !open);
+              else
+                void checkIntegrity().then(() => {
+                  if (useStore.getState().integrityReport) setDetailsOpen(true);
+                });
+            }}
+            title="Run SQLite integrity check"
+          >
+            <span className={`status-dot ${healthy ? "ok" : "warn"}`} />
+            {healthy ? "Integrity OK" : "Integrity issue"}
+          </button>
+          {detailsOpen && (
+            <div className="integrity-popover" role="dialog" aria-label="Integrity details">
+              <div className="integrity-popover-head">
+                <span>Integrity</span>
+                <button
+                  type="button"
+                  className="icon-control tiny"
+                  aria-label="Close"
+                  onClick={() => setDetailsOpen(false)}
+                >
+                  <Icon name="x" size={11} />
+                </button>
+              </div>
+              <dl>
+                <div>
+                  <dt>SQLite</dt>
+                  <dd>{report?.integrity ?? "Not run"}</dd>
+                </div>
+                <div>
+                  <dt>Foreign keys</dt>
+                  <dd>{report ? `${report.foreignKeyViolations} violations` : "Not run"}</dd>
+                </div>
+                <div>
+                  <dt>Pages</dt>
+                  <dd>{report ? report.pageCount.toLocaleString() : "…"}</dd>
+                </div>
+                <div>
+                  <dt>Journal</dt>
+                  <dd>
+                    {report
+                      ? report.journalMode.toUpperCase()
+                      : info?.journalMode.toUpperCase() ?? "WAL"}
+                  </dd>
+                </div>
+                {checkedAt && (
+                  <div>
+                    <dt>Checked</dt>
+                    <dd>{formatTimestamp(checkedAt)}</dd>
+                  </div>
+                )}
+              </dl>
+              <button
+                type="button"
+                className="button"
+                onClick={() => void checkIntegrity()}
+              >
+                Run Again
+              </button>
+            </div>
+          )}
+        </div>
+        <span className="status-mono">SQLite WAL</span>
+      </div>
     </footer>
+  );
+}
+
+function EmptyWorkspace() {
+  const openSchema = useStore((state) => state.openSchema);
+  const loadSample = useStore((state) => state.loadSample);
+  const busy = useStore((state) => state.busy);
+
+  return (
+    <div className="canvas-empty">
+      <span className="empty-glyph">
+        <Icon name="table" size={32} strokeWidth={1.2} />
+      </span>
+      <h2>No tables yet</h2>
+      <p>Create a table, or load the sample studio.</p>
+      <div className="empty-actions">
+        <button type="button" className="button primary" onClick={() => openSchema("table")}>
+          New Table
+        </button>
+        <button
+          type="button"
+          className="button"
+          disabled={busy}
+          onClick={() => void loadSample()}
+        >
+          Load Sample Workspace
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -343,8 +636,9 @@ function Launcher() {
   const busy = useStore((state) => state.busy);
   const openWorkspace = useStore((state) => state.openWorkspace);
   const createWorkspace = useStore((state) => state.createWorkspace);
-  const loadSample = useStore((state) => state.loadSample);
-  const recent = window.localStorage.getItem("slabbase.recent");
+  const [recent, setRecent] = useState<string | null>(() =>
+    window.localStorage.getItem("slabbase.recent"),
+  );
 
   const openExisting = async () => {
     const path = await openDialog({
@@ -353,6 +647,7 @@ function Launcher() {
     });
     if (typeof path !== "string") return;
     window.localStorage.setItem("slabbase.recent", path);
+    setRecent(path);
     await openWorkspace(path);
   };
 
@@ -364,6 +659,7 @@ function Launcher() {
     if (!path) return;
     const name = basename(path).replace(/\.slab$/i, "") || "Untitled";
     window.localStorage.setItem("slabbase.recent", path);
+    setRecent(path);
     await createWorkspace(path, name);
   };
 
@@ -374,95 +670,122 @@ function Launcher() {
     });
     if (!path) return;
     window.localStorage.setItem("slabbase.recent", path);
+    setRecent(path);
     await createWorkspace(path, "Design Studio");
-    await loadSample();
+    await useStore.getState().loadSample();
   };
 
   return (
     <main className="launcher">
-      <div className="launcher-card">
-        <div className="launcher-brand">
-          <BrandMark large />
-          <div>
-            <h1>SlabBase</h1>
-            <p>Local records. Open SQLite. Forms that hold their shape.</p>
-          </div>
-        </div>
+      <div className="launcher-content">
+        <span className="launcher-glyph">
+          <Icon name="database" size={28} strokeWidth={1.2} />
+        </span>
+        <span className="launcher-kicker">Local SQLite workspace</span>
+        <h1>SlabBase</h1>
+        <p>Relational records, visual forms, and reports — stored in a single database file.</p>
         <div className="launcher-actions">
-          <button type="button" className="launcher-action" onClick={() => void openExisting()}>
-            <span className="action-icon">
-              <Icon name="folder" size={18} />
-            </span>
-            <span>
-              <strong>Open workspace</strong>
-              <small>Choose an existing .slab file</small>
-            </span>
-            <Icon name="chevronRight" size={14} />
+          <button
+            type="button"
+            className="button primary"
+            onClick={() => void openExisting()}
+          >
+            Open Workspace
           </button>
-          {recent && (
-            <button
-              type="button"
-              className="launcher-action subtle"
-              onClick={() => void openWorkspace(recent)}
-            >
-              <span className="action-icon">
-                <Icon name="history" size={18} />
-              </span>
-              <span>
-                <strong>{basename(recent)}</strong>
-                <small>{dirname(recent)}</small>
-              </span>
-              <Icon name="chevronRight" size={14} />
-            </button>
-          )}
-          <button type="button" className="launcher-action" onClick={() => void newWorkspace()}>
-            <span className="action-icon">
-              <Icon name="plus" size={18} />
-            </span>
-            <span>
-              <strong>Create workspace</strong>
-              <small>A single SQLite database in WAL mode</small>
-            </span>
-            <Icon name="chevronRight" size={14} />
+          <button type="button" className="button" onClick={() => void newWorkspace()}>
+            New Workspace
           </button>
           <button
             type="button"
-            className="launcher-action accent"
-            onClick={() => void newSample()}
+            className="button"
             disabled={busy}
+            onClick={() => void newSample()}
           >
-            <span className="action-icon">
-              <Icon name="spark" size={18} />
-            </span>
-            <span>
-              <strong>Load sample studio</strong>
-              <small>Clients → Projects → Invoices → Line Items</small>
-            </span>
-            <Icon name="chevronRight" size={14} />
+            Load Sample Workspace
           </button>
         </div>
-        <footer className="launcher-footer">
-          <span>Apache-2.0 · no account · no cloud</span>
-          <span>v1.0.0</span>
-        </footer>
-      </div>
-      <div className="launcher-bg" aria-hidden="true">
-        <span className="bg-slab one" />
-        <span className="bg-slab two" />
-        <span className="bg-seal" />
+        {recent && (
+          <button
+            type="button"
+            className="recent-button"
+            onClick={() => void openWorkspace(recent)}
+            title={recent}
+          >
+            <Icon name="history" size={13} strokeWidth={1.5} />
+            <span>{basename(recent)}</span>
+            <span className="recent-folder">{dirname(recent)}</span>
+          </button>
+        )}
+        <p className="launcher-footnote">Apache-2.0 · no account · no cloud</p>
       </div>
     </main>
   );
 }
 
-function BrandMark({ large = false }: { large?: boolean }) {
+function PaneResizer({
+  side,
+  width,
+  min,
+  max,
+  onResize,
+}: {
+  side: "left" | "right";
+  width: number;
+  min: number;
+  max: number;
+  onResize: (width: number) => void;
+}) {
+  const [active, setActive] = useState(false);
+  const origin = useRef({ x: 0, width });
+
+  useEffect(() => {
+    if (!active) return;
+    const move = (event: PointerEvent) => {
+      const delta = event.clientX - origin.current.x;
+      const next = side === "left" ? origin.current.width + delta : origin.current.width - delta;
+      onResize(Math.min(max, Math.max(min, next)));
+    };
+    const up = () => setActive(false);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+    document.body.classList.add("resizing");
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      document.body.classList.remove("resizing");
+    };
+  }, [active, side, min, max, onResize]);
+
   return (
-    <span className={`brand-mark ${large ? "large" : ""}`} aria-hidden="true">
-      <span className="brand-slab left" />
-      <span className="brand-slab right" />
-      <span className="brand-seal" />
-    </span>
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={side === "left" ? "Resize sidebar" : "Resize inspector"}
+      className={`pane-resizer ${side} ${active ? "active" : ""}`}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        origin.current = { x: event.clientX, width };
+        setActive(true);
+      }}
+    />
   );
+}
+
+function isTextEntry(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+}
+
+function fileLabel(name: string): string {
+  const base = name.replace(/\.slab$/i, "");
+  return `${base}.slab`;
+}
+
+function readWidth(key: string, fallback: number, min: number, max: number): number {
+  const raw = Number(window.localStorage.getItem(key));
+  if (!Number.isFinite(raw) || raw <= 0) return fallback;
+  return Math.min(max, Math.max(min, raw));
 }
 
 function basename(path: string): string {

@@ -220,7 +220,7 @@ export function PrintDialog() {
             <div className="print-actions">
               <button
                 type="button"
-                className="button ghost"
+                className="button"
                 onClick={() => void renderPreview()}
                 disabled={busy}
               >

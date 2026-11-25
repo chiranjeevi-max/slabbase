@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 import type { LayoutItem, Table, Value } from "../bindings";
 import { useStore } from "../store";
 import { isComputedColumn, recordTitle } from "../types";
+import { confirmDestructive } from "../native";
 import { FieldInput } from "./FieldInput";
 import { PortalGrid } from "./PortalGrid";
 import { DraftField, DraftFieldLabel, fallbackValue } from "./DraftFields";
 import { Icon } from "./Icons";
 
-export function RecordPanel() {
+export function RecordPanel({ width }: { width: number }) {
   const schema = useStore((state) => state.schema);
   const activeTable = useStore((state) => state.activeTable);
   const selectedId = useStore((state) => state.selectedId);
@@ -26,43 +27,50 @@ export function RecordPanel() {
 
   if (!table) {
     return (
-      <aside className="record-panel">
-        <div className="empty-panel">
-          <Icon name="table" size={20} />
-          <p>Select a table to begin.</p>
-        </div>
+      <aside className="record-panel" style={{ width }}>
+        <header className="record-header">
+          <div>
+            <span className="eyebrow">Inspector</span>
+            <h2>No table</h2>
+          </div>
+          <button
+            type="button"
+            className="icon-control"
+            title="Close inspector"
+            aria-label="Close inspector"
+            onClick={() => useStore.getState().setInspectorOpen(false)}
+          >
+            <Icon name="x" size={14} strokeWidth={1.5} />
+          </button>
+        </header>
+        <p className="inspector-hint">Select a table to inspect its records.</p>
       </aside>
     );
   }
 
   if (creating) {
-    return <DraftRecord table={table} />;
+    return <DraftRecord table={table} width={width} />;
   }
 
   if (!bundle || selectedId === null) {
     return (
-      <aside className="record-panel">
-        <div className="empty-panel">
-          <div className="empty-glyph">
-            <Icon name="keyboard" size={22} />
+      <aside className="record-panel" style={{ width }}>
+        <header className="record-header">
+          <div>
+            <span className="eyebrow">{table.name}</span>
+            <h2>Inspector</h2>
           </div>
-          <h3>No record selected</h3>
-          <p>Click a row to open its form. Double-click a cell to edit in place.</p>
-          <dl className="shortcuts">
-            <div>
-              <dt>⌘K</dt>
-              <dd>Search</dd>
-            </div>
-            <div>
-              <dt>⌘N</dt>
-              <dd>New record</dd>
-            </div>
-            <div>
-              <dt>⌘Z</dt>
-              <dd>Undo</dd>
-            </div>
-          </dl>
-        </div>
+          <button
+            type="button"
+            className="icon-control"
+            title="Close inspector"
+            aria-label="Close inspector"
+            onClick={() => useStore.getState().setInspectorOpen(false)}
+          >
+            <Icon name="x" size={14} strokeWidth={1.5} />
+          </button>
+        </header>
+        <p className="inspector-hint">Select a record to inspect its fields and portals.</p>
       </aside>
     );
   }
@@ -84,32 +92,42 @@ export function RecordPanel() {
   };
 
   return (
-    <aside className="record-panel">
+    <aside className="record-panel" style={{ width }} aria-label="Record inspector">
       <header className="record-header">
-        <div>
-          <span className="eyebrow">{table.name}</span>
+        <div className="record-heading">
+          <span className="eyebrow">
+            {table.name}
+            <span className="record-id">#{bundle.record.id}</span>
+          </span>
           <h2>{recordTitle(table, bundle.record)}</h2>
         </div>
         <div className="record-header-actions">
           <button
             type="button"
-            className="icon-button danger"
+            className="icon-control danger"
             title="Delete record"
+            aria-label="Delete record"
             onClick={() => {
-              if (window.confirm("Delete this record and its child rows?")) {
-                void useStore.getState().deleteRecord(bundle.record.id);
-              }
+              void (async () => {
+                const ok = await confirmDestructive(
+                  "Delete this record and its child rows? Undo can restore it.",
+                  "Delete Record",
+                  "Delete",
+                );
+                if (ok) await useStore.getState().deleteRecord(bundle.record.id);
+              })();
             }}
           >
-            <Icon name="trash" size={15} />
+            <Icon name="trash" size={14} strokeWidth={1.5} />
           </button>
           <button
             type="button"
-            className="icon-button"
-            title="Close record"
+            className="icon-control"
+            title="Close inspector"
+            aria-label="Close inspector"
             onClick={() => useStore.getState().closeRecord()}
           >
-            <Icon name="x" size={15} />
+            <Icon name="x" size={14} strokeWidth={1.5} />
           </button>
         </div>
       </header>
@@ -180,7 +198,7 @@ export function RecordPanel() {
   );
 }
 
-function DraftRecord({ table }: { table: Table }) {
+function DraftRecord({ table, width }: { table: Table; width: number }) {
   const [values, setValues] = useState<Record<string, Value>>(() => {
     const initial: Record<string, Value> = {};
     for (const column of table.columns) {
@@ -198,25 +216,25 @@ function DraftRecord({ table }: { table: Table }) {
 
   const save = async () => {
     setSaving(true);
-    const ok = await useStore.getState().insertRecord(values);
+    await useStore.getState().insertRecord(values);
     setSaving(false);
-    if (!ok) return;
   };
 
   return (
-    <aside className="record-panel">
+    <aside className="record-panel" style={{ width }} aria-label="New record">
       <header className="record-header">
-        <div>
+        <div className="record-heading">
           <span className="eyebrow">{table.name}</span>
-          <h2>New record</h2>
+          <h2>New Record</h2>
         </div>
         <button
           type="button"
-          className="icon-button"
+          className="icon-control"
           title="Cancel"
+          aria-label="Cancel"
           onClick={() => useStore.getState().cancelCreate()}
         >
-          <Icon name="x" size={15} />
+          <Icon name="x" size={14} strokeWidth={1.5} />
         </button>
       </header>
       <div className="record-scroll">
@@ -240,7 +258,7 @@ function DraftRecord({ table }: { table: Table }) {
       <footer className="record-footer">
         <button
           type="button"
-          className="button ghost"
+          className="button compact"
           onClick={() => useStore.getState().cancelCreate()}
         >
           Cancel
@@ -252,11 +270,11 @@ function DraftRecord({ table }: { table: Table }) {
         </span>
         <button
           type="button"
-          className="button primary"
+          className="button primary compact"
           disabled={saving || missing.length > 0}
           onClick={() => void save()}
         >
-          {saving ? "Creating…" : "Create record"}
+          {saving ? "Creating…" : "Create Record"}
         </button>
       </footer>
     </aside>

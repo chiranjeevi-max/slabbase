@@ -156,83 +156,91 @@ export function ImportDialog() {
         </div>
         <div className="modal-body import-body">
           <div className="import-source">
-            <button type="button" className="button ghost" onClick={() => void chooseFile()}>
-              <Icon name="folder" size={14} /> Choose file
-            </button>
-            <span className="file-path">{path ? basename(path) : "No file chosen"}</span>
-            <select
-              className="select"
-              value={format}
-              onChange={(event) => setFormat(event.target.value as "csv" | "json")}
-            >
-              <option value="csv">CSV</option>
-              <option value="json">JSON</option>
-            </select>
-            <label className="inline-check">
-              <input
-                type="checkbox"
-                checked={options.hasHeaders}
-                onChange={(event) =>
-                  setOptions({ ...options, hasHeaders: event.target.checked })
-                }
-              />
-              First row is headers
-            </label>
-            <label className="compact-field">
-              <span>Delimiter</span>
-              <input
-                className="field-input small"
-                maxLength={2}
-                value={options.delimiter === "\t" ? "\\t" : options.delimiter}
-                onChange={(event) =>
-                  setOptions({
-                    ...options,
-                    delimiter:
-                      event.target.value === "\\t" ? "\t" : event.target.value.slice(0, 1),
-                  })
-                }
-              />
-            </label>
-            <label className="compact-field">
-              <span>Infer rows</span>
-              <input
-                className="field-input small"
-                type="number"
-                min={1}
-                max={100_000}
-                value={options.inferenceLimit}
-                onChange={(event) =>
-                  setOptions({
-                    ...options,
-                    inferenceLimit: Math.max(1, Number(event.target.value) || 1),
-                  })
-                }
-              />
-            </label>
-            <label className="compact-field">
-              <span>Batch</span>
-              <input
-                className="field-input small"
-                type="number"
-                min={1}
-                max={10_000}
-                value={options.batchSize}
-                onChange={(event) =>
-                  setOptions({
-                    ...options,
-                    batchSize: Math.max(1, Number(event.target.value) || 1),
-                  })
-                }
-              />
-            </label>
-            <button
-              type="button"
-              className="button primary"
-              disabled={!path || busy}
-              onClick={() => void runPreview()}
-            >
-              {busy ? "Reading…" : "Preview"}
-            </button>
+            <div className="import-source-row">
+              <button type="button" className="button ghost" onClick={() => void chooseFile()}>
+                <Icon name="folder" size={14} /> Choose file
+              </button>
+              <span className="file-path">{path ? basename(path) : "No file chosen"}</span>
+            </div>
+            <div className="import-source-options">
+              <label className="compact-field">
+                <span>Format</span>
+                <select
+                  className="select"
+                  value={format}
+                  onChange={(event) => setFormat(event.target.value as "csv" | "json")}
+                >
+                  <option value="csv">CSV</option>
+                  <option value="json">JSON</option>
+                </select>
+              </label>
+              <label className="inline-check">
+                <input
+                  type="checkbox"
+                  checked={options.hasHeaders}
+                  onChange={(event) =>
+                    setOptions({ ...options, hasHeaders: event.target.checked })
+                  }
+                />
+                First row is headers
+              </label>
+              <label className="compact-field">
+                <span>Delimiter</span>
+                <input
+                  className="field-input small"
+                  maxLength={2}
+                  value={options.delimiter === "\t" ? "\\t" : options.delimiter}
+                  onChange={(event) =>
+                    setOptions({
+                      ...options,
+                      delimiter:
+                        event.target.value === "\\t" ? "\t" : event.target.value.slice(0, 1),
+                    })
+                  }
+                />
+              </label>
+              <label className="compact-field">
+                <span>Infer Rows</span>
+                <input
+                  className="field-input small"
+                  type="number"
+                  min={1}
+                  max={100_000}
+                  value={options.inferenceLimit}
+                  onChange={(event) =>
+                    setOptions({
+                      ...options,
+                      inferenceLimit: Math.max(1, Number(event.target.value) || 1),
+                    })
+                  }
+                />
+              </label>
+              <label className="compact-field">
+                <span>Batch</span>
+                <input
+                  className="field-input small"
+                  type="number"
+                  min={1}
+                  max={10_000}
+                  value={options.batchSize}
+                  onChange={(event) =>
+                    setOptions({
+                      ...options,
+                      batchSize: Math.max(1, Number(event.target.value) || 1),
+                    })
+                  }
+                />
+              </label>
+              <span className="toolbar-spacer" />
+              <button
+                type="button"
+                className="button primary"
+                disabled={!path || busy}
+                onClick={() => void runPreview()}
+              >
+                {busy ? "Reading…" : "Preview"}
+              </button>
+            </div>
           </div>
 
           {preview && (
