@@ -36,6 +36,10 @@ Toolbar geometry:
 - Data grids may scroll inside their own viewport when columns exceed the pane. Portal grids may scroll inside their own bordered viewport when columns exceed the inspector. The surrounding chrome must not scroll or clip content outside its bounds.
 - Below 1080px viewport width the sidebar becomes a fixed overlay drawer with a scrim, outside-click dismissal, Escape dismissal, and focus return. The main pane keeps its full width.
 - Below 1200px viewport width the record inspector becomes a fixed elevated sheet above the grid. The docked inspector appears at 1200px and wider. The grid pane keeps at least 480px of width in both modes.
+- The containment, overflow, alignment, and virtualization laws are verified at `820x840`, `1024x680`, `1440x900`, `2560x1440`, and `3440x1440` (21:9), with a `5120x1440` super-ultrawide spot check. Layout decisions use the effective width after app zoom, not the raw window width.
+- On wide and ultra-wide displays, non-grid content keeps a readable measure: the schema `COLUMNS`/`RELATIONS` editor caps at 960px, form canvases at 920px, modals at 660px to 980px by kind, and empty-state copy at 460px. `DataGrid` uses the full available width so wide tables stay useful.
+- At `prefers-contrast: more`, borders strengthen and secondary/tertiary text tokens meet at least 4.5:1 against their surfaces. Control borders meet at least 3:1.
+- App zoom shortcuts (`⌘+`, `⌘-`, `⌘0`) scale the whole shell in 25% steps from 100% to 200%. The scaled shell still occupies exactly one viewport; media-style layout thresholds follow `window.innerWidth / zoom`.
 - The sidebar hairline runs from `y = 0` to the window bottom. The status bar belongs to the main pane and never cuts through the sidebar.
 
 ## 3. Native macOS interaction checklist
@@ -67,6 +71,12 @@ Toolbar geometry:
 - `⌘K` and popovers enter in 120ms. Dismissal completes within 110ms.
 - Animate `transform` and `opacity` only.
 - Under `prefers-reduced-motion: reduce`, transitions collapse to 40ms or less and animate opacity only.
+
+### Text entry
+
+- Inline grid editors and inspector fields set `dir="auto"` so mixed Arabic/Hebrew and Latin text isolate correctly.
+- Enter during IME composition is owned by the input method and never commits or dismisses an editor. Commit resumes after `compositionend`.
+- Date-only values round-trip as stored `YYYY-MM-DD` strings in every timezone; rendering never constructs a local `Date` for a calendar-only value.
 
 ### Scroll surfaces
 
@@ -186,3 +196,17 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | Density virtualizer alignment | `density keeps virtual rows aligned` |
 | Theme and preference persistence | `appearance controls persist` |
 | Native traffic-light reserve | `native chrome reserves traffic lights` |
+| Wide and ultrawide containment | `wide table and long values stay inside the grid viewport` |
+| Rapid appearance changes | `rapid density, surface, theme, and inspector bursts keep scroll stable` |
+| Portal density alignment | `portal rows keep density alignment during rapid appearance changes` |
+| Destructive error and recovery | `dropping a formula column reports an inline error and keeps state`, `relation-protected table drop, relation drop, and undo restore everything` |
+| Overlay focus return | `every overlay returns focus to its opener after Escape` |
+| Keyboard-only traversal | `keyboard-only navigation, hostile search, and undo routing` |
+| IME and bidi safety | `IME composition Enter does not commit inline or inspector editors`, `mixed RTL and LTR text round-trips without clipping` |
+| App zoom and scaling | `125% and 150% app zoom keep every chrome surface contained` |
+| High contrast tokens | `high contrast preference strengthens borders and text contrast` |
+| Ultrawide readable measure | `ultra-wide forms stay readable while grids use full width` |
+| Air-gap boot | `air-gapped boot makes zero external http(s) requests` |
+| HiDPI parity | `hidpi borders stay crisp and layout does not drift` |
+| Date-only timezone invariance | `calendar dates never shift on display or edit` |
+| WCAG 2.2 AA | `axe WCAG 2.2 AA scan finds no serious violations` |

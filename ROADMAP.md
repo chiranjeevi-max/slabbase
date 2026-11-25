@@ -36,6 +36,14 @@
 - Optional native SwiftUI shell through UniFFI over the same crates.
 - Windows and Linux installers in the verification matrix.
 
+## Known v1.0 limitations
+
+- PDF text is base-14 Helvetica with WinAnsiEncoding. Latin-1 and CP1252 punctuation are exact; common currency and math symbols transliterate to ASCII; other scripts and emoji render as `?`. Shipping a Unicode font is deferred.
+- User identifiers are ASCII (`A-Z`, `a-z`, `0-9`, space, `_`) up to 64 bytes. Non-Latin table and column names are rejected rather than quoted, which keeps formula source and SQL export unambiguous.
+- Import is strict by default: a ragged CSV row or a value that fails the target type aborts before commit. `skip_invalid` is the opt-in lossy mode, and it still reports every skipped row.
+- Form PDF fields are single-line and truncate with an ellipsis; multi-paragraph notes are not flowed across pages in v1.0.
+- Dropping a table that participates in a relation is blocked until the relation is dropped. Undo restores the table and then the relation; this is deliberate rather than a cascade delete of schema metadata.
+
 ## Compatibility policy
 
 Workspace format changes are additive within a major version. A newer build may add `_slab_*` tables or columns, but it will not rename or reinterpret existing user tables. An older build opens a file when the file's `format_version` is less than or equal to the build's supported version. A newer format is rejected rather than opened read-only, because silently hiding metadata leads to incomplete forms.
