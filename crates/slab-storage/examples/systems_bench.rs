@@ -336,6 +336,17 @@ fn ivm(directory: &tempfile::TempDir) {
         durations[durations.len() / 2].as_secs_f64() * 1_000.0,
         percentile(&durations, 95).as_secs_f64() * 1_000.0,
     );
+    {
+        let raw = rusqlite::Connection::open(&path).expect("raw");
+        raw.execute("DELETE FROM _slab_rollups", []).expect("clear");
+        let started = Instant::now();
+        let record = workspace.read_record("Invoices", invoice).expect("read");
+        let cold = started.elapsed().as_secs_f64() * 1_000.0;
+        println!(
+            "ivm_cold_full_scan total={:?} ms={cold:.3}",
+            record.get("Total")
+        );
+    }
     workspace.close().expect("close");
 }
 
