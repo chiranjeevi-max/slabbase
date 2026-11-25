@@ -739,6 +739,44 @@ fn interrupt_maps_to_benign_cancellation() {
 }
 
 #[test]
+fn restore_after_delete_recreates_the_row_and_rollup() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let (_path, mut workspace) = rollup_workspace(&directory);
+    let invoice = workspace
+        .insert_row("Invoices", &row(&[("Number", Value::from("GONE"))]))
+        .expect("invoice")
+        .id;
+    let child = workspace
+        .insert_row(
+            "Items",
+            &row(&[
+                ("Invoice", Value::Integer(invoice)),
+                ("Label", Value::from("removed")),
+                ("Amount", Value::Integer(75)),
+            ]),
+        )
+        .expect("child");
+    workspace.delete_row("Items", child.id).expect("delete");
+    assert_eq!(rollup_values(&workspace, invoice)[0], Value::Integer(0));
+    let history = workspace
+        .record_history("Items", child.id)
+        .expect("history");
+    let insert = history
+        .iter()
+        .find(|revision| revision.operation == "insert")
+        .expect("insert revision");
+    let restored = workspace
+        .restore_record_revision("Items", child.id, insert.audit_id)
+        .expect("restore");
+    assert_eq!(restored.id, child.id);
+    assert_eq!(restored.get("Amount"), Some(&Value::Integer(75)));
+    assert_eq!(rollup_values(&workspace, invoice)[0], Value::Integer(75));
+    assert!(workspace.integrity_check().expect("check").audit_chain);
+    workspace.undo().expect("undo");
+    assert_eq!(rollup_values(&workspace, invoice)[0], Value::Integer(0));
+}
+
+#[test]
 fn formula_columns_see_updated_rollups() {
     let directory = tempfile::TempDir::new().expect("tempdir");
     let (_path, mut workspace) = rollup_workspace(&directory);
