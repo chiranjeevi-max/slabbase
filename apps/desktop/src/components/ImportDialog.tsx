@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { ImportOptionsDto, ImportPreviewDto, ImportValidationDto } from "../bindings";
 import { api } from "../api";
+import { useFocusTrap } from "../focus";
+import { usePresence } from "../presence";
 import { errorText, useStore } from "../store";
 import { Icon } from "./Icons";
 
@@ -42,7 +44,11 @@ export function ImportDialog() {
     setTarget(activeTable ?? schema?.tables[0]?.name ?? "");
   }, [open, activeTable, schema]);
 
-  if (!open) return null;
+  const modalRef = useRef<HTMLDivElement>(null);
+  const presence = usePresence(open, 110);
+  useFocusTrap(open, modalRef, presence.mounted);
+
+  if (!presence.mounted) return null;
 
   const chooseFile = async () => {
     const chosen = await openDialog({
@@ -134,12 +140,20 @@ export function ImportDialog() {
 
   return (
     <div
-      className="modal-backdrop"
+      className={`modal-backdrop ${presence.closing ? "is-closing" : ""}`}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) setOpen(false);
       }}
     >
-      <div className="modal import-modal" role="dialog" aria-modal="true" aria-label="Import">
+      <div
+        ref={modalRef}
+        className={`modal import-modal ${presence.className}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Import"
+        data-testid="import-dialog"
+        tabIndex={-1}
+      >
         <header className="modal-header">
           <div>
             <span className="eyebrow">Import</span>

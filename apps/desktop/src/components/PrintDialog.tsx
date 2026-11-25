@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { PrintOptionsDto } from "../bindings";
 import { api } from "../api";
+import { useFocusTrap } from "../focus";
+import { usePresence } from "../presence";
 import { errorText, pageQueryFor, useStore } from "../store";
 import { Icon } from "./Icons";
 
@@ -39,7 +41,11 @@ export function PrintDialog() {
     setHtml("");
   }, [open, selectedId, activeTable, schema]);
 
-  if (!open) return null;
+  const modalRef = useRef<HTMLDivElement>(null);
+  const presence = usePresence(open, 110);
+  useFocusTrap(open, modalRef, presence.mounted);
+
+  if (!presence.mounted) return null;
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
 
@@ -113,12 +119,20 @@ export function PrintDialog() {
 
   return (
     <div
-      className="modal-backdrop"
+      className={`modal-backdrop ${presence.closing ? "is-closing" : ""}`}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) setOpen(false);
       }}
     >
-      <div className="modal print-modal" role="dialog" aria-modal="true" aria-label="Print">
+      <div
+        ref={modalRef}
+        className={`modal print-modal ${presence.className}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Print"
+        data-testid="print-dialog"
+        tabIndex={-1}
+      >
         <header className="modal-header">
           <div>
             <span className="eyebrow">Print</span>

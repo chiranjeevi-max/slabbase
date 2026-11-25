@@ -1,3 +1,6 @@
+import { useRef } from "react";
+import { useFocusTrap } from "../focus";
+import { usePresence } from "../presence";
 import { useStore } from "../store";
 import { formatTimestamp } from "../types";
 import { Icon } from "./Icons";
@@ -7,15 +10,24 @@ export function AuditDrawer() {
   const audit = useStore((state) => state.audit);
   const undoState = useStore((state) => state.undoState);
   const close = useStore((state) => state.closeAudit);
+  const drawerRef = useRef<HTMLElement>(null);
+  const presence = usePresence(open, 110);
+  useFocusTrap(open, drawerRef, presence.mounted);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   return (
-    <div className="drawer-backdrop" onMouseDown={close}>
+    <div
+      className={`drawer-backdrop ${presence.closing ? "is-closing" : ""}`}
+      onMouseDown={close}
+    >
       <aside
-        className="drawer audit-drawer"
+        ref={drawerRef}
+        className={`drawer audit-drawer ${presence.className}`}
         onMouseDown={(event) => event.stopPropagation()}
         aria-label="Audit log"
+        data-testid="audit-drawer"
+        tabIndex={-1}
       >
         <header className="drawer-header">
           <div>

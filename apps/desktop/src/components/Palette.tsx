@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { SearchHit } from "../bindings";
 import { api } from "../api";
+import { useFocusTrap } from "../focus";
+import { usePresence } from "../presence";
 import { errorText, useStore } from "../store";
 import { Icon } from "./Icons";
 
@@ -18,6 +20,9 @@ export function Palette() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [index, setIndex] = useState(0);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const presence = usePresence(open, 110);
+  useFocusTrap(open, dialogRef, presence.mounted);
 
   useEffect(() => {
     if (!open) {
@@ -109,15 +114,15 @@ export function Palette() {
         run: () => state.openSchema("relation"),
       },
       {
-        id: "theme",
-        label: "Toggle theme",
+        id: "appearance",
+        label: "Appearance…",
         hint: "",
-        run: () => state.toggleTheme(),
+        run: () => state.setAppearanceOpen(true),
       },
     ];
   }, []);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   const filtered = commands.filter((command) =>
     command.label.toLowerCase().includes(query.trim().toLowerCase()),
@@ -141,13 +146,19 @@ export function Palette() {
   };
 
   return (
-    <div className="palette-backdrop" onMouseDown={() => setOpen(false)}>
+    <div
+      className={`palette-backdrop ${presence.closing ? "is-closing" : ""}`}
+      onMouseDown={() => setOpen(false)}
+    >
       <div
-        className="palette"
+        ref={dialogRef}
+        className={`palette ${presence.className}`}
         onMouseDown={(event) => event.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
+        data-testid="command-palette"
+        tabIndex={-1}
       >
         <div className="palette-input">
           <Icon name="search" size={16} />
