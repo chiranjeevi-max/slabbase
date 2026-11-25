@@ -824,5 +824,13 @@ fn append_filter(
 }
 
 fn fts_query(term: &str) -> String {
-    format!("\"{}\"", term.replace('"', "\"\""))
+    // FTS5 string quoting handles punctuation, operators, and unbalanced
+    // quotes, but a NUL byte terminates the parser's view of the string and
+    // produces a raw syntax error. Strip NULs before quoting so every user
+    // input is a valid phrase query.
+    let cleaned: String = term.chars().filter(|ch| *ch != '\0').collect();
+    if cleaned.trim().is_empty() {
+        return "\"\"".to_owned();
+    }
+    format!("\"{}\"", cleaned.replace('"', "\"\""))
 }

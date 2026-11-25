@@ -18,6 +18,7 @@ use crate::ddl::{column_definition, create_table_sql, relation_index_sql, unique
 use crate::error::StorageError;
 use crate::sql::{decode_value, encode_value, normalize_value, quote_ident, stored_columns};
 use slab_formula::parse as parse_formula;
+use slab_formula::rewrite_column_source;
 
 const SYSTEM_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS _slab_meta (
@@ -91,6 +92,7 @@ pub struct Workspace {
     pub(crate) actor: String,
     pub(crate) undo: Vec<Command>,
     pub(crate) redo: Vec<Command>,
+    pub(crate) pending_import: Option<Vec<Command>>,
     pub(crate) id_seed: u64,
     pub(crate) policy: Arc<dyn PolicyHook>,
     pub(crate) name: String,
@@ -150,6 +152,7 @@ impl Workspace {
             actor: "local".into(),
             undo: Vec::new(),
             redo: Vec::new(),
+            pending_import: None,
             id_seed: 0,
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
@@ -164,19 +167,49 @@ impl Workspace {
         if !path.exists() {
             return Err(StorageError::NotFound(path.display().to_string()));
         }
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() == 0 {
+            return Err(StorageError::Workspace(format!(
+                "{} is empty; it is not a SlabBase workspace",
+                path.display()
+            )));
+        }
+        if metadata.permissions().readonly() {
+            return Err(StorageError::Workspace(format!(
+                "{} is read-only; SlabBase needs write access to open a workspace",
+                path.display()
+            )));
+        }
         let conn = Connection::open(path)?;
-        configure(&conn)?;
-        let has_meta: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_slab_meta')",
-            [],
-            |row| row.get(0),
-        )?;
+        // Set the timeout before the first read so a concurrent writer cannot
+        // turn workspace discovery into an immediate SQLITE_BUSY failure.
+        conn.busy_timeout(Duration::from_millis(5_000))?;
+        let has_meta: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_slab_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| workspace_open_error(error, path))?;
         if !has_meta {
             return Err(StorageError::Workspace(format!(
                 "{} is not a SlabBase workspace",
                 path.display()
             )));
         }
+        // Only mutate connection settings after the file is known to be a
+        // workspace. This keeps foreign or damaged files byte-for-byte intact.
+        configure(&conn).map_err(|error| match error {
+            StorageError::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::ReadOnly =>
+            {
+                StorageError::Workspace(format!(
+                    "{} is read-only; SlabBase needs write access to open a workspace",
+                    path.display()
+                ))
+            }
+            other => other,
+        })?;
         let name = read_meta(&conn, "name")?.unwrap_or_else(|| "Workspace".into());
         let format_version = read_meta(&conn, "format_version")?
             .and_then(|value| value.parse::<u32>().ok())
@@ -193,6 +226,7 @@ impl Workspace {
             actor: "local".into(),
             undo: Vec::new(),
             redo: Vec::new(),
+            pending_import: None,
             id_seed: 0,
             policy: Arc::new(slab_core::NoopPolicy),
             name,
@@ -213,6 +247,7 @@ impl Workspace {
             actor: "local".into(),
             undo: Vec::new(),
             redo: Vec::new(),
+            pending_import: None,
             id_seed: 0,
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
@@ -957,7 +992,7 @@ impl Workspace {
                 id,
                 values: row.values,
             };
-            refresh_fts(&tx, definition, id, &applied.values)?;
+            index_fts(&tx, definition, id, &applied.values)?;
             let command = Command::InsertRow {
                 table: table.to_owned(),
                 row: applied,
@@ -977,6 +1012,113 @@ impl Workspace {
             }
         }
         Ok(records)
+    }
+
+    /// Starts an all-or-nothing import transaction.
+    ///
+    /// Rows written through [`Self::insert_import_rows`] share one SQLite
+    /// transaction. Nothing is visible to other connections, and no undo entry
+    /// is published, until [`Self::commit_import`] succeeds. Call
+    /// [`Self::rollback_import`] on every error path so a failed import leaves
+    /// zero half-committed rows.
+    pub fn begin_import(&mut self) -> Result<(), StorageError> {
+        if self.pending_import.is_some() || !self.conn.is_autocommit() {
+            return Err(StorageError::Command(
+                "an import transaction is already active".into(),
+            ));
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.pending_import = Some(Vec::new());
+        Ok(())
+    }
+
+    /// Inserts one validated batch inside the active import transaction.
+    ///
+    /// Every row receives its own audit entry, matching a normal insert.
+    pub fn insert_import_rows(
+        &mut self,
+        table: &str,
+        rows: &[RowData],
+    ) -> Result<Vec<RowId>, StorageError> {
+        if self.pending_import.is_none() {
+            return Err(StorageError::Command(
+                "no import transaction is active".into(),
+            ));
+        }
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let mut prepared = Vec::with_capacity(rows.len());
+        for values in rows {
+            prepared.push(prepare_row(definition, values, None, true)?);
+        }
+        let hlc = self.clock.now();
+        let mut commands = Vec::with_capacity(prepared.len());
+        let mut ids = Vec::with_capacity(prepared.len());
+        for values in prepared {
+            let row = slab_core::Record { id: 0, values };
+            let id = insert_record_tx(&self.conn, definition, &row, false)?;
+            let applied = slab_core::Record {
+                id,
+                values: row.values,
+            };
+            index_fts(&self.conn, definition, id, &applied.values)?;
+            let command = Command::InsertRow {
+                table: table.to_owned(),
+                row: applied,
+                children: Vec::new(),
+            };
+            append_audit(
+                &self.conn,
+                &command,
+                &hlc,
+                &self.actor,
+                "insert",
+                &command.label(),
+            )?;
+            commands.push(command);
+            ids.push(id);
+        }
+        if let Some(pending) = self.pending_import.as_mut() {
+            pending.extend(commands);
+        }
+        Ok(ids)
+    }
+
+    /// Commits the active import transaction and publishes its undo entries.
+    pub fn commit_import(&mut self) -> Result<(), StorageError> {
+        let Some(commands) = self.pending_import.take() else {
+            return Err(StorageError::Command(
+                "no import transaction is active".into(),
+            ));
+        };
+        match self.conn.execute_batch("COMMIT") {
+            Ok(()) => {
+                for command in commands {
+                    self.push_undo(command);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Rolls back the active import transaction, discarding every row.
+    pub fn rollback_import(&mut self) -> Result<(), StorageError> {
+        if self.pending_import.take().is_none() {
+            return Err(StorageError::Command(
+                "no import transaction is active".into(),
+            ));
+        }
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
     }
 
     /// Updates a row from a partial column map and returns the stored record.
@@ -1080,7 +1222,12 @@ impl Workspace {
         let summary = format!("Redo {}", command.label());
         match self.apply_command_with_audit(&command, "redo", &summary) {
             Ok(_) => {
-                self.push_undo(command);
+                // Keep the remaining redo stack intact. `push_undo` clears it
+                // for new edits, but a redo is a replay, not a new edit.
+                self.undo.push(command);
+                if self.undo.len() > UNDO_LIMIT {
+                    self.undo.remove(0);
+                }
                 Ok(self.undo_state())
             }
             Err(error) => {
@@ -1192,13 +1339,13 @@ impl Workspace {
                 let id = insert_record_tx(&tx, definition, row, row.id > 0)?;
                 let mut applied_row = row.clone();
                 applied_row.id = id;
-                refresh_fts(&tx, definition, id, &applied_row.values)?;
+                index_fts(&tx, definition, id, &applied_row.values)?;
                 for child in children {
                     let child_table = schema
                         .table(&child.table)
                         .ok_or_else(|| StorageError::NotFound(child.table.clone()))?;
                     insert_record_tx(&tx, child_table, &child.row, true)?;
-                    refresh_fts(&tx, child_table, child.row.id, &child.row.values)?;
+                    index_fts(&tx, child_table, child.row.id, &child.row.values)?;
                 }
                 Command::InsertRow {
                     table: table.clone(),
@@ -1266,7 +1413,7 @@ impl Workspace {
                 }
                 for row in rows {
                     insert_record_tx(&tx, table, row, true)?;
-                    refresh_fts(&tx, table, row.id, &row.values)?;
+                    index_fts(&tx, table, row.id, &row.values)?;
                 }
                 for index in indexes {
                     tx.execute_batch(&create_index_sql(index))?;
@@ -1300,16 +1447,12 @@ impl Workspace {
                     if layout.table == *old_name {
                         let mut updated = layout.clone();
                         updated.table = new_name.clone();
-                        updated.updated_at = now_ms();
+                        // A rename changes identity, not form content, so the
+                        // original timestamp survives undo/redo exactly.
                         tx.execute(
-                            "UPDATE _slab_layouts SET table_name = ?1, spec_json = ?2,
-                                updated_at = ?3 WHERE id = ?4",
-                            params![
-                                new_name,
-                                serde_json::to_string(&updated)?,
-                                updated.updated_at,
-                                updated.id
-                            ],
+                            "UPDATE _slab_layouts SET table_name = ?1, spec_json = ?2
+                                WHERE id = ?3",
+                            params![new_name, serde_json::to_string(&updated)?, updated.id],
                         )?;
                     }
                 }
@@ -1574,6 +1717,21 @@ fn configure(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn workspace_open_error(error: rusqlite::Error, path: &Path) -> StorageError {
+    if let rusqlite::Error::SqliteFailure(failure, _) = &error
+        && matches!(
+            failure.code,
+            rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+        )
+    {
+        return StorageError::Workspace(format!(
+            "{} is not a valid SQLite database",
+            path.display()
+        ));
+    }
+    error.into()
+}
+
 fn initialize(conn: &Connection, name: &str) -> Result<(), StorageError> {
     conn.execute_batch(SYSTEM_DDL)?;
     conn.execute(
@@ -1696,7 +1854,7 @@ pub(crate) fn read_stored_record(
 }
 
 fn insert_record_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     table: &Table,
     record: &slab_core::Record,
     explicit_id: bool,
@@ -1868,18 +2026,17 @@ fn rebuild_fts_for_table(tx: &Transaction<'_>, table: &Table) -> Result<(), Stor
                 decode_value(row, index + 1, &column.ty)?,
             );
         }
-        refresh_fts(tx, table, id, &values)?;
+        index_fts(tx, table, id, &values)?;
     }
     Ok(())
 }
 
-fn refresh_fts(
-    tx: &Transaction<'_>,
+fn index_fts(
+    tx: &Connection,
     table: &Table,
     id: RowId,
     values: &RowData,
 ) -> Result<(), StorageError> {
-    delete_fts(tx, &table.name, id)?;
     let mut body = String::new();
     for column in table.stored_columns() {
         if let Some(value) = values.get(&column.name) {
@@ -1902,7 +2059,17 @@ fn refresh_fts(
     Ok(())
 }
 
-fn delete_fts(tx: &Transaction<'_>, table: &str, id: RowId) -> Result<(), StorageError> {
+fn refresh_fts(
+    tx: &Connection,
+    table: &Table,
+    id: RowId,
+    values: &RowData,
+) -> Result<(), StorageError> {
+    delete_fts(tx, &table.name, id)?;
+    index_fts(tx, table, id, values)
+}
+
+fn delete_fts(tx: &Connection, table: &str, id: RowId) -> Result<(), StorageError> {
     tx.execute(
         "DELETE FROM _slab_fts WHERE table_name = ?1 AND CAST(row_id AS INTEGER) = ?2",
         params![table, id],
@@ -2084,7 +2251,7 @@ fn rebuild_table(
 }
 
 fn append_audit(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command: &Command,
     hlc: &Hlc,
     actor: &str,
@@ -2211,25 +2378,24 @@ fn rename_column_in_schema(
         for column in &mut definition.columns {
             match &mut column.ty {
                 ColumnType::Formula { expression } => {
-                    let mut parsed = parse_formula(expression)?;
+                    let parsed = parse_formula(expression)?;
                     let bare = parsed.bare_columns();
                     let qualified = parsed.qualified_columns();
-                    let mut changed = false;
                     if definition.name == table && bare.iter().any(|name| name == old_name) {
-                        parsed.rewrite_column(None, old_name, new_name);
-                        changed = true;
+                        *expression = rewrite_column_source(expression, None, old_name, new_name)?;
                     }
                     for relation in &child_relations {
                         if qualified
                             .iter()
                             .any(|(name, column)| name == relation && column == old_name)
                         {
-                            parsed.rewrite_column(Some(relation), old_name, new_name);
-                            changed = true;
+                            *expression = rewrite_column_source(
+                                expression,
+                                Some(relation),
+                                old_name,
+                                new_name,
+                            )?;
                         }
-                    }
-                    if changed {
-                        *expression = parsed.to_string();
                     }
                 }
                 ColumnType::Lookup {
