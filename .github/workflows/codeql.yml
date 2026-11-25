@@ -37,10 +37,11 @@ jobs:
         with:
           category: /language:javascript-typescript
 
-  # PR and main-push Rust analysis runs as `Rust CodeQL` in ci.yml under CI
-  # gate. This job keeps the weekly scan current with new CodeQL queries.
+  # PR and main-push Rust analysis runs as `Analyze (rust)` in ci.yml under
+  # CI gate. This job keeps the weekly scan current with new CodeQL queries;
+  # its distinct name keeps its PR skip from shadowing that required check.
   analyze-rust:
-    name: Analyze (rust)
+    name: Analyze (rust, scheduled)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 60

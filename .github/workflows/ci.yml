@@ -167,9 +167,10 @@ jobs:
         run: npm --prefix apps/desktop run tauri build
 
   # Rust CodeQL lives here rather than in codeql.yml so CI gate can depend on
-  # it; codeql.yml keeps only the weekly scheduled Rust analysis.
+  # it; codeql.yml keeps only the weekly scheduled Rust analysis. The name
+  # matches the `Analyze (rust)` required check in the main ruleset.
   codeql-rust:
-    name: Rust CodeQL
+    name: Analyze (rust)
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: macos-15
     timeout-minutes: 60
