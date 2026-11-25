@@ -8,7 +8,10 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::Read;
+
+use serde::de::{self, Deserializer as _, MapAccess, SeqAccess, Visitor};
 
 use slab_core::error::codes;
 use slab_core::{
@@ -48,6 +51,10 @@ pub struct ImportOptions {
     pub max_issues: u32,
     /// Skip rows that fail validation instead of stopping.
     pub skip_invalid: bool,
+    /// Maximum rows used to infer column types. Ingestion still streams all rows.
+    pub inference_limit: u32,
+    /// Number of converted rows sent to the sink in one batch.
+    pub batch_size: u32,
 }
 
 impl Default for ImportOptions {
@@ -58,6 +65,8 @@ impl Default for ImportOptions {
             max_preview_rows: 20,
             max_issues: 100,
             skip_invalid: false,
+            inference_limit: 5_000,
+            batch_size: 500,
         }
     }
 }
@@ -106,6 +115,10 @@ pub struct ImportPreview {
     pub sample: Vec<PreviewRow>,
     /// Total rows scanned.
     pub rows_scanned: u64,
+    /// Rows actually used for type inference.
+    pub inference_rows: u64,
+    /// True when scanning stopped feeding type inference at the configured cap.
+    pub inference_limited: bool,
     /// Structural issues found while scanning.
     pub issues: Vec<RowIssue>,
 }
@@ -247,65 +260,179 @@ impl ImportAdapter for JsonAdapter {
         on_columns: &mut dyn FnMut(&[String]),
         on_row: &mut dyn FnMut(SourceRow),
     ) -> Result<(), ImportError> {
-        let values: serde_json::Value = serde_json::from_reader(reader)?;
-        let objects: Vec<&serde_json::Map<String, serde_json::Value>> = match &values {
-            serde_json::Value::Array(items) => {
-                items.iter().filter_map(|item| item.as_object()).collect()
-            }
-            serde_json::Value::Object(object) => vec![object],
-            _ => {
-                return Err(ImportError::Format(
-                    "JSON source must be an object or an array of objects".into(),
-                ));
-            }
-        };
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
         let mut columns: Vec<String> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for object in objects {
-            let mut added = false;
-            for key in object.keys() {
-                if seen.insert(key.clone()) {
-                    columns.push(key.clone());
-                    added = true;
-                }
-            }
-            if added {
-                on_columns(&columns);
+        let mut row_number = 0_u64;
+        loop {
+            let visitor = JsonVisitor {
+                columns: &mut columns,
+                seen: &mut seen,
+                on_columns,
+                on_row,
+                row_number: &mut row_number,
+            };
+            match deserializer.deserialize_any(visitor) {
+                Ok(()) => {}
+                Err(error) if error.is_eof() => break,
+                Err(error) => return Err(error.into()),
             }
         }
-        for (index, object) in values
-            .as_array()
-            .map_or_else(|| vec![&values], |items| items.iter().collect())
-            .into_iter()
-            .enumerate()
-        {
-            let row_number = u64::try_from(index).unwrap_or(u64::MAX) + 1;
-            let mut row = SourceRow {
-                number: row_number,
-                ..SourceRow::default()
-            };
-            let Some(object) = object.as_object() else {
-                row.issues.push("row is not an object".into());
-                on_row(row);
-                continue;
-            };
-            for column in &columns {
-                let value = object.get(column);
-                row.values.insert(
-                    column.clone(),
-                    value.map(|value| match value {
-                        serde_json::Value::String(text) => text.clone(),
-                        serde_json::Value::Null => String::new(),
-                        other => other.to_string(),
-                    }),
+        Ok(())
+    }
+}
+
+struct JsonVisitor<'a> {
+    columns: &'a mut Vec<String>,
+    seen: &'a mut BTreeSet<String>,
+    on_columns: &'a mut dyn FnMut(&[String]),
+    on_row: &'a mut dyn FnMut(SourceRow),
+    row_number: &'a mut u64,
+}
+
+impl<'de> Visitor<'de> for JsonVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object or an array of objects")
+    }
+
+    fn visit_seq<A>(mut self, mut sequence: A) -> Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(value) = sequence.next_element::<serde_json::Value>()? {
+            self.emit_value(value);
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(mut self, mut map: A) -> Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = BTreeMap::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value: serde_json::Value = map.next_value()?;
+            values.insert(key, json_text(&value));
+        }
+        self.emit_object(values);
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<(), E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON source must be an object or an array of objects",
+        ))
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<(), E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON source must be an object or an array of objects",
+        ))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<(), E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON source must be an object or an array of objects",
+        ))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<(), E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON source must be an object or an array of objects",
+        ))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<(), E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON source must be an object or an array of objects",
+        ))
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON source must be an object or an array of objects",
+        ))
+    }
+}
+
+impl JsonVisitor<'_> {
+    fn emit_value(&mut self, value: serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                self.emit_object(
+                    object
+                        .into_iter()
+                        .map(|(key, value)| (key, json_text(&value)))
+                        .collect(),
                 );
-                if value.is_none() {
+            }
+            _ => {
+                *self.row_number = self.row_number.saturating_add(1);
+                (self.on_row)(SourceRow {
+                    number: *self.row_number,
+                    issues: vec!["row is not an object".into()],
+                    ..SourceRow::default()
+                });
+            }
+        }
+    }
+
+    fn emit_object(&mut self, values: BTreeMap<String, String>) {
+        let mut added = false;
+        for key in values.keys() {
+            if self.seen.insert(key.clone()) {
+                self.columns.push(key.clone());
+                added = true;
+            }
+        }
+        if added {
+            (self.on_columns)(self.columns);
+        }
+        *self.row_number = self.row_number.saturating_add(1);
+        let mut row = SourceRow {
+            number: *self.row_number,
+            ..SourceRow::default()
+        };
+        for column in self.columns.iter() {
+            match values.get(column) {
+                Some(value) => {
+                    row.values.insert(column.clone(), Some(value.clone()));
+                }
+                None => {
+                    row.values.insert(column.clone(), None);
                     row.issues.push(format!("missing value for {column}"));
                 }
             }
-            on_row(row);
         }
-        Ok(())
+        (self.on_row)(row);
+    }
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -320,6 +447,8 @@ pub fn preview(
     let mut issues: Vec<RowIssue> = Vec::new();
     let mut sample: Vec<PreviewRow> = Vec::new();
     let mut rows_scanned = 0_u64;
+    let mut inference_rows = 0_u64;
+    let inference_limit = u64::from(options.inference_limit.max(1));
     let max_issues = usize::try_from(options.max_issues).unwrap_or(usize::MAX);
     adapter.read(
         reader,
@@ -339,22 +468,30 @@ pub fn preview(
         },
         &mut |row| {
             rows_scanned += 1;
+            let infer_this_row = inference_rows < inference_limit;
+            if infer_this_row {
+                inference_rows += 1;
+            }
             let mut columns = columns.borrow_mut();
-            for column in &mut *columns {
-                let value = row.values.get(&column.name).and_then(Option::as_deref);
-                match value.filter(|value| !value.trim().is_empty()) {
-                    Some(value) => {
-                        let candidate = classify(value);
-                        if column.samples.is_empty() {
-                            column.ty = candidate.clone();
-                        } else {
-                            column.ty = merge_types(&column.ty, &candidate);
+            if infer_this_row {
+                for column in &mut *columns {
+                    let value = row.values.get(&column.name).and_then(Option::as_deref);
+                    match value.filter(|value| !value.trim().is_empty()) {
+                        Some(value) => {
+                            let candidate = classify(value);
+                            if column.samples.is_empty() {
+                                column.ty = candidate.clone();
+                            } else {
+                                column.ty = merge_types(&column.ty, &candidate);
+                            }
+                            if column.samples.len() < 3
+                                && !column.samples.iter().any(|s| s == value)
+                            {
+                                column.samples.push(value.to_owned());
+                            }
                         }
-                        if column.samples.len() < 3 && !column.samples.iter().any(|s| s == value) {
-                            column.samples.push(value.to_owned());
-                        }
+                        None => column.nullable = true,
                     }
-                    None => column.nullable = true,
                 }
             }
             for issue in &row.issues {
@@ -388,6 +525,8 @@ pub fn preview(
         columns,
         sample,
         rows_scanned,
+        inference_rows,
+        inference_limited: rows_scanned > inference_limit,
         issues,
     })
 }
@@ -494,6 +633,16 @@ pub fn validate(
 pub trait ImportSink {
     /// Inserts one validated row and returns its id.
     fn insert_row(&mut self, table: &str, values: &RowData) -> Result<RowId, ImportError>;
+
+    /// Inserts a bounded batch. The default preserves correctness for sinks
+    /// that cannot commit in bulk; storage-backed sinks override it.
+    fn insert_batch(&mut self, table: &str, rows: &[RowData]) -> Result<Vec<RowId>, ImportError> {
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            ids.push(self.insert_row(table, row)?);
+        }
+        Ok(ids)
+    }
 }
 
 /// The result of applying an import.
@@ -525,21 +674,33 @@ pub fn apply(
         issues: Vec::new(),
     };
     let max_issues = usize::try_from(options.max_issues).unwrap_or(usize::MAX);
+    let batch_size = usize::try_from(options.batch_size.clamp(1, 10_000)).unwrap_or(1);
+    let mut batch: Vec<RowData> = Vec::with_capacity(batch_size);
     let mut failure: Option<ImportError> = None;
     adapter.read(reader, options, &mut |_| {}, &mut |row| {
         if failure.is_some() {
             return;
         }
         match convert_row(target, mapping, &row) {
-            Ok(values) => match sink.insert_row(&target.name, &values) {
-                Ok(_) => summary.inserted += 1,
-                Err(error) => {
-                    summary.skipped += 1;
+            Ok(values) => {
+                batch.push(values);
+                if batch.len() >= batch_size
+                    && let Err(error) = flush_batch(sink, &target.name, &mut batch, &mut summary)
+                {
                     if !options.skip_invalid {
                         failure = Some(error);
+                    } else {
+                        summary.skipped += 1;
+                        if summary.issues.len() < max_issues {
+                            summary.issues.push(RowIssue {
+                                row_number: row.number,
+                                column: None,
+                                message: error.to_string(),
+                            });
+                        }
                     }
                 }
-            },
+            }
             Err(issues) => {
                 summary.skipped += 1;
                 let fatal = !options.skip_invalid;
@@ -556,10 +717,30 @@ pub fn apply(
             }
         }
     })?;
+    if failure.is_none()
+        && let Err(error) = flush_batch(sink, &target.name, &mut batch, &mut summary)
+    {
+        failure = Some(error);
+    }
     if let Some(error) = failure {
         return Err(error);
     }
     Ok(summary)
+}
+
+fn flush_batch(
+    sink: &mut dyn ImportSink,
+    table: &str,
+    batch: &mut Vec<RowData>,
+    summary: &mut ImportSummary,
+) -> Result<(), ImportError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let ids = sink.insert_batch(table, batch)?;
+    summary.inserted += u64::try_from(ids.len()).unwrap_or(u64::MAX);
+    batch.clear();
+    Ok(())
 }
 
 fn convert_row(
@@ -779,6 +960,98 @@ mod tests {
         .expect("preview");
         assert_eq!(preview.rows_scanned, 2);
         assert_eq!(preview.columns.len(), 2);
+    }
+
+    #[test]
+    fn json_streams_ndjson_records() {
+        let source = "{\"Name\":\"Northlight\",\"Seats\":12}\n{\"Name\":\"Hiraya\",\"Seats\":4}\n";
+        let mut adapter = JsonAdapter;
+        let preview = preview(
+            &mut adapter,
+            &mut source.as_bytes(),
+            &ImportOptions::default(),
+        )
+        .expect("preview");
+        assert_eq!(preview.rows_scanned, 2);
+        assert_eq!(preview.columns.len(), 2);
+    }
+
+    #[test]
+    fn csv_inference_stops_at_the_configured_prefix() {
+        let source = "Name,Seats\nA,1\nB,2\nC,three\nD,four\n";
+        let mut adapter = CsvAdapter;
+        let options = ImportOptions {
+            inference_limit: 2,
+            ..ImportOptions::default()
+        };
+        let preview = preview(&mut adapter, &mut source.as_bytes(), &options).expect("preview");
+        assert_eq!(preview.rows_scanned, 4);
+        assert_eq!(preview.inference_rows, 2);
+        assert!(preview.inference_limited);
+        assert_eq!(preview.columns[1].ty, ColumnType::Integer);
+    }
+
+    #[test]
+    fn large_json_array_commits_in_bounded_batches() {
+        struct BatchedSink {
+            batches: Vec<usize>,
+            rows: usize,
+        }
+        impl ImportSink for BatchedSink {
+            fn insert_row(
+                &mut self,
+                _table: &str,
+                _values: &RowData,
+            ) -> Result<RowId, ImportError> {
+                self.rows += 1;
+                Ok(i64::try_from(self.rows).unwrap_or(0))
+            }
+
+            fn insert_batch(
+                &mut self,
+                _table: &str,
+                rows: &[RowData],
+            ) -> Result<Vec<RowId>, ImportError> {
+                self.batches.push(rows.len());
+                self.rows += rows.len();
+                Ok((0..rows.len())
+                    .map(|index| i64::try_from(self.rows + index).unwrap_or(0))
+                    .collect())
+            }
+        }
+        let mut source = String::from("[");
+        for index in 0..25_000 {
+            if index > 0 {
+                source.push(',');
+            }
+            source.push_str(&format!("{{\"Name\":\"Row {index}\",\"Seats\":{index}}}"));
+        }
+        source.push(']');
+        let mut adapter = JsonAdapter;
+        let target = table();
+        let mapping = suggest_mapping(&["Name".to_owned(), "Seats".to_owned()], &target);
+        let options = ImportOptions {
+            batch_size: 500,
+            ..ImportOptions::default()
+        };
+        let mut sink = BatchedSink {
+            batches: Vec::new(),
+            rows: 0,
+        };
+        let summary = apply(
+            &mut adapter,
+            &mut source.as_bytes(),
+            &options,
+            &target,
+            &mapping,
+            &mut sink,
+        )
+        .expect("apply");
+        assert_eq!(summary.inserted, 25_000);
+        assert_eq!(sink.rows, 25_000);
+        assert_eq!(sink.batches.iter().sum::<usize>(), 25_000);
+        assert!(sink.batches.len() >= 50);
+        assert!(sink.batches.iter().all(|size| *size <= 500));
     }
 
     #[test]
