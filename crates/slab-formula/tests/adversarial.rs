@@ -240,3 +240,22 @@ fn renaming_to_a_non_bare_name_brackets_the_reference() {
     .expect("rewrite");
     assert_eq!(qualified, "[Items].[Unit Price]");
 }
+
+#[test]
+fn renaming_back_to_a_bare_name_restores_the_bare_spelling() {
+    let undone =
+        slab_formula::rewrite_column_source("Qty * [Unit Price]", None, "Unit Price", "Price")
+            .expect("rewrite");
+    assert_eq!(undone, "Qty * Price");
+    assert!(slab_formula::parse(&undone).is_ok());
+
+    let qualified = slab_formula::rewrite_column_source(
+        "[Items].[Unit Price]",
+        Some("Items"),
+        "Unit Price",
+        "Price",
+    )
+    .expect("rewrite");
+    assert_eq!(qualified, "[Items].Price");
+    assert!(slab_formula::parse(&qualified).is_ok());
+}

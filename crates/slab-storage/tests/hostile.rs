@@ -1183,4 +1183,75 @@ fn nulled_hashes_do_not_launder_a_tampered_audit_entry() {
         "a NULLed hash laundered the tampered entry into a fresh chain"
     );
     assert!(report.audit_tamper.is_some());
+
+    // NULLing every hash must not fall back into the legacy migration path
+    // while the chain head still proves this is a modern log.
+    let all_path = directory.path().join("audit-launder-all.slab");
+    let mut all =
+        Workspace::create(&all_path, "Audit", Box::new(TestClock::new())).expect("create all");
+    all.create_table(&TableDraft {
+        name: "Notes".into(),
+        columns: vec![text("Body")],
+    })
+    .expect("table");
+    for index in 0..3 {
+        all.insert_row(
+            "Notes",
+            &row(&[("Body", Value::from(format!("note {index}")))]),
+        )
+        .expect("row");
+    }
+    all.close().expect("close all");
+    {
+        let connection = Connection::open(&all_path).expect("raw open all");
+        connection
+            .execute(
+                "UPDATE _slab_audit_log
+                 SET summary = 'silently rewritten', prev_hash = NULL, entry_hash = NULL",
+                [],
+            )
+            .expect("tamper all");
+    }
+    let all = Workspace::open(&all_path, Box::new(TestClock::new())).expect("reopen all");
+    let report = all.integrity_check().expect("check all");
+    assert!(
+        !report.audit_chain,
+        "NULLing every hash laundered the modern log into a legacy migration"
+    );
+    assert!(report.audit_tamper.is_some());
+}
+
+/// A non-UTF-8 parent directory is a valid Unix path, but `VACUUM INTO` needs a
+/// Rust string. The failure must remove its scratch file instead of leaving
+/// residue behind. APFS rejects such a directory name, so this runs on Linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_snapshot_parent_leaves_no_scratch_file() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let path = directory.path().join("live.slab");
+    let mut workspace =
+        Workspace::create(&path, "Snapshot", Box::new(TestClock::new())).expect("create");
+    workspace
+        .create_table(&TableDraft {
+            name: "Notes".into(),
+            columns: vec![text("Body")],
+        })
+        .expect("table");
+
+    let parent = directory
+        .path()
+        .join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
+    fs::create_dir(&parent).expect("non-utf8 dir");
+    let error = workspace
+        .snapshot_vacuum_to(parent.join("snapshot.slab"))
+        .expect_err("a non-UTF-8 target must fail");
+    assert_eq!(error.code_str(), "SLAB_E_WORKSPACE");
+    assert_eq!(
+        fs::read_dir(&parent).expect("read parent").count(),
+        0,
+        "a failed snapshot left a scratch file behind"
+    );
 }

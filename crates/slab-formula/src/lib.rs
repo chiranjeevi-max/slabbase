@@ -68,18 +68,30 @@ pub fn rewrite_column_source(
             _ => continue,
         }
         let bracketed = input.as_bytes().get(token.position) == Some(&b'[');
-        let start = if bracketed {
-            token.position + 1
+        // Reversing a rename that had to add brackets restores the original
+        // bare spelling instead of leaving `[Price]` behind.
+        let unbracket = bracketed && !is_bare_identifier(from) && is_bare_identifier(to);
+        let (start, end, expected) = if unbracket {
+            (
+                token.position,
+                token.position + name.len() + 2,
+                format!("[{name}]"),
+            )
+        } else if bracketed {
+            (
+                token.position + 1,
+                token.position + 1 + name.len(),
+                name.clone(),
+            )
         } else {
-            token.position
+            (token.position, token.position + name.len(), name.clone())
         };
-        let end = start + name.len();
-        if input.get(start..end) == Some(name.as_str()) {
+        if input.get(start..end) == Some(expected.as_str()) {
             // A bare reference can only stay bare when the new name is itself a
             // legal bare identifier. Names with spaces, a leading digit, or a
             // keyword spelling need brackets; a name that was already bracketed
             // stays inside its existing brackets.
-            let replacement = if bracketed || is_bare_identifier(to) {
+            let replacement = if (bracketed && !unbracket) || is_bare_identifier(to) {
                 to.to_owned()
             } else {
                 format!("[{to}]")

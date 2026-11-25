@@ -883,9 +883,15 @@ impl Workspace {
             .unwrap_or_else(|| Path::new("."));
         let (temporary, file) = create_temporary_sibling(parent)?;
         drop(file);
-        let target = temporary
-            .to_str()
-            .ok_or_else(|| StorageError::Workspace("snapshot path is not valid UTF-8".into()))?;
+        let Some(target) = temporary.to_str() else {
+            // A non-UTF-8 parent produces a valid Unix path that `VACUUM INTO`
+            // cannot receive as a Rust string. Remove the scratch file before
+            // returning so failed snapshots do not accumulate residue.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(StorageError::Workspace(
+                "snapshot path is not valid UTF-8".into(),
+            ));
+        };
         let outcome = self.conn.execute("VACUUM INTO ?1", params![target]);
         if let Err(error) = outcome {
             let _ = std::fs::remove_file(&temporary);
@@ -2369,14 +2375,14 @@ fn ensure_audit_chain(conn: &Connection) -> Result<(), StorageError> {
         |row| row.get(0),
     )?;
     if missing > 0 {
-        if missing == total {
-            // A wholly unhashed log is the legacy v1.0 format. Backfilling it
-            // is a migration.
+        // A wholly unhashed log is the legacy v1.0 format only when it also
+        // has no chain anchor. If the head exists, an attacker has NULLed the
+        // hashes of a modern log; backfilling would rewrite a fresh chain over
+        // the altered content.
+        if missing == total && read_meta(conn, "audit_head_hash")?.is_none() {
             return backfill_audit_chain(conn);
         }
-        // A partially hashed log is not a legacy file. Rewriting the missing
-        // hashes over the current content would launder an altered entry, so
-        // leave the evidence for `verify_audit_chain` to report.
+        // Leave every other missing hash for `verify_audit_chain` to report.
         return Ok(());
     }
     if read_meta(conn, "audit_head_hash")?.is_none() {
