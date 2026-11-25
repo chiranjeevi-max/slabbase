@@ -84,6 +84,9 @@ fn rename_table_updates_relations_metadata_and_search() {
             on_delete: DeleteAction::Cascade,
         })
         .expect("relation");
+    workspace
+        .save_layout(field_layout("Clients", "Name"))
+        .expect("layout");
     let client = workspace
         .insert_row(
             "Clients",
@@ -123,6 +126,7 @@ fn rename_table_updates_relations_metadata_and_search() {
             .table,
         "Customers"
     );
+    assert_eq!(schema.layouts[0].table, "Customers");
     let hits = workspace.search("northlight", 10).expect("search");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].table, "Customers");

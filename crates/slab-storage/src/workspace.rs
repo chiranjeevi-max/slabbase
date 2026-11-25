@@ -1287,10 +1287,23 @@ impl Workspace {
                     "UPDATE _slab_relations SET child_table = ?1 WHERE child_table = ?2",
                     params![new_name, old_name],
                 )?;
-                tx.execute(
-                    "UPDATE _slab_layouts SET table_name = ?1 WHERE table_name = ?2",
-                    params![new_name, old_name],
-                )?;
+                for layout in &schema.layouts {
+                    if layout.table == *old_name {
+                        let mut updated = layout.clone();
+                        updated.table = new_name.clone();
+                        updated.updated_at = now_ms();
+                        tx.execute(
+                            "UPDATE _slab_layouts SET table_name = ?1, spec_json = ?2,
+                                updated_at = ?3 WHERE id = ?4",
+                            params![
+                                new_name,
+                                serde_json::to_string(&updated)?,
+                                updated.updated_at,
+                                updated.id
+                            ],
+                        )?;
+                    }
+                }
                 tx.execute(
                     "UPDATE _slab_fts SET table_name = ?1 WHERE table_name = ?2",
                     params![new_name, old_name],
