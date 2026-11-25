@@ -447,6 +447,15 @@ impl Workspace {
                 )?;
             }
         }
+        let mut indexes = self.conn.prepare(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name LIKE 'slab_idx_%' AND sql IS NOT NULL
+             ORDER BY name",
+        )?;
+        let index_sql = indexes.query_map([], |row| row.get::<_, String>(0))?;
+        for statement in index_sql {
+            writeln!(out, "{};", statement?)?;
+        }
         writeln!(out, "COMMIT;")?;
         out.flush()?;
         Ok(())
