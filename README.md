@@ -41,6 +41,13 @@ npm --prefix apps/desktop run build
 npm --prefix apps/desktop run tauri build
 ```
 
+Launch the built app with the sample workspace:
+
+```bash
+open target/release/bundle/macos/SlabBase.app \
+  --args --workspace "$PWD/fixtures/design-studio.slab"
+```
+
 For development:
 
 ```bash

@@ -28,7 +28,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let db = worker::DbHandle::new()?;
-            if let Ok(path) = std::env::var("SLABBASE_WORKSPACE") {
+            if let Some(path) = requested_workspace() {
                 let _ = db.open(path);
             }
             app.manage(AppState { db: Arc::new(db) });
@@ -74,6 +74,19 @@ pub fn run() {
     if let Err(error) = builder.run(tauri::generate_context!()) {
         report_startup_error(&error);
     }
+}
+
+fn requested_workspace() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--workspace" {
+            return args.next();
+        }
+        if let Some(path) = argument.strip_prefix("--workspace=") {
+            return Some(path.to_owned());
+        }
+    }
+    std::env::var("SLABBASE_WORKSPACE").ok()
 }
 
 #[allow(clippy::print_stderr)]
