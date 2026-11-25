@@ -5,7 +5,6 @@ name: CodeQL
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
   schedule:
     - cron: "24 5 * * 1"
   workflow_dispatch:
@@ -38,11 +37,11 @@ jobs:
         with:
           category: /language:javascript-typescript
 
-  # Separate job (not a matrix entry) because a job-level `if` cannot read
-  # the matrix. On PRs the macOS runner starts only with the ok-to-test label.
+  # PR and main-push Rust analysis runs as `Rust CodeQL` in ci.yml under CI
+  # gate. This job keeps the weekly scan current with new CodeQL queries.
   analyze-rust:
     name: Analyze (rust)
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 60
     permissions:

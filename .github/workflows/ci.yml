@@ -166,14 +166,45 @@ jobs:
       - name: Build macOS application bundle
         run: npm --prefix apps/desktop run tauri build
 
-  # Required check for this workflow's jobs. GitHub treats a skipped job as
-  # passing, so this job fails explicitly when a PR lacks ok-to-test or any
-  # job in ci.yml did not succeed. Rust CodeQL lives in codeql.yml and is
-  # enforced by its own required check, `Analyze (rust)`.
+  # Rust CodeQL lives here rather than in codeql.yml so CI gate can depend on
+  # it; codeql.yml keeps only the weekly scheduled Rust analysis.
+  codeql-rust:
+    name: Rust CodeQL
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      packages: read
+      contents: read
+      actions: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust for CodeQL
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          languages: rust
+          build-mode: none
+      - name: Analyze
+        uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          category: /language:rust
+
+  # The only required check for gated work. GitHub treats a skipped job as
+  # passing, and removing the label re-runs the workflow on the same commit,
+  # so individual job checks can be overwritten by skips. This job fails
+  # explicitly when a PR lacks ok-to-test or any job it needs did not succeed.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [quick, rust, desktop, bundle]
+    needs: [quick, rust, desktop, bundle, codeql-rust]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
