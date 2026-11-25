@@ -8,5 +8,7 @@
 .DS_Store
 *.swp
 *.log
+*.slab-wal
+*.slab-shm
 .coverage
 /coverage
