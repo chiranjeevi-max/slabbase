@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { confirmDestructive, isTauri } from "./native";
 import { usePresence } from "./presence";
@@ -16,6 +17,7 @@ import { AuditDrawer } from "./components/AuditDrawer";
 import { Toasts } from "./components/Toasts";
 import { AppearancePopover } from "./components/AppearancePopover";
 import { ContextMenu, type ContextMenuItem } from "./components/ContextMenu";
+import { runMenuAction } from "./menu";
 import { formatTimestamp } from "./types";
 
 const SIDEBAR_DEFAULT = 240;
@@ -51,6 +53,8 @@ export function App() {
   const [sidebarOverlay, setSidebarOverlay] = useState(false);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const inspectorPresence = usePresence(view === "table" && inspectorOpen, 110);
+  const sidebarToggleRef = useRef<() => void>(() => {});
+  const lastMenuUndoRef = useRef(0);
 
   useEffect(() => {
     if (isNarrowSidebar) setSidebarOverlay(false);
@@ -103,9 +107,13 @@ export function App() {
         state.setPaletteOpen(true);
       } else if (meta && key === "z") {
         if (editing || !state.info) return;
+        if (performance.now() - lastMenuUndoRef.current < 250) return;
         event.preventDefault();
         if (event.shiftKey) void state.redo();
         else void state.undo();
+      } else if (meta && key === ",") {
+        event.preventDefault();
+        state.setAppearanceOpen(true);
       } else if (meta && key === "n") {
         if (editing || !state.info) return;
         event.preventDefault();
@@ -153,6 +161,26 @@ export function App() {
     if (isNarrowSidebar) setSidebarOverlay((open) => !open);
     else setSidebarDocked((open) => !open);
   };
+  sidebarToggleRef.current = toggleSidebar;
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<string>("menu-action", (event) => {
+      if (event.payload === "edit-undo" || event.payload === "edit-redo") {
+        lastMenuUndoRef.current = performance.now();
+      }
+      void runMenuAction(event.payload, () => sidebarToggleRef.current());
+    }).then((off) => {
+      if (disposed) off();
+      else unlisten = off;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   return (
     <div className="app">

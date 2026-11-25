@@ -1,7 +1,13 @@
 import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 
 export function isTauri(): boolean {
-  return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
+  const internals = window.__TAURI_INTERNALS__ as
+    | { invoke?: unknown; transformCallback?: unknown }
+    | undefined;
+  return (
+    typeof internals?.invoke === "function" &&
+    typeof internals?.transformCallback === "function"
+  );
 }
 
 /**
