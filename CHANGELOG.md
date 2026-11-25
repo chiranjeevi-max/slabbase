@@ -42,7 +42,7 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Neutralize spreadsheet formula injection, including a leading line feed, and publish CSV/JSON exports atomically so a failed export cannot truncate an existing file.
 - Restore the original bare formula spelling when a rename that needed brackets is undone.
 - Exclude concurrent read leases from schema-changing commands, so a read never prepares SQL against a schema that was renamed underneath it.
-- Keep an existing export's file permissions when an export replaces it, so a private `0600` file is not republished with the default mode.
+- Create an export's scratch file with the existing destination's permissions, so re-exporting over a private `0600` file never exposes its rows to other users, during the write or after publishing.
 - Keep Form Studio edits made while a save is in flight, clamp item position and width to the 12-column grid, and resync the portal relation picker when relations change.
 - Keep a New Record draft open when the grid is clicked or double-clicked, and refresh an open inspector when another row is double-clicked.
 - Leave a newer selection alone when a delete or insert resolves, and clear the row-loading indicator whenever a page request is discarded.

@@ -661,12 +661,23 @@ impl ExportTemp {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        // Rows are written before `publish`, so the scratch file must be born
+        // with the destination's mode; tightening it at publish would leave a
+        // private export world-readable while it is written. The umask can
+        // only narrow this further.
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::metadata(target) {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(metadata.permissions().mode() & 0o777);
+        }
         for serial in 0..64 {
             let path = parent.join(format!(
                 ".slabbase-export-{}-{serial}.tmp",
                 std::process::id()
             ));
-            match File::create_new(&path) {
+            match options.open(&path) {
                 Ok(file) => {
                     return Ok((
                         Self {
@@ -1155,6 +1166,27 @@ mod permission_tests {
         assert_eq!(
             mode, 0o600,
             "publishing widened the destination permissions"
+        );
+    }
+
+    #[test]
+    fn export_scratch_is_private_before_rows_are_written() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("private.csv");
+        fs::write(&path, "old").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+
+        let (temporary, _file) = ExportTemp::create(path.to_str().expect("path")).expect("scratch");
+
+        let mode = fs::metadata(&temporary.path)
+            .expect("scratch metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the scratch file for a private export is readable by others: {mode:o}"
         );
     }
 }
