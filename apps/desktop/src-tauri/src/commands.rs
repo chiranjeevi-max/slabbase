@@ -686,6 +686,11 @@ impl ExportTemp {
     }
 
     fn publish(mut self, target: &str) -> Result<(), ApiError> {
+        // `rename` replaces the inode, which would otherwise replace a private
+        // destination's permissions with the scratch file's default mode.
+        if let Ok(metadata) = std::fs::metadata(target) {
+            std::fs::set_permissions(&self.path, metadata.permissions())?;
+        }
         std::fs::rename(&self.path, target)?;
         self.published = true;
         Ok(())
@@ -1101,6 +1106,55 @@ mod tests {
             fs::read_to_string(&path).expect("read export"),
             "keep me",
             "a failed page validation truncated the previous file"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::*;
+    use slab_core::{ColumnDraft, ColumnType, TableDraft};
+    use slab_sync::HybridLogicalClock;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn export_publish_preserves_private_destination_permissions() {
+        let mut workspace =
+            Workspace::open_in_memory("Export", Box::new(HybridLogicalClock::new("test")))
+                .expect("workspace");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![ColumnDraft {
+                    name: "Body".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                }],
+            })
+            .expect("table");
+
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("private.json");
+        fs::write(&path, "old").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+
+        export_json_to(
+            &workspace,
+            path.to_str().expect("path"),
+            PageQuery {
+                table: "Notes".into(),
+                ..PageQuery::default()
+            },
+        )
+        .expect("export");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "publishing widened the destination permissions"
         );
     }
 }
