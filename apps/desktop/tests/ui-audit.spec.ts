@@ -907,8 +907,20 @@ test.describe("interaction polish", () => {
         };
       });
 
+    const readPopover = () =>
+      page.evaluate(() => {
+        const element = document.querySelector<HTMLElement>('[data-testid="appearance-popover"]');
+        if (!element) return null;
+        const style = getComputedStyle(element);
+        return {
+          background: style.backgroundColor,
+          border: style.borderTopColor,
+          bevel: style.boxShadow,
+        };
+      });
+
     const darkGlass = await readGlass();
-    expect(darkGlass.sidebarFilter).toContain("blur(22px)");
+    expect(darkGlass.sidebarFilter).toContain("blur(28px)");
     expect(alphaOf(darkGlass.sidebarBg)).toBeLessThan(1);
     expect(alphaOf(darkGlass.gridBg)).toBeGreaterThanOrEqual(0.96);
     expect(alphaOf(darkGlass.headerBg)).toBeGreaterThanOrEqual(0.96);
@@ -922,12 +934,61 @@ test.describe("interaction polish", () => {
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
     await expect(page.locator("html")).toHaveAttribute("data-surface", "glass");
     const lightGlass = await readGlass();
-    expect(lightGlass.sidebarFilter).toContain("blur(22px)");
+    expect(lightGlass.sidebarFilter).toContain("blur(28px)");
     expect(alphaOf(lightGlass.sidebarBg)).toBeLessThan(1);
     expect(alphaOf(lightGlass.gridBg)).toBeGreaterThanOrEqual(0.96);
     await popover.locator('[data-accent-option="orange"]').click();
     expect(await page.locator("html").getAttribute("data-accent")).toBe("orange");
+
+    await page.evaluate(() => {
+      document.documentElement.dataset["native"] = "true";
+    });
+    await page.waitForTimeout(60);
+    const nativeLight = await readGlass();
+    const nativeLightPopover = await readPopover();
+    expect(nativeLight.sidebarFilter).toContain("blur(28px)");
+    expect(alphaOf(nativeLight.sidebarBg)).toBeGreaterThan(0.2);
+    expect(alphaOf(nativeLight.sidebarBg)).toBeLessThan(0.6);
+    expect(alphaOf(nativeLight.gridBg)).toBeGreaterThanOrEqual(0.96);
+    expect(nativeLightPopover).not.toBeNull();
+    expect(alphaOf(nativeLightPopover?.background ?? "")).toBeGreaterThan(0.5);
+    expect(alphaOf(nativeLightPopover?.background ?? "")).toBeLessThan(0.75);
+    expect(alphaOf(nativeLightPopover?.border ?? "")).toBeGreaterThan(0.4);
+    expect(nativeLightPopover?.bevel).toContain("inset");
+
+    await popover.getByRole("button", { name: "Dark", exact: true }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.waitForTimeout(60);
+    const nativeDark = await readGlass();
+    const nativeDarkPopover = await readPopover();
+    expect(alphaOf(nativeDark.sidebarBg)).toBeGreaterThan(0.3);
+    expect(alphaOf(nativeDark.sidebarBg)).toBeLessThan(0.5);
+    expect(alphaOf(nativeDark.gridBg)).toBeGreaterThanOrEqual(0.96);
+    expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
+    expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
+    expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
     await assertViewport(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("accent hex follows the resolved theme", async ({ page }) => {
+    const errors = await boot(page);
+    await page.getByTestId("appearance-button").click();
+    const popover = page.getByTestId("appearance-popover");
+    const hex = page.getByTestId("accent-hex");
+    await expect(hex).toHaveValue("#0066cc");
+    await popover.getByRole("button", { name: "Dark", exact: true }).click();
+    await expect(hex).toHaveValue("#0a84ff");
+    await popover.getByRole("button", { name: "Light", exact: true }).click();
+    await expect(hex).toHaveValue("#0066cc");
+    await popover.locator('[data-accent-option="rose"]').click();
+    await expect(hex).toHaveValue("#be123c");
+    await popover.getByRole("button", { name: "Dark", exact: true }).click();
+    await expect(hex).toHaveValue("#ff375f");
+    await hex.fill("#123456");
+    await hex.press("Enter");
+    await popover.getByRole("button", { name: "Light", exact: true }).click();
+    await expect(hex).toHaveValue("#123456");
     expect(errors).toEqual([]);
   });
 

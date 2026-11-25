@@ -100,14 +100,15 @@ The `<html>` element carries these attributes:
 | `data-accent` | `blue`, `graphite`, `indigo`, `teal`, `green`, `orange`, `rose`, `custom` |
 | `data-density` | `compact`, `default`, `comfortable` |
 | `data-window-focused` | `true`, `false` |
-| `data-native` | `true` when `window.__TAURI_INTERNALS__` exists |
+| `data-native` | `true` when the Tauri internals bridge is present |
 
 Component CSS uses semantic variables only. Literal colors live in `apps/desktop/src/styles/tokens.css`.
 
 | Family | Variables |
 | --- | --- |
-| Backgrounds | `--bg-backdrop`, `--bg-grid`, `--bg-sidebar`, `--bg-toolbar`, `--bg-sheet`, `--bg-elevated`, `--bg-popover`, `--bg-field`, `--bg-hover`, `--bg-search`, `--bg-segmented`, `--bg-paper` |
-| Borders | `--border-hairline`, `--border-control`, `--border-grid`, `--border-elevated` |
+| Backgrounds | `--bg-backdrop`, `--bg-grid`, `--bg-sidebar`, `--bg-toolbar`, `--bg-sheet`, `--bg-elevated`, `--bg-popover`, `--bg-field`, `--bg-control`, `--bg-hover`, `--bg-search`, `--bg-segmented`, `--bg-paper` |
+| Borders | `--border-hairline`, `--border-control`, `--border-grid`, `--border-elevated`, `--glass-edge` |
+| Glass | `--glass-blur`, `--glass-sheen` |
 | Text | `--text-primary`, `--text-secondary`, `--text-tertiary`, `--text-on-accent`, `--text-on-danger` |
 | Accent | `--accent`, `--accent-hover`, `--accent-soft`, `--accent-ring`, `--accent-text`, `--accent-on-solid`, `--accent-foreground` |
 | Geometry | `--toolbar-h`, `--subtoolbar-h`, `--statusbar-h`, `--sidebar-row-h`, `--grid-header-h`, `--row-h`, `--sidebar-w`, `--inspector-w` |
@@ -119,11 +120,27 @@ The default preference is `system`. It follows `prefers-color-scheme` and writes
 
 ### Surfaces
 
-Solid is the default. Glass applies `backdrop-filter: blur(22px) saturate(180%)` only to chrome: sidebar, toolbar, popovers, `⌘K`, appearance popover, and context menus. Data grids and form sheets stay opaque with alpha at or above 0.96. Under `prefers-reduced-transparency: reduce`, Glass falls back to Solid and removes the filter.
+Solid is the default. Glass changes only chrome: sidebar, main toolbar, status bar, table sub-toolbar, popovers, `⌘K`, appearance popover, context menus, toasts, and overlay drawers. Data grids, paper, and form sheets stay opaque with alpha at or above 0.96.
+
+On macOS, Glass is native window vibrancy, not just CSS alpha:
+
+- `macOSPrivateApi: true` and `transparent: true` are required. The Tauri shell enables the `macos-private-api` feature.
+- `set_window_surface("glass")` applies `NSVisualEffectView` with the UnderWindowBackground material and `FollowsWindowActiveState`, so the desktop wallpaper reads through the chrome tints in both themes.
+- The native toolbar does not create its own CSS backdrop root, so floating panels can blur the content beneath them.
+- `set_window_surface("solid")` clears window effects.
+- The native window appearance follows the resolved light or dark theme so the material matches.
+- Light Glass chrome tints: sidebar `rgba(245, 245, 247, 0.32)`, toolbar `rgba(251, 251, 253, 0.52)`.
+- Dark Glass chrome tints: sidebar `rgba(28, 28, 31, 0.38)`, toolbar `rgba(32, 32, 36, 0.56)`.
+- Native Glass popovers and drawers: `rgba(255, 255, 255, 0.64)` Light and `rgba(34, 34, 40, 0.62)` Dark.
+- Glass chrome uses `backdrop-filter: blur(28px) saturate(200%)`, a 1px specular border, and an inner top highlight bevel.
+
+Browser Glass has no OS vibrancy. It uses a frosted tint, a subtle sheen gradient, the same 28px blur, and crisp specular edges so Solid and Glass remain clearly distinct.
+
+Under `prefers-reduced-transparency: reduce`, Glass reverts chrome tokens to Solid, removes the filter and sheen, and sends `set_window_surface("solid")` to clear native effects.
 
 ### Accent
 
-Seven presets ship with light and dark values. A custom hex picker accepts `#RGB` and `#RRGGBB`.
+Seven presets ship with light and dark values. A custom hex picker accepts `#RGB` and `#RRGGBB`. The hex field displays the resolved preset hex for the active theme, and keeps the custom hex value when the custom accent is active.
 
 Derived values:
 
@@ -164,7 +181,8 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | Context menu clamping | `context menu clamps and dismisses` |
 | Reduced motion | `reduced motion collapses surfaces` |
 | Dark luminance and bevels | `dark surfaces step and bevel` |
-| Glass surfaces | `glass keeps chrome translucent and grids opaque` |
+| Glass surfaces and native tokens | `glass keeps chrome translucent and grids opaque` |
+| Accent hex follows the resolved theme | `accent hex follows the resolved theme` |
 | Density virtualizer alignment | `density keeps virtual rows aligned` |
 | Theme and preference persistence | `appearance controls persist` |
 | Native traffic-light reserve | `native chrome reserves traffic lights` |

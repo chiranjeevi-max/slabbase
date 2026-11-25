@@ -100,6 +100,8 @@ export const api = {
     call<WorkspaceInfoDto>("create_workspace", { path, name }),
   closeWorkspace: () => call<void>("close_workspace"),
   workspaceInfo: () => call<WorkspaceInfoDto | null>("workspace_info"),
+  setWindowSurface: (surface: "solid" | "glass") =>
+    call<void>("set_window_surface", { surface }),
   loadSample: () => call<WorkspaceInfoDto>("load_sample"),
 
   getSchema: () => call<Schema>("get_schema"),

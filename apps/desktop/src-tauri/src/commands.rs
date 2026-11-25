@@ -77,6 +77,36 @@ pub async fn workspace_info(
     blocking(move || db.info()).await
 }
 
+/// Applies the native macOS material behind the webview. Glass uses the
+/// under-window background so the desktop wallpaper reads through the chrome
+/// tints; Solid removes the effect view so the opaque CSS surfaces stay crisp.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_window_surface(window: tauri::WebviewWindow, surface: String) -> Result<(), ApiError> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::utils::config::WindowEffectsConfig;
+        use tauri::window::{Effect, EffectState, EffectsBuilder};
+
+        match surface.as_str() {
+            "glass" => {
+                let effects = EffectsBuilder::new()
+                    .effect(Effect::UnderWindowBackground)
+                    .state(EffectState::FollowsWindowActiveState)
+                    .build();
+                window.set_effects(effects)?;
+            }
+            _ => window.set_effects(None::<WindowEffectsConfig>)?,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, surface);
+    }
+
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn load_sample(state: State<'_, AppState>) -> Result<WorkspaceInfoDto, ApiError> {
     let db = Arc::clone(&state.db);

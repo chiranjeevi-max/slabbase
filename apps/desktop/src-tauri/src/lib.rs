@@ -49,6 +49,7 @@ pub fn run() {
             commands::create_workspace,
             commands::close_workspace,
             commands::workspace_info,
+            commands::set_window_surface,
             commands::load_sample,
             commands::get_schema,
             commands::create_table,

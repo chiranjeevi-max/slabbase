@@ -40,11 +40,15 @@ export function AppearancePopover() {
   const anchorRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const presence = usePresence(open, 110);
-  const [hexDraft, setHexDraft] = useState(appearance.customAccent);
+  const activeHex =
+    appearance.accent === "custom"
+      ? normalizeHex(appearance.customAccent) ?? appearance.customAccent
+      : ACCENTS[appearance.accent][resolvedTheme];
+  const [hexDraft, setHexDraft] = useState(activeHex);
 
   useEffect(() => {
-    setHexDraft(appearance.customAccent);
-  }, [appearance.customAccent, open]);
+    setHexDraft(activeHex);
+  }, [activeHex, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -72,7 +76,7 @@ export function AppearancePopover() {
       setAppearance({ accent: "custom", customAccent: normalized });
       setHexDraft(normalized);
     } else {
-      setHexDraft(appearance.customAccent);
+      setHexDraft(activeHex);
     }
   };
 
@@ -187,7 +191,7 @@ export function AppearancePopover() {
             <input
               type="color"
               aria-label="Custom accent color"
-              value={normalizeHex(hexDraft) ?? appearance.customAccent}
+              value={normalizeHex(hexDraft) ?? activeHex}
               onChange={(event) => {
                 const next = normalizeHex(event.target.value);
                 if (!next) return;
@@ -209,7 +213,7 @@ export function AppearancePopover() {
                   event.preventDefault();
                   commitHex();
                 }
-                if (event.key === "Escape") setHexDraft(appearance.customAccent);
+                if (event.key === "Escape") setHexDraft(activeHex);
               }}
             />
           </div>

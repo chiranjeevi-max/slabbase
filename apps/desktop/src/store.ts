@@ -938,4 +938,11 @@ if (typeof window !== "undefined") {
     const resolvedTheme = applyAppearance(state.appearance);
     useStore.setState({ resolvedTheme });
   });
+
+  const transparency = window.matchMedia("(prefers-reduced-transparency: reduce)");
+  transparency.addEventListener("change", () => {
+    const state = useStore.getState();
+    const resolvedTheme = applyAppearance(state.appearance);
+    useStore.setState({ resolvedTheme });
+  });
 }

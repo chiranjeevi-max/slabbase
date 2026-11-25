@@ -1,3 +1,7 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { api } from "./api";
+import { isTauri } from "./native";
+
 export type ThemePreference = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type SurfaceMode = "solid" | "glass";
@@ -193,6 +197,28 @@ export function accentForeground(hex: string): string {
     : "#000000";
 }
 
+function reducedTransparency(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    window.matchMedia("(prefers-reduced-transparency: reduce)").matches
+  );
+}
+
+function syncNativeWindow(prefs: AppearancePrefs, resolved: ResolvedTheme): void {
+  if (!isTauri()) return;
+  const surface = prefs.surface === "glass" && !reducedTransparency() ? "glass" : "solid";
+  void api.setWindowSurface(surface).catch(() => {
+    // The CSS glass fallback remains available if native vibrancy is unavailable.
+  });
+  try {
+    void getCurrentWindow()
+      .setTheme(prefs.theme === "system" ? null : resolved)
+      .catch(() => {});
+  } catch {
+    // A partial Tauri host may not expose window metadata.
+  }
+}
+
 export function applyAppearance(prefs: AppearancePrefs): ResolvedTheme {
   const resolved = resolveTheme(prefs.theme);
   if (typeof document === "undefined") return resolved;
@@ -207,6 +233,7 @@ export function applyAppearance(prefs: AppearancePrefs): ResolvedTheme {
   root.style.setProperty("--accent-on-solid", foreground);
   root.style.setProperty("--accent-foreground", foreground);
   root.style.setProperty("--row-h", `${DENSITY_ROW_HEIGHT[prefs.density]}px`);
+  syncNativeWindow(prefs, resolved);
   return resolved;
 }
 
