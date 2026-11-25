@@ -833,25 +833,39 @@ test.describe("interaction polish", () => {
       surface: "glass",
       accent: "teal",
     });
-    const glass = await page.evaluate(() => {
-      const sidebar = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
-      const grid = document.querySelector<HTMLElement>('[data-testid="grid-pane"]');
-      const header = document.querySelector<HTMLElement>('[data-testid="grid-header"]');
-      return {
-        sidebarFilter: sidebar ? getComputedStyle(sidebar).backdropFilter : "",
-        sidebarBg: sidebar ? getComputedStyle(sidebar).backgroundColor : "",
-        gridBg: grid ? getComputedStyle(grid).backgroundColor : "",
-        headerBg: header ? getComputedStyle(header).backgroundColor : "",
-      };
-    });
-    expect(glass.sidebarFilter).toContain("blur(22px)");
-    expect(alphaOf(glass.sidebarBg)).toBeLessThan(1);
-    expect(alphaOf(glass.gridBg)).toBeGreaterThanOrEqual(0.96);
-    expect(alphaOf(glass.headerBg)).toBeGreaterThanOrEqual(0.96);
+    const readGlass = () =>
+      page.evaluate(() => {
+        const sidebar = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+        const grid = document.querySelector<HTMLElement>('[data-testid="grid-pane"]');
+        const header = document.querySelector<HTMLElement>('[data-testid="grid-header"]');
+        return {
+          sidebarFilter: sidebar ? getComputedStyle(sidebar).backdropFilter : "",
+          sidebarBg: sidebar ? getComputedStyle(sidebar).backgroundColor : "",
+          gridBg: grid ? getComputedStyle(grid).backgroundColor : "",
+          headerBg: header ? getComputedStyle(header).backgroundColor : "",
+        };
+      });
+
+    const darkGlass = await readGlass();
+    expect(darkGlass.sidebarFilter).toContain("blur(22px)");
+    expect(alphaOf(darkGlass.sidebarBg)).toBeLessThan(1);
+    expect(alphaOf(darkGlass.gridBg)).toBeGreaterThanOrEqual(0.96);
+    expect(alphaOf(darkGlass.headerBg)).toBeGreaterThanOrEqual(0.96);
 
     await page.getByTestId("appearance-button").click();
-    await page.getByTestId("appearance-popover").locator('[data-accent-option="rose"]').click();
+    const popover = page.getByTestId("appearance-popover");
+    await popover.locator('[data-accent-option="rose"]').click();
     expect(await page.locator("html").getAttribute("data-accent")).toBe("rose");
+
+    await popover.getByRole("button", { name: "Light", exact: true }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await expect(page.locator("html")).toHaveAttribute("data-surface", "glass");
+    const lightGlass = await readGlass();
+    expect(lightGlass.sidebarFilter).toContain("blur(22px)");
+    expect(alphaOf(lightGlass.sidebarBg)).toBeLessThan(1);
+    expect(alphaOf(lightGlass.gridBg)).toBeGreaterThanOrEqual(0.96);
+    await popover.locator('[data-accent-option="orange"]').click();
+    expect(await page.locator("html").getAttribute("data-accent")).toBe("orange");
     await assertViewport(page);
     expect(errors).toEqual([]);
   });
