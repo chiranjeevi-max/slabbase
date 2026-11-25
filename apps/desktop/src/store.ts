@@ -1,5 +1,14 @@
 import { create } from "zustand";
 import { api, SlabError, type RowValues } from "./api";
+import {
+  applyAppearance,
+  initialAppearance,
+  mergeAppearance,
+  resolveTheme,
+  saveAppearance,
+  type AppearancePrefs,
+  type ResolvedTheme,
+} from "./appearance";
 import type {
   AuditEntry,
   ColumnDraft,
@@ -19,7 +28,6 @@ import type {
   WorkspaceInfoDto,
 } from "./bindings";
 
-export type Theme = "light" | "dark";
 export type Tone = "info" | "success" | "error";
 
 export interface Toast {
@@ -41,13 +49,6 @@ const EMPTY_UNDO: UndoState = {
 
 let pageRequest = 0;
 let toastCounter = 0;
-
-function initialTheme(): Theme {
-  if (typeof window === "undefined") return "light";
-  const stored = window.localStorage.getItem("slabbase.theme");
-  if (stored === "light" || stored === "dark") return stored;
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-}
 
 function firstTable(schema: Schema | null): string | null {
   return schema?.tables[0]?.name ?? null;
@@ -94,7 +95,9 @@ export interface AppStore {
   schema: Schema | null;
   booting: boolean;
   busy: boolean;
-  theme: Theme;
+  appearance: AppearancePrefs;
+  resolvedTheme: ResolvedTheme;
+  appearanceOpen: boolean;
   toast: Toast | null;
 
   activeTable: string | null;
@@ -138,8 +141,8 @@ export interface AppStore {
 
   notify: (tone: Tone, message: string, code?: string) => void;
   clearToast: () => void;
-  setTheme: (theme: Theme) => void;
-  toggleTheme: () => void;
+  setAppearance: (patch: Partial<Omit<AppearancePrefs, "version">>) => void;
+  setAppearanceOpen: (open: boolean) => void;
 
   selectTable: (table: string) => Promise<void>;
   selectLayout: (id: string) => void;
@@ -277,7 +280,9 @@ export const useStore = create<AppStore>((set, get) => {
     schema: null,
     booting: true,
     busy: false,
-    theme: initialTheme(),
+    appearance: initialAppearance,
+    resolvedTheme: resolveTheme(initialAppearance.theme),
+    appearanceOpen: false,
     toast: null,
 
     activeTable: null,
@@ -405,16 +410,14 @@ export const useStore = create<AppStore>((set, get) => {
     notify,
     clearToast: () => set({ toast: null }),
 
-    setTheme: (theme) => {
-      window.localStorage.setItem("slabbase.theme", theme);
-      document.documentElement.dataset["theme"] = theme;
-      set({ theme });
+    setAppearance: (patch) => {
+      const appearance = mergeAppearance(get().appearance, patch);
+      saveAppearance(appearance);
+      const resolvedTheme = applyAppearance(appearance);
+      set({ appearance, resolvedTheme });
     },
 
-    toggleTheme: () => {
-      const theme = get().theme === "light" ? "dark" : "light";
-      get().setTheme(theme);
-    },
+    setAppearanceOpen: (open) => set({ appearanceOpen: open }),
 
     selectTable: async (table) => {
       const state = get();
@@ -916,3 +919,13 @@ export const useStore = create<AppStore>((set, get) => {
 
   };
 });
+
+if (typeof window !== "undefined") {
+  const media = window.matchMedia("(prefers-color-scheme: dark)");
+  media.addEventListener("change", () => {
+    const state = useStore.getState();
+    if (state.appearance.theme !== "system") return;
+    const resolvedTheme = applyAppearance(state.appearance);
+    useStore.setState({ resolvedTheme });
+  });
+}

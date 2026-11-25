@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import type { Column, LayoutItem, Table, Value } from "../bindings";
 import { useStore } from "../store";
 import {
@@ -13,7 +13,13 @@ import { PortalGrid } from "./PortalGrid";
 import { DraftField, DraftFieldLabel, fallbackValue } from "./DraftFields";
 import { Icon } from "./Icons";
 
-export function RecordPanel({ width }: { width: number }) {
+export function RecordPanel({
+  width,
+  closing = false,
+}: {
+  width: number;
+  closing?: boolean;
+}) {
   const schema = useStore((state) => state.schema);
   const activeTable = useStore((state) => state.activeTable);
   const selectedId = useStore((state) => state.selectedId);
@@ -21,6 +27,7 @@ export function RecordPanel({ width }: { width: number }) {
   const creating = useStore((state) => state.creating);
   const activeLayoutId = useStore((state) => state.activeLayoutId);
   const [pulse, setPulse] = useState<string | null>(null);
+  const panelStyle = { "--inspector-w": `${width}px` } as CSSProperties;
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
 
@@ -32,7 +39,7 @@ export function RecordPanel({ width }: { width: number }) {
 
   if (!table) {
     return (
-      <aside className="record-panel" style={{ width }}>
+      <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle}>
         <header className="record-header">
           <div>
             <span className="eyebrow">Inspector</span>
@@ -54,12 +61,12 @@ export function RecordPanel({ width }: { width: number }) {
   }
 
   if (creating) {
-    return <DraftRecord table={table} width={width} />;
+    return <DraftRecord table={table} width={width} closing={closing} />;
   }
 
   if (!bundle || selectedId === null) {
     return (
-      <aside className="record-panel" style={{ width }}>
+      <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle}>
         <header className="record-header">
           <div>
             <span className="eyebrow">{table.name}</span>
@@ -99,7 +106,7 @@ export function RecordPanel({ width }: { width: number }) {
   };
 
   return (
-    <aside className="record-panel" style={{ width }} aria-label="Record inspector">
+    <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle} aria-label="Record inspector">
       <header className="record-header">
         <div className="record-heading">
           <span className="eyebrow">
@@ -132,7 +139,7 @@ export function RecordPanel({ width }: { width: number }) {
             className="icon-control"
             title="Close inspector"
             aria-label="Close inspector"
-            onClick={() => useStore.getState().closeRecord()}
+            onClick={() => useStore.getState().setInspectorOpen(false)}
           >
             <Icon name="x" size={14} strokeWidth={1.5} />
           </button>
@@ -208,7 +215,15 @@ export function RecordPanel({ width }: { width: number }) {
   );
 }
 
-function DraftRecord({ table, width }: { table: Table; width: number }) {
+function DraftRecord({
+  table,
+  width,
+  closing,
+}: {
+  table: Table;
+  width: number;
+  closing: boolean;
+}) {
   const [values, setValues] = useState<Record<string, Value>>(() => {
     const initial: Record<string, Value> = {};
     for (const column of table.columns) {
@@ -217,6 +232,7 @@ function DraftRecord({ table, width }: { table: Table; width: number }) {
     return initial;
   });
   const [saving, setSaving] = useState(false);
+  const panelStyle = { "--inspector-w": `${width}px` } as CSSProperties;
   const columns = table.columns.filter((column) => !isComputedColumn(column));
   const fullWidth = draftFullWidth(columns);
   const narrow = width < 340;
@@ -234,7 +250,7 @@ function DraftRecord({ table, width }: { table: Table; width: number }) {
   };
 
   return (
-    <aside className="record-panel" style={{ width }} aria-label="New record">
+    <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle} aria-label="New record">
       <header className="record-header">
         <div className="record-heading">
           <span className="eyebrow">{table.name}</span>

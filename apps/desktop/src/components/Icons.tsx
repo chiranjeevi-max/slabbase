@@ -30,7 +30,9 @@ export type IconName =
   | "arrowDown"
   | "spark"
   | "keyboard"
-  | "panelRight";
+  | "panelRight"
+  | "sidebar"
+  | "copy";
 
 const paths: Record<IconName, ReactElement> = {
   table: (
@@ -117,6 +119,18 @@ const paths: Record<IconName, ReactElement> = {
     <>
       <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
       <path d="M9.5 3v10" />
+    </>
+  ),
+  sidebar: (
+    <>
+      <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+      <path d="M6.5 3v10" />
+    </>
+  ),
+  copy: (
+    <>
+      <rect x="5" y="5" width="8" height="8" rx="1.5" />
+      <path d="M3 10.5V4a1.5 1.5 0 0 1 1.5-1.5H10" />
     </>
   ),
 };

@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { confirmDestructive, isTauri } from "./native";
+import { usePresence } from "./presence";
 import { useStore } from "./store";
 import { Icon } from "./components/Icons";
 import { DataGrid } from "./components/DataGrid";
@@ -12,29 +14,45 @@ import { PrintDialog } from "./components/PrintDialog";
 import { Palette } from "./components/Palette";
 import { AuditDrawer } from "./components/AuditDrawer";
 import { Toasts } from "./components/Toasts";
+import { AppearancePopover } from "./components/AppearancePopover";
+import { ContextMenu, type ContextMenuItem } from "./components/ContextMenu";
 import { formatTimestamp } from "./types";
 
-const SIDEBAR_DEFAULT = 220;
-const INSPECTOR_DEFAULT = 340;
+const SIDEBAR_DEFAULT = 240;
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 300;
+const INSPECTOR_DEFAULT = 360;
+const INSPECTOR_MIN = 320;
+const INSPECTOR_MAX = 480;
 
 export function App() {
-  const theme = useStore((state) => state.theme);
   const booting = useStore((state) => state.booting);
   const info = useStore((state) => state.info);
   const view = useStore((state) => state.view);
   const inspectorOpen = useStore((state) => state.inspectorOpen);
   const tables = useStore((state) => state.schema?.tables.length ?? 0);
+  const isNarrowSidebar = useMediaQuery("(max-width: 1079px)");
+  const isInspectorOverlay = useMediaQuery("(max-width: 1199px)");
+  const native = isTauri();
 
   const [sidebarWidth, setSidebarWidth] = useState(() =>
-    readWidth("slabbase.sidebarWidth", SIDEBAR_DEFAULT, 180, 280),
+    readWidth("slabbase.sidebarWidth", SIDEBAR_DEFAULT, SIDEBAR_MIN, SIDEBAR_MAX),
   );
   const [inspectorWidth, setInspectorWidth] = useState(() =>
-    readWidth("slabbase.inspectorWidth", INSPECTOR_DEFAULT, 280, 460),
+    readWidth(
+      "slabbase.inspectorWidth",
+      INSPECTOR_DEFAULT,
+      INSPECTOR_MIN,
+      INSPECTOR_MAX,
+    ),
   );
+  const [sidebarDocked, setSidebarDocked] = useState(true);
+  const [sidebarOverlay, setSidebarOverlay] = useState(false);
+  const inspectorPresence = usePresence(view === "table" && inspectorOpen, 110);
 
   useEffect(() => {
-    document.documentElement.dataset["theme"] = theme;
-  }, [theme]);
+    if (isNarrowSidebar) setSidebarOverlay(false);
+  }, [isNarrowSidebar]);
 
   useEffect(() => {
     window.localStorage.setItem("slabbase.sidebarWidth", String(sidebarWidth));
@@ -43,6 +61,22 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem("slabbase.inspectorWidth", String(inspectorWidth));
   }, [inspectorWidth]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const apply = (focused: boolean) => {
+      root.dataset["windowFocused"] = focused ? "true" : "false";
+    };
+    apply(true);
+    const onFocus = () => apply(true);
+    const onBlur = () => apply(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
 
   useEffect(() => {
     void useStore.getState().initialize();
@@ -82,60 +116,109 @@ export function App() {
         else if (state.importOpen) state.setImportOpen(false);
         else if (state.printOpen) state.setPrintOpen(false);
         else if (state.auditOpen) state.closeAudit();
+        else if (state.appearanceOpen) state.setAppearanceOpen(false);
+        else if (isNarrowSidebar && sidebarOverlay) {
+          document.querySelector<HTMLElement>('[data-testid="sidebar-toggle"]')?.focus();
+          setSidebarOverlay(false);
+        }
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [isNarrowSidebar, sidebarOverlay]);
+
+  const sidebarVisible = isNarrowSidebar ? sidebarOverlay : sidebarDocked;
+  const showSidebar = Boolean(info);
+  const reserveTrafficLights = native && (!info || isNarrowSidebar || !sidebarDocked);
+
+  const toggleSidebar = () => {
+    if (isNarrowSidebar) setSidebarOverlay((open) => !open);
+    else setSidebarDocked((open) => !open);
+  };
 
   return (
     <div className="app">
-      <Titlebar />
-      {booting ? (
-        <div className="splash">
-          <Icon name="database" size={24} />
-          <p>Opening workspace…</p>
-        </div>
-      ) : info ? (
-        <>
-          <div className="app-body">
-            <Sidebar width={sidebarWidth} />
-            <PaneResizer
-              side="left"
-              width={sidebarWidth}
-              min={180}
-              max={280}
-              onResize={setSidebarWidth}
-            />
-            <main className={`workspace ${view === "form" ? "studio-view" : ""}`}>
-              {tables === 0 ? (
-                <EmptyWorkspace />
-              ) : view === "schema" ? (
-                <SchemaView />
-              ) : view === "form" ? (
-                <FormStudio />
-              ) : (
-                <DataGrid />
-              )}
-            </main>
-            {view === "table" && inspectorOpen && (
-              <>
-                <PaneResizer
-                  side="right"
-                  width={inspectorWidth}
-                  min={280}
-                  max={460}
-                  onResize={setInspectorWidth}
-                />
-                <RecordPanel width={inspectorWidth} />
-              </>
-            )}
-          </div>
-          <Statusbar />
-        </>
-      ) : (
-        <Launcher />
+      {info && isNarrowSidebar && sidebarOverlay && (
+        <div
+          className="sidebar-scrim"
+          role="presentation"
+          onMouseDown={() => setSidebarOverlay(false)}
+        />
       )}
+
+      {showSidebar && (
+        <Sidebar
+          width={sidebarWidth}
+          overlay={isNarrowSidebar}
+          open={sidebarVisible}
+          onToggle={toggleSidebar}
+        />
+      )}
+
+      {info && !isNarrowSidebar && sidebarDocked && (
+        <PaneResizer
+          side="left"
+          width={sidebarWidth}
+          min={SIDEBAR_MIN}
+          max={SIDEBAR_MAX}
+          onResize={setSidebarWidth}
+        />
+      )}
+
+      <div
+        className="main-column"
+        data-sidebar-docked={!isNarrowSidebar && sidebarDocked ? "true" : "false"}
+      >
+        <Toolbar
+          reserveTrafficLights={reserveTrafficLights}
+          showSidebarToggle={Boolean(info) && (isNarrowSidebar || !sidebarDocked)}
+          onToggleSidebar={toggleSidebar}
+        />
+
+        {booting ? (
+          <div className="splash">
+            <Icon name="database" size={24} />
+            <p>Opening workspace…</p>
+          </div>
+        ) : info ? (
+          <>
+            <div className="app-body">
+              <main className={`workspace ${view === "form" ? "studio-view" : ""}`}>
+                {tables === 0 ? (
+                  <EmptyWorkspace />
+                ) : view === "schema" ? (
+                  <SchemaView />
+                ) : view === "form" ? (
+                  <FormStudio />
+                ) : (
+                  <DataGrid />
+                )}
+              </main>
+              {view === "table" && inspectorPresence.mounted && (
+                <>
+                  {inspectorOpen && !isInspectorOverlay && (
+                    <PaneResizer
+                      side="right"
+                      width={inspectorWidth}
+                      min={INSPECTOR_MIN}
+                      max={INSPECTOR_MAX}
+                      onResize={setInspectorWidth}
+                    />
+                  )}
+                  <RecordPanel
+                    width={inspectorWidth}
+                    closing={inspectorPresence.closing}
+                  />
+                </>
+              )}
+            </div>
+            <Statusbar />
+          </>
+        ) : (
+          <Launcher />
+        )}
+      </div>
+
       <SchemaDialog />
       <ImportDialog />
       <PrintDialog />
@@ -146,18 +229,24 @@ export function App() {
   );
 }
 
-function Titlebar() {
+function Toolbar({
+  reserveTrafficLights,
+  showSidebarToggle,
+  onToggleSidebar,
+}: {
+  reserveTrafficLights: boolean;
+  showSidebarToggle: boolean;
+  onToggleSidebar: () => void;
+}) {
   const info = useStore((state) => state.info);
   const view = useStore((state) => state.view);
   const activeTable = useStore((state) => state.activeTable);
   const hasTables = useStore((state) => (state.schema?.tables.length ?? 0) > 0);
-  const theme = useStore((state) => state.theme);
   const inspectorOpen = useStore((state) => state.inspectorOpen);
   const undoState = useStore((state) => state.undoState);
   const setPaletteOpen = useStore((state) => state.setPaletteOpen);
   const setView = useStore((state) => state.setView);
   const toggleInspector = useStore((state) => state.toggleInspector);
-  const toggleTheme = useStore((state) => state.toggleTheme);
   const setImportOpen = useStore((state) => state.setImportOpen);
   const setPrintOpen = useStore((state) => state.setPrintOpen);
 
@@ -200,8 +289,24 @@ function Titlebar() {
   };
 
   return (
-    <header className="titlebar" data-tauri-drag-region>
-      <div className="titlebar-left" data-tauri-drag-region>
+    <header
+      className={`toolbar ${reserveTrafficLights ? "traffic-space" : ""}`}
+      data-testid="toolbar"
+      data-tauri-drag-region
+    >
+      <div className="toolbar-left" data-tauri-drag-region>
+        {showSidebarToggle && (
+          <button
+            type="button"
+            className="icon-control"
+            title="Toggle Sidebar"
+            aria-label="Toggle Sidebar"
+            data-testid="sidebar-toggle"
+            onClick={onToggleSidebar}
+          >
+            <Icon name="sidebar" size={14} strokeWidth={1.5} />
+          </button>
+        )}
         {info ? (
           <div className="workspace-anchor" ref={menuRef}>
             <button
@@ -211,6 +316,7 @@ function Titlebar() {
               title={info.path ?? info.name}
               aria-haspopup="menu"
               aria-expanded={menuOpen}
+              data-testid="workspace-switcher"
             >
               <span className="workspace-name">{fileLabel(info.name)}</span>
               <Icon name="chevronDown" size={11} strokeWidth={1.5} />
@@ -246,11 +352,11 @@ function Titlebar() {
             )}
           </div>
         ) : (
-          <span className="titlebar-drag" data-tauri-drag-region />
+          <span className="toolbar-drag" data-tauri-drag-region />
         )}
       </div>
 
-      <div className="titlebar-center">
+      <div className="toolbar-center">
         {info && activeTable && (
           <div className="view-switcher" role="tablist" aria-label="Workspace view">
             {(
@@ -279,6 +385,7 @@ function Titlebar() {
             className="search-trigger"
             onClick={() => setPaletteOpen(true)}
             title="Search records and commands (⌘K)"
+            data-testid="search-trigger"
           >
             <Icon name="search" size={13} strokeWidth={1.5} />
             <span>Search</span>
@@ -287,86 +394,98 @@ function Titlebar() {
         )}
       </div>
 
-      <div className="titlebar-right">
+      <div className="toolbar-right">
         {info && (
           <>
-            <button
-              type="button"
-              className="icon-control"
-              title={`${undoState.undo_label ?? "Undo"} (⌘Z)`}
-              aria-label={undoState.undo_label ?? "Undo"}
-              disabled={!undoState.can_undo}
-              onClick={() => void useStore.getState().undo()}
-            >
-              <Icon name="undo" size={14} strokeWidth={1.5} />
-            </button>
-            <button
-              type="button"
-              className="icon-control"
-              title={`${undoState.redo_label ?? "Redo"} (⇧⌘Z)`}
-              aria-label={undoState.redo_label ?? "Redo"}
-              disabled={!undoState.can_redo}
-              onClick={() => void useStore.getState().redo()}
-            >
-              <Icon name="redo" size={14} strokeWidth={1.5} />
-            </button>
+            <div className="toolbar-group">
+              <button
+                type="button"
+                className="icon-control"
+                title={`${undoState.undo_label ?? "Undo"} (⌘Z)`}
+                aria-label={undoState.undo_label ?? "Undo"}
+                disabled={!undoState.can_undo}
+                onClick={() => void useStore.getState().undo()}
+              >
+                <Icon name="undo" size={14} strokeWidth={1.5} />
+              </button>
+              <button
+                type="button"
+                className="icon-control"
+                title={`${undoState.redo_label ?? "Redo"} (⇧⌘Z)`}
+                aria-label={undoState.redo_label ?? "Redo"}
+                disabled={!undoState.can_redo}
+                onClick={() => void useStore.getState().redo()}
+              >
+                <Icon name="redo" size={14} strokeWidth={1.5} />
+              </button>
+            </div>
             <span className="toolbar-divider" />
-            <button
-              type="button"
-              className="icon-control"
-              title="Import CSV or JSON (⇧⌘I)"
-              aria-label="Import"
-              disabled={!hasTables}
-              onClick={() => setImportOpen(true)}
-            >
-              <Icon name="upload" size={14} strokeWidth={1.5} />
-            </button>
-            <button
-              type="button"
-              className="icon-control"
-              title="Print or Export PDF (⌘P)"
-              aria-label="Print or Export PDF"
-              disabled={!activeTable}
-              onClick={() => setPrintOpen(true)}
-            >
-              <Icon name="printer" size={14} strokeWidth={1.5} />
-            </button>
+            <div className="toolbar-group">
+              <button
+                type="button"
+                className="icon-control"
+                title="Import CSV or JSON (⇧⌘I)"
+                aria-label="Import"
+                disabled={!hasTables}
+                onClick={() => setImportOpen(true)}
+              >
+                <Icon name="upload" size={14} strokeWidth={1.5} />
+              </button>
+              <button
+                type="button"
+                className="icon-control"
+                title="Print or Export PDF (⌘P)"
+                aria-label="Print or Export PDF"
+                disabled={!activeTable}
+                onClick={() => setPrintOpen(true)}
+              >
+                <Icon name="printer" size={14} strokeWidth={1.5} />
+              </button>
+            </div>
+            <span className="toolbar-divider" />
           </>
         )}
-        <button
-          type="button"
-          className="icon-control"
-          title="Switch Appearance"
-          aria-label="Switch appearance"
-          onClick={toggleTheme}
-        >
-          <Icon name={theme === "light" ? "moon" : "sun"} size={14} strokeWidth={1.5} />
-        </button>
-        {info && (
-          <button
-            type="button"
-            className={`icon-control ${inspectorOpen && view !== "schema" ? "active" : ""}`}
-            title={
-              view === "schema"
-                ? "Inspector is available in Table and Form views"
-                : inspectorOpen
-                  ? "Hide Inspector"
-                  : "Show Inspector"
-            }
-            aria-label="Toggle Inspector"
-            aria-pressed={inspectorOpen}
-            disabled={view === "schema"}
-            onClick={toggleInspector}
-          >
-            <Icon name="panelRight" size={14} strokeWidth={1.5} />
-          </button>
-        )}
+        <div className="toolbar-group">
+          <AppearancePopover />
+          {info && (
+            <button
+              type="button"
+              className={`icon-control ${
+                inspectorOpen && view !== "schema" ? "active" : ""
+              }`}
+              title={
+                view === "schema"
+                  ? "Inspector is available in Table and Form views"
+                  : inspectorOpen
+                    ? "Hide Inspector"
+                    : "Show Inspector"
+              }
+              aria-label="Toggle Inspector"
+              aria-pressed={inspectorOpen}
+              disabled={view === "schema"}
+              data-testid="inspector-toggle"
+              onClick={toggleInspector}
+            >
+              <Icon name="panelRight" size={14} strokeWidth={1.5} />
+            </button>
+          )}
+        </div>
       </div>
     </header>
   );
 }
 
-function Sidebar({ width }: { width: number }) {
+function Sidebar({
+  width,
+  overlay,
+  open,
+  onToggle,
+}: {
+  width: number;
+  overlay: boolean;
+  open: boolean;
+  onToggle: () => void;
+}) {
   const schema = useStore((state) => state.schema);
   const info = useStore((state) => state.info);
   const view = useStore((state) => state.view);
@@ -377,103 +496,221 @@ function Sidebar({ width }: { width: number }) {
   const setView = useStore((state) => state.setView);
   const openSchema = useStore((state) => state.openSchema);
   const openAudit = useStore((state) => state.openAudit);
+  const dropTable = useStore((state) => state.dropTable);
+  const notify = useStore((state) => state.notify);
+
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    table: string;
+  } | null>(null);
+
+  const closeOverlay = () => {
+    if (!overlay) return;
+    document.querySelector<HTMLElement>('[data-testid="sidebar-toggle"]')?.focus();
+    onToggle();
+  };
+
+  const tableMenuItems = (table: string): ContextMenuItem[] => [
+    {
+      label: "Open Table",
+      icon: "table",
+      onSelect: () => void selectTable(table),
+    },
+    {
+      label: "New Form",
+      icon: "form",
+      onSelect: () => {
+        void selectTable(table).then(() => setView("form"));
+      },
+    },
+    {
+      label: "Manage Columns",
+      icon: "grid",
+      onSelect: () => openSchema("column", table),
+    },
+    {
+      label: "Delete Table…",
+      icon: "trash",
+      danger: true,
+      separatorBefore: true,
+      onSelect: () => {
+        void (async () => {
+          const ok = await confirmDestructive(
+            `Delete the table "${table}" and all of its rows?`,
+            "Delete Table",
+            "Delete",
+          );
+          if (!ok) return;
+          const deleted = await dropTable(table);
+          if (deleted) notify("success", `Deleted table ${table}`);
+        })();
+      },
+    },
+  ];
 
   const counts = new Map(info?.tables.map((table) => [table.name, table.rowCount]) ?? []);
   const layouts = schema?.layouts.filter((layout) => layout.table === activeTable) ?? [];
 
   return (
-    <nav className="sidebar" style={{ width }} aria-label="Workspace">
-      <section className="source-section">
-        <div className="source-heading">
-          <span>Tables</span>
-          <button
-            type="button"
-            className="icon-control tiny"
-            title="New table"
-            aria-label="New table"
-            onClick={() => openSchema("table")}
-          >
-            <Icon name="plus" size={12} strokeWidth={1.5} />
-          </button>
-        </div>
-        <div className="source-list">
-          {schema?.tables.map((table) => (
+    <>
+      <nav
+        className={`sidebar ${overlay ? "overlay" : ""} ${open ? "open" : ""}`}
+      style={{ "--sidebar-w": `${width}px` } as CSSProperties}
+      aria-label="Workspace"
+      data-testid="sidebar"
+      aria-hidden={overlay && !open}
+      inert={overlay && !open ? true : undefined}
+    >
+      <div className="sidebar-header" data-tauri-drag-region>
+        <button
+          type="button"
+          className="icon-control sidebar-toggle"
+          title={overlay ? "Close Sidebar" : "Collapse Sidebar"}
+          aria-label={overlay ? "Close Sidebar" : "Collapse Sidebar"}
+          data-testid="sidebar-header-toggle"
+          onClick={onToggle}
+        >
+          <Icon name="sidebar" size={14} strokeWidth={1.5} />
+        </button>
+      </div>
+
+      <div className="sidebar-scroll">
+        <section className="source-section">
+          <div className="source-heading">
+            <span>Tables</span>
             <button
               type="button"
-              key={table.name}
-              className={`source-row ${
-                view === "table" && activeTable === table.name ? "active" : ""
-              }`}
-              onClick={() => void selectTable(table.name)}
-              title={table.name}
+              className="icon-control tiny"
+              title="New table"
+              aria-label="New table"
+              onClick={() => openSchema("table")}
             >
-              <Icon name="table" size={14} strokeWidth={1.5} />
-              <span className="source-name">{table.name}</span>
-              <span className="source-count">
-                {(counts.get(table.name) ?? 0).toLocaleString()}
-              </span>
+              <Icon name="plus" size={12} strokeWidth={1.5} />
             </button>
-          ))}
-          {schema?.tables.length === 0 && <p className="source-empty">No tables yet</p>}
-        </div>
-      </section>
+          </div>
+          <div className="source-list">
+            {schema?.tables.map((table) => (
+              <button
+                type="button"
+                key={table.name}
+                className={`source-row ${
+                  view === "table" && activeTable === table.name ? "active" : ""
+                }`}
+                data-testid="source-row"
+                data-table={table.name}
+                onClick={() => {
+                  void selectTable(table.name);
+                  closeOverlay();
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setContextMenu({
+                    x: event.clientX,
+                    y: event.clientY,
+                    table: table.name,
+                  });
+                }}
+                title={table.name}
+              >
+                <Icon name="table" size={14} strokeWidth={1.5} />
+                <span className="source-name">{table.name}</span>
+                <span className="source-count">
+                  {(counts.get(table.name) ?? 0).toLocaleString()}
+                </span>
+              </button>
+            ))}
+            {schema?.tables.length === 0 && <p className="source-empty">No tables yet</p>}
+          </div>
+        </section>
 
-      <section className="source-section">
-        <div className="source-heading">
-          <span>Forms</span>
-          <button
-            type="button"
-            className="icon-control tiny"
-            title="New form"
-            aria-label="New form"
-            onClick={() => setView("form")}
-          >
-            <Icon name="plus" size={12} strokeWidth={1.5} />
-          </button>
-        </div>
-        <div className="source-list">
-          {layouts.map((layout) => (
+        <section className="source-section">
+          <div className="source-heading">
+            <span>Forms</span>
             <button
               type="button"
-              key={layout.id}
-              className={`source-row ${
-                view === "form" && activeLayoutId === layout.id ? "active" : ""
-              }`}
-              onClick={() => selectLayout(layout.id)}
-              title={layout.name}
+              className="icon-control tiny"
+              title="New form"
+              aria-label="New form"
+              onClick={() => {
+                setView("form");
+                closeOverlay();
+              }}
             >
-              <Icon name="form" size={13} strokeWidth={1.5} />
-              <span className="source-name">{layout.name}</span>
+              <Icon name="plus" size={12} strokeWidth={1.5} />
             </button>
-          ))}
-          {layouts.length === 0 && (
-            <p className="source-empty">
-              {activeTable ? "No forms for this table" : "Select a table"}
-            </p>
-          )}
-        </div>
-      </section>
+          </div>
+          <div className="source-list">
+            {layouts.map((layout) => (
+              <button
+                type="button"
+                key={layout.id}
+                className={`source-row ${
+                  view === "form" && activeLayoutId === layout.id ? "active" : ""
+                }`}
+                data-testid="source-row"
+                data-layout={layout.id}
+                onClick={() => {
+                  selectLayout(layout.id);
+                  closeOverlay();
+                }}
+                title={layout.name}
+              >
+                <Icon name="form" size={13} strokeWidth={1.5} />
+                <span className="source-name">{layout.name}</span>
+              </button>
+            ))}
+            {layouts.length === 0 && (
+              <p className="source-empty">
+                {activeTable ? "No forms for this table" : "Select a table"}
+              </p>
+            )}
+          </div>
+        </section>
 
-      <section className="source-section">
-        <div className="source-heading">
-          <span>Workspace</span>
-        </div>
-        <div className="source-list">
-          <button
-            type="button"
-            className={`source-row ${view === "schema" ? "active" : ""}`}
-            onClick={() => setView("schema")}
-          >
-            <Icon name="grid" size={14} strokeWidth={1.5} />
-            <span className="source-name">Relations &amp; Schema</span>
-          </button>
-          <button type="button" className="source-row" onClick={() => void openAudit()}>
-            <Icon name="history" size={14} strokeWidth={1.5} />
-            <span className="source-name">Audit Log</span>
-          </button>
-        </div>
-      </section>
-    </nav>
+        <section className="source-section">
+          <div className="source-heading">
+            <span>Workspace</span>
+          </div>
+          <div className="source-list">
+            <button
+              type="button"
+              className={`source-row ${view === "schema" ? "active" : ""}`}
+              data-testid="source-row"
+              onClick={() => {
+                setView("schema");
+                closeOverlay();
+              }}
+            >
+              <Icon name="grid" size={14} strokeWidth={1.5} />
+              <span className="source-name">Relations &amp; Schema</span>
+            </button>
+            <button
+              type="button"
+              className="source-row"
+              data-testid="source-row"
+              onClick={() => {
+                void openAudit();
+                closeOverlay();
+              }}
+            >
+              <Icon name="history" size={14} strokeWidth={1.5} />
+              <span className="source-name">Audit Log</span>
+            </button>
+          </div>
+        </section>
+      </div>
+      </nav>
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          items={tableMenuItems(contextMenu.table)}
+        />
+      )}
+    </>
   );
 }
 
@@ -507,7 +744,7 @@ function Statusbar() {
   const showLatency = rows.length > 0 && elapsedMs > 0;
 
   return (
-    <footer className="statusbar">
+    <footer className="statusbar" data-testid="status-bar" aria-label="Status">
       <div className="status-left">
         {!info ? (
           <span>Empty workspace</span>
@@ -515,9 +752,7 @@ function Statusbar() {
           <>
             <span className="status-table">{activeTable}</span>
             <span className="status-separator" />
-            <span>
-              {count.toLocaleString()} rows
-            </span>
+            <span>{count.toLocaleString()} rows</span>
             {showLatency && (
               <>
                 <span className="status-separator" />
@@ -609,7 +844,7 @@ function EmptyWorkspace() {
   const busy = useStore((state) => state.busy);
 
   return (
-    <div className="canvas-empty">
+    <div className="canvas-empty" data-testid="empty-workspace">
       <span className="empty-glyph">
         <Icon name="table" size={32} strokeWidth={1.2} />
       </span>
@@ -683,13 +918,9 @@ function Launcher() {
         </span>
         <span className="launcher-kicker">Local SQLite workspace</span>
         <h1>SlabBase</h1>
-        <p>Relational records, visual forms, and reports — stored in a single database file.</p>
+        <p>Relational records, visual forms, and reports, all stored in a single database file.</p>
         <div className="launcher-actions">
-          <button
-            type="button"
-            className="button primary"
-            onClick={() => void openExisting()}
-          >
+          <button type="button" className="button primary" onClick={() => void openExisting()}>
             Open Workspace
           </button>
           <button type="button" className="button" onClick={() => void newWorkspace()}>
@@ -769,6 +1000,22 @@ function PaneResizer({
       }}
     />
   );
+}
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof window === "undefined" ? false : window.matchMedia(query).matches,
+  );
+
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+
+  return matches;
 }
 
 function isTextEntry(target: EventTarget | null): boolean {

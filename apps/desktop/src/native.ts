@@ -1,5 +1,9 @@
 import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 
+export function isTauri(): boolean {
+  return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
+}
+
 /**
  * Uses the platform confirmation sheet for irreversible actions. Falls back to
  * the web dialog when the app runs outside the Tauri shell (Vite in a browser).
