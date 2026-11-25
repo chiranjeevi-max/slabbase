@@ -1,0 +1,377 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build (vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  release:
+    name: Draft release
+    runs-on: macos-15
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate tag and version parity
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must match vX.Y.Z; got '$RELEASE_TAG'"
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import tomllib
+
+          expected = os.environ["VERSION"]
+          with open("Cargo.toml", "rb") as handle:
+              cargo_version = tomllib.load(handle)["workspace"]["package"]["version"]
+          with open("apps/desktop/package.json", encoding="utf-8") as handle:
+              package_version = json.load(handle)["version"]
+          with open("apps/desktop/src-tauri/tauri.conf.json", encoding="utf-8") as handle:
+              tauri_version = json.load(handle)["version"]
+
+          versions = {
+              "Cargo.toml": cargo_version,
+              "apps/desktop/package.json": package_version,
+              "apps/desktop/src-tauri/tauri.conf.json": tauri_version,
+              "tag": expected,
+          }
+          if len(set(versions.values())) != 1:
+              for name, value in versions.items():
+                  print(f"{name}: {value}", file=sys.stderr)
+              raise SystemExit("version parity gate failed")
+          print(f"version parity: {expected}")
+          PY
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install release tools
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2
+        with:
+          tool: cargo-auditable,cargo-cyclonedx,cargo-deny
+
+      - name: Install frontend dependencies
+        run: npm --prefix apps/desktop ci
+      - name: Typecheck frontend
+        run: npm --prefix apps/desktop run typecheck
+      - name: Build production frontend
+        run: npm --prefix apps/desktop run build
+      - name: Run workspace tests
+        run: cargo test --workspace
+      - name: Audit dependencies
+        run: cargo deny check
+      - name: Run UI audit
+        run: npm --prefix apps/desktop run test:ui -- --output=test-results
+
+      - name: Select macOS target
+        id: target
+        run: |
+          set -euo pipefail
+          if rustup target add aarch64-apple-darwin x86_64-apple-darwin; then
+            echo "triple=universal-apple-darwin" >> "$GITHUB_OUTPUT"
+            echo "arch=universal" >> "$GITHUB_OUTPUT"
+            echo "universal=true" >> "$GITHUB_OUTPUT"
+          else
+            rustup target add aarch64-apple-darwin
+            echo "triple=aarch64-apple-darwin" >> "$GITHUB_OUTPUT"
+            echo "arch=aarch64" >> "$GITHUB_OUTPUT"
+            echo "universal=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine signing mode
+        id: signing
+        run: |
+          set -euo pipefail
+          if [[ -n "${APPLE_CERTIFICATE}" && -n "${APPLE_SIGNING_IDENTITY}" ]]; then
+            : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required for signed builds}"
+            : "${APPLE_ID:?APPLE_ID is required for signed builds}"
+            : "${APPLE_PASSWORD:?APPLE_PASSWORD is required for signed builds}"
+            : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required for signed builds}"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Developer ID signing and notarization enabled."
+          elif [[ -n "${APPLE_CERTIFICATE}" || -n "${APPLE_SIGNING_IDENTITY}" ]]; then
+            echo "::error::APPLE_CERTIFICATE and APPLE_SIGNING_IDENTITY must be provided together."
+            exit 1
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Apple signing secrets are absent; producing an unsigned DMG."
+          fi
+
+      - name: Build auditable release binary
+        run: |
+          set -euo pipefail
+          triple="${{ steps.target.outputs.triple }}"
+          if [[ "${{ steps.target.outputs.universal }}" == "true" ]]; then
+            cargo auditable build \
+              --release \
+              -p slabbase-desktop \
+              --target aarch64-apple-darwin \
+              --features tauri/custom-protocol \
+              --bins
+            cargo auditable build \
+              --release \
+              -p slabbase-desktop \
+              --target x86_64-apple-darwin \
+              --features tauri/custom-protocol \
+              --bins
+            mkdir -p target/universal-apple-darwin/release
+            lipo -create \
+              target/aarch64-apple-darwin/release/slabbase-desktop \
+              target/x86_64-apple-darwin/release/slabbase-desktop \
+              -output target/universal-apple-darwin/release/slabbase-desktop
+            lipo -info target/universal-apple-darwin/release/slabbase-desktop
+          else
+            cargo auditable build \
+              --release \
+              -p slabbase-desktop \
+              --target "$triple" \
+              --features tauri/custom-protocol \
+              --bins
+          fi
+
+      - name: Verify auditable dependency section
+        run: |
+          set -euo pipefail
+          triple="${{ steps.target.outputs.triple }}"
+          binary="target/$triple/release/slabbase-desktop"
+          if [[ "${{ steps.target.outputs.universal }}" == "true" ]]; then
+            otool -arch arm64 -l "$binary" | grep -q dep-v0
+            otool -arch x86_64 -l "$binary" | grep -q dep-v0
+          else
+            otool -l "$binary" | grep -q dep-v0
+          fi
+
+      - name: Bundle signed application and DMG
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ steps.target.outputs.arch }}"
+          triple="${{ steps.target.outputs.triple }}"
+          dmg="dist/SlabBase_${version}_${arch}.dmg"
+          mkdir -p dist
+          npm --prefix apps/desktop run tauri bundle -- \
+            --target "$triple" \
+            --bundles app,dmg \
+            --no-binary-patching
+          source_dmg=$(find "target/$triple/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
+          if [[ -z "$source_dmg" ]]; then
+            echo "::error::Tauri did not produce a signed DMG"
+            exit 1
+          fi
+          cp "$source_dmg" "$dmg"
+          codesign --verify --verbose=2 "$dmg"
+          mount=$(hdiutil attach "$dmg" -nobrowse -readonly | awk '/\/Volumes\// {print $NF; exit}')
+          app_in_dmg="$mount/SlabBase.app"
+          binary="$app_in_dmg/Contents/MacOS/slabbase-desktop"
+          if [[ "${{ steps.target.outputs.universal }}" == "true" ]]; then
+            otool -arch arm64 -l "$binary" | grep -q dep-v0
+            otool -arch x86_64 -l "$binary" | grep -q dep-v0
+          else
+            otool -l "$binary" | grep -q dep-v0
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_in_dmg"
+          xcrun stapler validate "$app_in_dmg"
+          spctl --assess --type execute --verbose=2 "$app_in_dmg"
+          hdiutil detach "$mount" >/dev/null || hdiutil detach "$mount" -force >/dev/null
+
+      - name: Bundle unsigned application and DMG
+        if: steps.signing.outputs.signed != 'true'
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ steps.target.outputs.arch }}"
+          triple="${{ steps.target.outputs.triple }}"
+          npm --prefix apps/desktop run tauri bundle -- \
+            --target "$triple" \
+            --bundles app \
+            --no-binary-patching \
+            --no-sign
+          app="target/$triple/release/bundle/macos/SlabBase.app"
+          binary="$app/Contents/MacOS/slabbase-desktop"
+          if [[ "${{ steps.target.outputs.universal }}" == "true" ]]; then
+            otool -arch arm64 -l "$binary" | grep -q dep-v0
+            otool -arch x86_64 -l "$binary" | grep -q dep-v0
+          else
+            otool -l "$binary" | grep -q dep-v0
+          fi
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          stage="dist/dmg-stage"
+          rm -rf "$stage"
+          mkdir -p "$stage" dist
+          ditto "$app" "$stage/SlabBase.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create \
+            -volname "SlabBase" \
+            -srcfolder "$stage" \
+            -ov \
+            -format UDZO \
+            "dist/SlabBase_${version}_${arch}.dmg"
+          rm -rf "$stage"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          cargo cyclonedx \
+            --manifest-path apps/desktop/src-tauri/Cargo.toml \
+            --format json \
+            --override-filename sbom.cdx
+          if [[ ! -s apps/desktop/src-tauri/sbom.cdx.json ]]; then
+            echo "::error::cargo-cyclonedx did not produce apps/desktop/src-tauri/sbom.cdx.json"
+            exit 1
+          fi
+          mkdir -p dist
+          cp apps/desktop/src-tauri/sbom.cdx.json dist/sbom.cdx.json
+          find crates apps/desktop/src-tauri -name 'sbom.cdx.json' -delete
+
+      - name: Write checksums
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ steps.target.outputs.arch }}"
+          cd dist
+          shasum -a 256 "SlabBase_${version}_${arch}.dmg" sbom.cdx.json > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ steps.target.outputs.arch }}"
+          dmg="SlabBase_${version}_${arch}.dmg"
+          commit="$(git rev-parse HEAD)"
+          VERSION="$version" ARCH="$arch" DMG="$dmg" SIGNED="${{ steps.signing.outputs.signed }}" COMMIT="$commit" python3 - <<'PY'
+          import os
+
+          version = os.environ["VERSION"]
+          arch = os.environ["ARCH"]
+          dmg = os.environ["DMG"]
+          signed = os.environ["SIGNED"] == "true"
+          commit = os.environ["COMMIT"]
+
+          if signed:
+              signing_note = "This build is signed with a Developer ID certificate and notarized by Apple."
+              gatekeeper_note = "The application is notarized; Gatekeeper should accept it without an override."
+          else:
+              signing_note = "This build is unsigned."
+              gatekeeper_note = """If Gatekeeper quarantines the application, copy it to `/Applications` and remove the quarantine attribute:
+
+          ```bash
+          xattr -dr com.apple.quarantine /Applications/SlabBase.app
+          ```"""
+
+          notes = f"""# SlabBase {version}
+
+          Draft release built from `{commit}` on macOS 15 ({arch}).
+          {signing_note}
+
+          ## Install
+
+          1. Download `{dmg}`.
+          2. Open the disk image and drag **SlabBase** to **Applications**.
+          3. Launch SlabBase and click **Load Sample Workspace**, or create a new workspace.
+
+          {gatekeeper_note}
+
+          ## Verify
+
+          ```bash
+          shasum -a 256 -c SHA256SUMS.txt
+          gh attestation verify {dmg} --repo chiranjeevi-max/slabbase
+          gh attestation verify {dmg} --repo chiranjeevi-max/slabbase --predicate-type https://cyclonedx.org/bom
+          gh attestation verify SHA256SUMS.txt --repo chiranjeevi-max/slabbase
+          ```
+
+          `sbom.cdx.json` is the CycloneDX SBOM for this release.
+
+          ## Scope
+
+          See [ROADMAP.md](https://github.com/chiranjeevi-max/slabbase/blob/main/ROADMAP.md) for the known v1.0 limits and the workspace compatibility policy.
+          """
+          with open("dist/RELEASE_NOTES.md", "w", encoding="utf-8") as handle:
+              handle.write(notes)
+          PY
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/SlabBase_*.dmg
+            dist/SHA256SUMS.txt
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/SlabBase_*.dmg
+            dist/SHA256SUMS.txt
+          sbom-path: dist/sbom.cdx.json
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ steps.target.outputs.arch }}"
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --verify-tag \
+            --title "SlabBase ${version}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            "dist/SlabBase_${version}_${arch}.dmg" \
+            dist/sbom.cdx.json \
+            dist/SHA256SUMS.txt
