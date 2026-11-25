@@ -530,10 +530,14 @@ fn remainder(left: &Value, right: &Value) -> Result<Value, FormulaError> {
     };
     match (left, right) {
         (Number::Integer(left), Number::Integer(right)) => {
-            if right == 0 {
-                return Err(FormulaError::Core(slab_core::CoreError::DivisionByZero));
-            }
-            Ok(Value::Integer(left % right))
+            let remainder = left.checked_rem(right).ok_or_else(|| {
+                if right == 0 {
+                    FormulaError::Core(slab_core::CoreError::DivisionByZero)
+                } else {
+                    overflow("taking an integer remainder")
+                }
+            })?;
+            Ok(Value::Integer(remainder))
         }
         (left, right) => Ok(Value::Decimal(
             number_decimal(left).checked_rem(number_decimal(right))?,

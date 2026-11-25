@@ -18,8 +18,71 @@ pub use ast::{BinaryOp, Expr, UnaryOp};
 pub use dag::{FormulaCheck, FormulaDag};
 pub use error::FormulaError;
 pub use eval::{EvalContext, evaluate, evaluate_expression};
+use lexer::{TokenKind, tokenize};
 pub use parser::parse;
 pub use types::{FormulaType, TypeEnv, typecheck, validate_expression};
+
+/// Rewrites exact column references in formula source text without touching
+/// string literals, whitespace, parentheses, or formatting.
+///
+/// `table` is `None` for bare references and `Some(relation)` for
+/// relation-qualified references. The returned text is byte-for-byte identical
+/// except for the renamed identifier spans, so rename undo restores the
+/// original formula exactly.
+pub fn rewrite_column_source(
+    input: &str,
+    table: Option<&str>,
+    from: &str,
+    to: &str,
+) -> Result<String, FormulaError> {
+    let tokens = tokenize(input)?;
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let TokenKind::Ident(name) = &token.kind else {
+            continue;
+        };
+        if name != from {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|at| tokens.get(at));
+        let next = tokens.get(index + 1);
+        let qualified = previous.is_some_and(|token| matches!(token.kind, TokenKind::Dot));
+        let is_owner = next.is_some_and(|token| matches!(token.kind, TokenKind::Dot));
+        if is_owner {
+            continue;
+        }
+        match (table, qualified) {
+            (None, false) => {}
+            (Some(expected), true) => {
+                let owner = index
+                    .checked_sub(2)
+                    .and_then(|at| tokens.get(at))
+                    .and_then(|token| match &token.kind {
+                        TokenKind::Ident(owner) => Some(owner.as_str()),
+                        _ => None,
+                    });
+                if owner != Some(expected) {
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+        let start = if input.as_bytes().get(token.position) == Some(&b'[') {
+            token.position + 1
+        } else {
+            token.position
+        };
+        let end = start + name.len();
+        if input.get(start..end) == Some(name.as_str()) {
+            edits.push((start, end));
+        }
+    }
+    let mut output = input.to_owned();
+    for (start, end) in edits.into_iter().rev() {
+        output.replace_range(start..end, to);
+    }
+    Ok(output)
+}
 
 #[cfg(test)]
 mod property_tests {
