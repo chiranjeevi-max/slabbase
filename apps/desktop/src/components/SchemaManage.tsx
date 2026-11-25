@@ -50,7 +50,7 @@ export function SchemaManage({
     api
       .listIndexes(selectedTable)
       .then((result) => {
-        if (!cancelled) setIndexes(result);
+        if (!cancelled) setIndexes(Array.isArray(result) ? result : []);
       })
       .catch((error: unknown) => {
         if (!cancelled) notify("error", errorText(error));
@@ -128,7 +128,7 @@ export function SchemaManage({
 
   const onToggleIndex = async (column: Column, enabled: boolean) => {
     const result = await toggleIndex(table.name, column.name, enabled);
-    if (result) setIndexes(result);
+    if (Array.isArray(result)) setIndexes(result);
   };
 
   return (

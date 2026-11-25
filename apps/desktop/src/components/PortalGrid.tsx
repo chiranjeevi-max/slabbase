@@ -166,7 +166,7 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
   const end = Math.min(rows.length, start + visibleCount);
   const bodyHeight = Math.max(
     ROW_HEIGHT,
-    Math.min(rows.length * ROW_HEIGHT, PORTAL_HEIGHT),
+    Math.min(rows.length * ROW_HEIGHT + (rows.length > 0 ? 2 : 0), PORTAL_HEIGHT),
   );
 
   return (
@@ -278,7 +278,9 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
 
 function gridColumns(columns: Column[]): string {
   if (columns.length === 0) return "1fr 26px";
-  return `${columns.map(() => "minmax(108px, 1fr)").join(" ")} 26px`;
+  return `${columns
+    .map((_, index) => (index === 0 ? "minmax(100px, 1.3fr)" : "minmax(64px, 1fr)"))
+    .join(" ")} 26px`;
 }
 
 function errorText(error: unknown): string {

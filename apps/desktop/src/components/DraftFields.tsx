@@ -95,7 +95,7 @@ export function DraftField({ column, value, onChange }: DraftFieldProps) {
   }
   const type = column.ty.kind === "date" ? "date" : column.ty.kind === "integer" ? "number" : "text";
   return (
-    <span className="field-shell">
+    <span className={`field-shell ${column.ty.kind === "currency" ? "has-suffix" : ""}`}>
       <input
         className={`field-input ${isNumericColumn(column) ? "numeric" : ""}`}
         type={type}

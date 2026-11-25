@@ -119,7 +119,11 @@ export function FieldInput({
         ? "number"
         : "text";
   return (
-    <span className={`field-shell ${compact ? "compact" : ""}`}>
+    <span
+      className={`field-shell ${compact ? "compact" : ""} ${
+        column.ty.kind === "currency" ? "has-suffix" : ""
+      }`}
+    >
       <input
         ref={inputRef as React.RefObject<HTMLInputElement>}
         className={`field-input ${compact ? "compact" : ""} ${

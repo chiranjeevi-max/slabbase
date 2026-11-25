@@ -1052,7 +1052,7 @@ button.grid-head-cell:hover {
   width: 100%;
 }
 
-.field-shell .field-input {
+.field-shell.has-suffix .field-input {
   padding-right: 34px;
 }
 
@@ -3008,7 +3008,7 @@ button.grid-head-cell:hover {
 
 .portal-grid-head {
   display: grid;
-  min-width: 420px;
+  min-width: 0;
   background: var(--panel-2);
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
@@ -3047,7 +3047,7 @@ button.grid-head-cell:hover {
 .portal-scroll {
   position: relative;
   overflow: auto;
-  min-width: 420px;
+  min-width: 0;
   background: var(--panel);
 }
 
@@ -3094,6 +3094,10 @@ button.grid-head-cell:hover {
 .portal-grid-cell .field-input:hover {
   border-color: var(--line);
   background: var(--panel);
+}
+
+.portal-grid-cell .field-value.readonly .computed-mark {
+  display: none;
 }
 
 .portal-grid-cell .field-value.readonly {
@@ -3385,4 +3389,122 @@ button.grid-head-cell:hover {
     opacity: 1;
     transform: scale(1);
   }
+}
+
+/* Responsive workspace toolbar */
+
+.grid-toolbar {
+  flex-wrap: wrap;
+  height: auto;
+  row-gap: 7px;
+}
+
+.grid-title {
+  flex: 1 1 240px;
+  overflow: hidden;
+}
+
+.grid-title h1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 1330px) {
+  .grid-toolbar {
+    padding: 8px 12px;
+  }
+
+  .toolbar-actions .button {
+    height: 28px;
+    padding: 0 8px;
+    font-size: 11px;
+  }
+
+  .grid-title h1 {
+    font-size: 21px;
+  }
+
+  .filter-input {
+    width: 220px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .keyboard-hint {
+    display: none;
+  }
+
+  .grid-title {
+    flex-basis: 180px;
+  }
+}
+
+/* Responsive form studio */
+
+.studio-toolbar {
+  flex-wrap: wrap;
+  height: auto;
+  min-height: 52px;
+  row-gap: 6px;
+}
+
+.studio-toolbar .toolbar-actions {
+  flex-wrap: wrap;
+}
+
+.canvas {
+  min-width: 0;
+}
+
+@media (max-width: 1400px) {
+  .palette {
+    width: 190px;
+    flex-basis: 190px;
+    padding: 12px 9px;
+  }
+
+  .inspector {
+    width: 220px;
+    flex-basis: 220px;
+  }
+
+  .layout-name {
+    width: 180px;
+    font-size: 17px;
+  }
+
+  .canvas-wrap {
+    padding: 16px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .palette {
+    width: 170px;
+    flex-basis: 170px;
+  }
+
+  .inspector {
+    width: 200px;
+    flex-basis: 200px;
+  }
+
+  .studio-toolbar {
+    padding: 6px 10px;
+  }
+}
+
+.studio-toolbar .select {
+  width: auto;
+  min-width: 132px;
+  max-width: 190px;
+}
+
+.studio-toolbar .toolbar-actions {
+  flex: 0 1 auto;
 }
