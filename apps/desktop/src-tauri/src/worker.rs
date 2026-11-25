@@ -24,7 +24,7 @@ pub struct DbHandle {
     readers: Mutex<Vec<Workspace>>,
     path: Mutex<Option<PathBuf>>,
     lifecycle: RwLock<()>,
-    cancel: Arc<QueryCancel>,
+    cancel: Mutex<Arc<QueryCancel>>,
     generation: AtomicU64,
     read_gate: ReadGate,
 }
@@ -37,15 +37,35 @@ impl DbHandle {
             readers: Mutex::new(Vec::new()),
             path: Mutex::new(None),
             lifecycle: RwLock::new(()),
-            cancel: Arc::new(QueryCancel::new()),
+            cancel: Mutex::new(Arc::new(QueryCancel::new())),
             generation: AtomicU64::new(0),
             read_gate: ReadGate::new(),
         })
     }
 
-    /// Interrupts a superseded interactive query without taking a lock.
+    /// The cancellation handle for the current workspace generation.
+    ///
+    /// Every open or create installs a fresh handle. Readers lease the handle
+    /// they were opened with, so an interrupt aimed at a previous workspace can
+    /// never reach the workspace now on screen.
+    pub fn cancel_handle(&self) -> Arc<QueryCancel> {
+        match self.cancel.lock() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Interrupts a superseded interactive query without taking the writer lock.
     pub fn cancel_query(&self) -> bool {
-        self.cancel.interrupt()
+        self.cancel_handle().interrupt()
+    }
+
+    fn install_cancel(&self, cancel: Arc<QueryCancel>) -> Result<(), ApiError> {
+        *self
+            .cancel
+            .lock()
+            .map_err(|_| ApiError::internal("cancel lock is poisoned"))? = cancel;
+        Ok(())
     }
 
     /// Opens a workspace, replacing any current one.
@@ -56,7 +76,8 @@ impl DbHandle {
             .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
         let mut workspace = Workspace::open(&path, Box::new(HybridLogicalClock::new("desktop")))
             .map_err(ApiError::from)?;
-        workspace.set_cancel_handle(Arc::clone(&self.cancel));
+        let cancel = Arc::new(QueryCancel::new());
+        workspace.set_cancel_handle(Arc::clone(&cancel));
         let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
         self.clear_readers();
         close_writer(&self.writer)?;
@@ -65,11 +86,12 @@ impl DbHandle {
             .lock()
             .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
             Some(PathBuf::from(&path));
+        self.install_cancel(Arc::clone(&cancel))?;
         *self
             .writer
             .lock()
             .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
-        self.fill_readers(Path::new(&path));
+        self.fill_readers(Path::new(&path), &cancel);
         Ok(info)
     }
 
@@ -88,18 +110,20 @@ impl DbHandle {
         let mut workspace =
             Workspace::create(&path, &name, Box::new(HybridLogicalClock::new("desktop")))
                 .map_err(ApiError::from)?;
-        workspace.set_cancel_handle(Arc::clone(&self.cancel));
+        let cancel = Arc::new(QueryCancel::new());
+        workspace.set_cancel_handle(Arc::clone(&cancel));
         let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
         *self
             .path
             .lock()
             .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
             Some(PathBuf::from(&path));
+        self.install_cancel(Arc::clone(&cancel))?;
         *self
             .writer
             .lock()
             .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
-        self.fill_readers(Path::new(&path));
+        self.fill_readers(Path::new(&path), &cancel);
         Ok(info)
     }
 
@@ -115,6 +139,7 @@ impl DbHandle {
             .path
             .lock()
             .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? = None;
+        self.install_cancel(Arc::new(QueryCancel::new()))?;
         Ok(())
     }
 
@@ -133,9 +158,9 @@ impl DbHandle {
         })?))
     }
 
-    /// Loads the sample workspace. This is a write and serializes with writers.
+    /// Loads the sample workspace. It creates tables, so it excludes readers.
     pub fn load_sample(&self) -> Result<WorkspaceInfoDto, ApiError> {
-        self.write(|workspace| {
+        self.write_schema(|workspace| {
             workspace.seed_studio().map_err(ApiError::from)?;
             Ok(WorkspaceInfoDto::from(
                 workspace.info().map_err(ApiError::from)?,
@@ -167,7 +192,10 @@ impl DbHandle {
         outcome
     }
 
-    /// Runs a write against the serialized writer workspace.
+    /// Runs a data write against the serialized writer workspace.
+    ///
+    /// Reads may continue from their WAL snapshot while an import or row write
+    /// is active.
     pub fn write<T, F>(&self, work: F) -> Result<T, ApiError>
     where
         T: Send,
@@ -185,8 +213,35 @@ impl DbHandle {
             let workspace = writer.as_mut().ok_or_else(ApiError::no_workspace)?;
             work(workspace)
         };
-        // A write may have changed the schema or audit metadata. Recycle idle
-        // reader connections so the next read sees a fresh schema snapshot.
+        self.clear_readers();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        outcome
+    }
+
+    /// Runs a schema-changing write while excluding concurrent read leases.
+    ///
+    /// A read loads metadata and then prepares its data SQL on that snapshot.
+    /// If a rename or table rebuild committed between those two steps, the
+    /// prepared statement could name a column that no longer exists. Schema
+    /// changes take the lifecycle write lock, so every lease observes either
+    /// the old schema for its whole call or the new one, never a mixture.
+    pub fn write_schema<T, F>(&self, work: F) -> Result<T, ApiError>
+    where
+        T: Send,
+        F: FnOnce(&mut Workspace) -> Result<T, ApiError> + Send,
+    {
+        let _gate = self
+            .lifecycle
+            .write()
+            .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
+        let outcome = {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| ApiError::internal("writer lock is poisoned"))?;
+            let workspace = writer.as_mut().ok_or_else(ApiError::no_workspace)?;
+            work(workspace)
+        };
         self.clear_readers();
         self.generation.fetch_add(1, Ordering::AcqRel);
         outcome
@@ -200,7 +255,10 @@ impl DbHandle {
             .pop();
         match pooled {
             Some(workspace) => Ok(workspace),
-            None => self.open_reader(path),
+            None => {
+                let cancel = self.cancel_handle();
+                self.open_reader(path, &cancel)
+            }
         }
     }
 
@@ -215,18 +273,18 @@ impl DbHandle {
         }
     }
 
-    fn open_reader(&self, path: &Path) -> Result<Workspace, ApiError> {
+    fn open_reader(&self, path: &Path, cancel: &Arc<QueryCancel>) -> Result<Workspace, ApiError> {
         let mut workspace =
             Workspace::open_read_only(path, Box::new(HybridLogicalClock::new("desktop-read")))
                 .map_err(ApiError::from)?;
-        workspace.set_cancel_handle(Arc::clone(&self.cancel));
+        workspace.set_cancel_handle(Arc::clone(cancel));
         Ok(workspace)
     }
 
-    fn fill_readers(&self, path: &Path) {
+    fn fill_readers(&self, path: &Path, cancel: &Arc<QueryCancel>) {
         if let Ok(mut readers) = self.readers.lock() {
             while readers.len() < READER_POOL_SIZE {
-                match self.open_reader(path) {
+                match self.open_reader(path, cancel) {
                     Ok(workspace) => readers.push(workspace),
                     Err(_) => break,
                 }

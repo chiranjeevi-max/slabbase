@@ -12,7 +12,7 @@ use std::sync::Arc;
 use slab_core::{
     AuditEntry, Column, ColumnDraft, GridSpec, IndexSpec, Layout, LayoutItem, LayoutItemKind,
     PageFrame, PageQuery, PortalFrame, PortalQuery, Record, RecordBundle, RecordRevision, Relation,
-    RelationDraft, RowData, RowId, Schema, SearchHit, Table, TableDraft, UndoState,
+    RelationDraft, RowData, RowId, Schema, SearchHit, Table, TableDraft, UndoState, Value,
 };
 use slab_import::{CsvAdapter, ImportAdapter, ImportError, ImportSink, JsonAdapter};
 use slab_storage::Workspace;
@@ -51,6 +51,15 @@ where
 {
     let db = Arc::clone(&state.db);
     blocking(move || db.write(work)).await
+}
+
+async fn run_schema_write<T, F>(state: &State<'_, AppState>, work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Workspace) -> Result<T, ApiError> + Send + 'static,
+{
+    let db = Arc::clone(&state.db);
+    blocking(move || db.write_schema(work)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -132,7 +141,7 @@ pub async fn create_table(
     state: State<'_, AppState>,
     draft: TableDraft,
 ) -> Result<Table, ApiError> {
-    run_write(&state, move |workspace| Ok(workspace.create_table(&draft)?)).await
+    run_schema_write(&state, move |workspace| Ok(workspace.create_table(&draft)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -141,7 +150,7 @@ pub async fn add_column(
     table: String,
     draft: ColumnDraft,
 ) -> Result<Column, ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         Ok(workspace.add_column(&table, &draft)?)
     })
     .await
@@ -152,7 +161,7 @@ pub async fn create_relation(
     state: State<'_, AppState>,
     draft: RelationDraft,
 ) -> Result<Relation, ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         Ok(workspace.create_relation(&draft)?)
     })
     .await
@@ -160,12 +169,12 @@ pub async fn create_relation(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn save_layout(state: State<'_, AppState>, layout: Layout) -> Result<Layout, ApiError> {
-    run_write(&state, move |workspace| Ok(workspace.save_layout(layout)?)).await
+    run_schema_write(&state, move |workspace| Ok(workspace.save_layout(layout)?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn delete_layout(state: State<'_, AppState>, id: String) -> Result<(), ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         workspace.delete_layout(&id)?;
         Ok(())
     })
@@ -178,7 +187,7 @@ pub async fn rename_table(
     old_name: String,
     new_name: String,
 ) -> Result<(), ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         workspace.rename_table(&old_name, &new_name)?;
         Ok(())
     })
@@ -192,7 +201,7 @@ pub async fn rename_column(
     old_name: String,
     new_name: String,
 ) -> Result<(), ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         workspace.rename_column(&table, &old_name, &new_name)?;
         Ok(())
     })
@@ -201,7 +210,7 @@ pub async fn rename_column(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn drop_table(state: State<'_, AppState>, name: String) -> Result<(), ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         workspace.drop_table(&name)?;
         Ok(())
     })
@@ -214,7 +223,7 @@ pub async fn drop_column(
     table: String,
     column: String,
 ) -> Result<(), ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         workspace.drop_column(&table, &column)?;
         Ok(())
     })
@@ -223,7 +232,7 @@ pub async fn drop_column(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn drop_relation(state: State<'_, AppState>, name: String) -> Result<(), ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         workspace.drop_relation(&name)?;
         Ok(())
     })
@@ -245,7 +254,7 @@ pub async fn toggle_index(
     column: String,
     enabled: bool,
 ) -> Result<Vec<IndexSpec>, ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         if enabled {
             workspace.create_index(&table, &column)?;
         } else {
@@ -268,7 +277,7 @@ pub async fn create_index(
     table: String,
     column: String,
 ) -> Result<IndexSpec, ApiError> {
-    run_write(&state, move |workspace| {
+    run_schema_write(&state, move |workspace| {
         Ok(workspace.create_index(&table, &column)?)
     })
     .await
@@ -387,12 +396,12 @@ pub async fn delete_row(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn undo(state: State<'_, AppState>) -> Result<UndoState, ApiError> {
-    run_write(&state, |workspace| Ok(workspace.undo()?)).await
+    run_schema_write(&state, |workspace| Ok(workspace.undo()?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn redo(state: State<'_, AppState>) -> Result<UndoState, ApiError> {
-    run_write(&state, |workspace| Ok(workspace.redo()?)).await
+    run_schema_write(&state, |workspace| Ok(workspace.redo()?)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -635,6 +644,38 @@ fn collect_rows_bounded(
     Ok((rows, truncated))
 }
 
+/// Renders one exported value.
+///
+/// A spreadsheet evaluates a leading `=`, `+`, `-`, `@`, tab, or carriage
+/// return even when the field is CSV-quoted. Imported data is untrusted, so
+/// text that would be treated as a formula is prefixed with a single quote.
+/// Numeric values are never prefixed: a negative amount is data.
+fn csv_cell(value: &Value) -> String {
+    let text = value.display_string();
+    let text_like = matches!(
+        value,
+        Value::Text(_) | Value::Select(_) | Value::AttachmentRef(_)
+    );
+    let formula_like = text
+        .chars()
+        .next()
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'));
+    if text_like && formula_like {
+        format!("'{text}")
+    } else {
+        text
+    }
+}
+
+fn csv_record(record: &Record, columns: &[String]) -> Vec<String> {
+    let mut row = vec![record.id.to_string()];
+    for column in columns {
+        let value = record.get(column).cloned().unwrap_or(Value::Null);
+        row.push(csv_cell(&value));
+    }
+    row
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn export_csv(
     state: State<'_, AppState>,
@@ -663,17 +704,7 @@ pub async fn export_csv(
         loop {
             let page = workspace.page(&query)?;
             for record in &page.rows {
-                let mut row = vec![record.id.to_string()];
-                for column in &columns {
-                    row.push(
-                        record
-                            .get(column)
-                            .cloned()
-                            .unwrap_or(slab_core::Value::Null)
-                            .display_string(),
-                    );
-                }
-                writer.write_record(&row)?;
+                writer.write_record(csv_record(record, &columns))?;
             }
             match page.next_cursor {
                 Some(cursor) => query.cursor = Some(cursor),
@@ -693,36 +724,45 @@ pub async fn export_json(
     query: PageQuery,
 ) -> Result<(), ApiError> {
     run_read(&state, move |workspace| {
-        let file = File::create(&path)?;
-        let mut out = BufWriter::new(file);
-        out.write_all(b"[\n")?;
-        let mut first = true;
-        let mut query = query;
-        query.limit = 500;
-        loop {
-            let page = workspace.page(&query)?;
-            for record in &page.rows {
-                if !first {
-                    out.write_all(b",\n")?;
-                }
-                first = false;
-                let mut object = serde_json::Map::new();
-                object.insert("id".into(), serde_json::Value::from(record.id));
-                for (name, value) in &record.values {
-                    object.insert(name.clone(), serde_json::to_value(value)?);
-                }
-                serde_json::to_writer(&mut out, &serde_json::Value::Object(object))?;
-            }
-            match page.next_cursor {
-                Some(cursor) => query.cursor = Some(cursor),
-                None => break,
-            }
-        }
-        out.write_all(b"\n]\n")?;
-        out.flush()?;
-        Ok(())
+        export_json_to(workspace, &path, query)
     })
     .await
+}
+
+/// Resolves the table before touching the destination, so a typo cannot erase
+/// an existing export.
+fn export_json_to(workspace: &Workspace, path: &str, mut query: PageQuery) -> Result<(), ApiError> {
+    let schema = workspace.schema()?;
+    if schema.table(&query.table).is_none() {
+        return Err(ApiError::new("SLAB_E_NOT_FOUND", "table is missing"));
+    }
+    let file = File::create(path)?;
+    let mut out = BufWriter::new(file);
+    out.write_all(b"[\n")?;
+    let mut first = true;
+    query.limit = 500;
+    loop {
+        let page = workspace.page(&query)?;
+        for record in &page.rows {
+            if !first {
+                out.write_all(b",\n")?;
+            }
+            first = false;
+            let mut object = serde_json::Map::new();
+            object.insert("id".into(), serde_json::Value::from(record.id));
+            for (name, value) in &record.values {
+                object.insert(name.clone(), serde_json::to_value(value)?);
+            }
+            serde_json::to_writer(&mut out, &serde_json::Value::Object(object))?;
+        }
+        match page.next_cursor {
+            Some(cursor) => query.cursor = Some(cursor),
+            None => break,
+        }
+    }
+    out.write_all(b"\n]\n")?;
+    out.flush()?;
+    Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -901,4 +941,83 @@ pub async fn export_table_pdf(
         })
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slab_core::{ColumnDraft, ColumnType, TableDraft};
+    use slab_sync::HybridLogicalClock;
+    use std::fs;
+
+    fn text(name: &str) -> ColumnDraft {
+        ColumnDraft {
+            name: name.into(),
+            ty: ColumnType::Text,
+            required: false,
+            unique: false,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn csv_export_neutralizes_spreadsheet_formulas() {
+        let record = Record {
+            id: 7,
+            values: RowData::from([
+                (
+                    "Note".to_owned(),
+                    Value::from("=HYPERLINK(\"http://attacker\",\"Report\")"),
+                ),
+                ("Amount".to_owned(), Value::Integer(-5)),
+                ("Plus".to_owned(), Value::from("+1+1")),
+                ("At".to_owned(), Value::from("@SUM(A1)")),
+            ]),
+        };
+        let columns = vec![
+            "Note".to_owned(),
+            "Amount".to_owned(),
+            "Plus".to_owned(),
+            "At".to_owned(),
+        ];
+        let row = csv_record(&record, &columns);
+        assert_eq!(row[0], "7");
+        assert_eq!(row[1], "'=HYPERLINK(\"http://attacker\",\"Report\")");
+        assert_eq!(row[2], "-5", "a negative numeric value is data");
+        assert_eq!(row[3], "'+1+1");
+        assert_eq!(row[4], "'@SUM(A1)");
+    }
+
+    #[test]
+    fn json_export_validates_before_truncating_the_target() {
+        let mut workspace =
+            Workspace::open_in_memory("Export", Box::new(HybridLogicalClock::new("test")))
+                .expect("workspace");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![text("Body")],
+            })
+            .expect("table");
+
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("existing.json");
+        fs::write(&path, "keep me").expect("seed export");
+
+        let error = export_json_to(
+            &workspace,
+            path.to_str().expect("path"),
+            PageQuery {
+                table: "Missing".into(),
+                ..PageQuery::default()
+            },
+        )
+        .expect_err("an unknown table must fail");
+        assert_eq!(error.code, "SLAB_E_NOT_FOUND");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read export"),
+            "keep me",
+            "a failed export truncated the previous file"
+        );
+    }
 }
