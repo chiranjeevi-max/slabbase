@@ -259,7 +259,6 @@ impl Parser {
     }
 
     fn parse_call(&mut self, name: String) -> Result<Expr, FormulaError> {
-        // The opening parenthesis is next.
         self.advance();
         let mut args = Vec::new();
         if matches!(self.peek(), TokenKind::RParen) {
