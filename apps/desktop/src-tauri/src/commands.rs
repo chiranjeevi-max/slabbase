@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::sync::Arc;
 
 use slab_core::{
@@ -363,8 +363,8 @@ fn adapter_for(format: &str) -> Result<Box<dyn ImportAdapter>, ApiError> {
     }
 }
 
-fn open_file(path: &str) -> Result<File, ApiError> {
-    File::open(path).map_err(ApiError::from)
+fn open_file(path: &str) -> Result<BufReader<File>, ApiError> {
+    File::open(path).map(BufReader::new).map_err(ApiError::from)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -673,7 +673,7 @@ pub async fn render_form_html(
             .table(&table)
             .ok_or_else(|| ApiError::new("SLAB_E_NOT_FOUND", "table is missing"))?;
         let layout = layout_for(&schema, definition, layout_id.as_deref())?;
-        let bundle = workspace.bundle(&table, id, 500)?;
+        let bundle = workspace.bundle(&table, id, 25_000)?;
         Ok(slab_print::render_html(
             &schema,
             &layout,
@@ -725,7 +725,7 @@ pub async fn export_form_pdf(
             .table(&table)
             .ok_or_else(|| ApiError::new("SLAB_E_NOT_FOUND", "table is missing"))?;
         let layout = layout_for(&schema, definition, layout_id.as_deref())?;
-        let bundle = workspace.bundle(&table, id, 500)?;
+        let bundle = workspace.bundle(&table, id, 25_000)?;
         let bytes = slab_print::render_pdf(&schema, &layout, &bundle, &options.to_options())?;
         std::fs::write(&path, bytes)?;
         Ok(())
