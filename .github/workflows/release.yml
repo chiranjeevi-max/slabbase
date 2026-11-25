@@ -25,7 +25,7 @@ env:
 jobs:
   release:
     name: Draft release
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 180
     permissions:
       contents: write

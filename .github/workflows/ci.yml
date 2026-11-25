@@ -21,7 +21,7 @@ env:
 jobs:
   rust:
     name: Rust gate
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       contents: read
@@ -52,7 +52,7 @@ jobs:
 
   desktop:
     name: Desktop gate (${{ matrix.shard }}/4)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     permissions:
       contents: read
@@ -97,7 +97,7 @@ jobs:
 
   bundle:
     name: Bundle check
-    runs-on: macos-15
+    runs-on: macos-26
     needs: [rust, desktop]
     timeout-minutes: 60
     permissions:
