@@ -82,8 +82,11 @@ User data lives in ordinary tables with real foreign keys. SlabBase metadata liv
 - [ARCHITECTURE.md](ARCHITECTURE.md) — dependency graph, storage schema, reader/writer concurrency, pagination, rollups, audit chain, and failure containment.
 - [docs/DESIGN_CONTRACT.md](docs/DESIGN_CONTRACT.md) — the normative visual and interaction contract, enforced by the Playwright audit.
 - [ROADMAP.md](ROADMAP.md) — shipped scope, next versions, known limits, and the workspace compatibility policy.
+- [CHANGELOG.md](CHANGELOG.md) — release history and the unreleased v1.0 scope.
 - [SECURITY.md](SECURITY.md) — reporting, scope, response targets, and security design notes.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — DCO, commit signing, the local gate, and commit style.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community standards and enforcement.
+- [docs/RELEASING.md](docs/RELEASING.md) — tag-to-draft release operations, Apple secrets, and attestation checks.
 
 ## Build from source
 

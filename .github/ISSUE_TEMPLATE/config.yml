@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and usage help
+    url: https://github.com/chiranjeevi-max/slabbase/discussions
+    about: Ask usage questions, share workflows, and propose ideas in Discussions.
+  - name: Report a security vulnerability
+    url: https://github.com/chiranjeevi-max/slabbase/security/advisories/new
+    about: Report vulnerabilities privately through GitHub Private Vulnerability Reporting.

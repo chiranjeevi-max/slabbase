@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a focused improvement to SlabBase.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are most useful when they describe a concrete workflow, the current workaround, and the smallest acceptable change.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: This is a product request, not a support question or a security report.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is blocked, slow, or unnecessarily fragile today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest behavior that would solve the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, SQL, external tools, or a narrower option.
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Primary surface
+      options:
+        - Grid and records
+        - Form Studio
+        - Schema and relations
+        - Import and export
+        - Print and PDF
+        - Audit and time travel
+        - macOS shell and appearance
+        - CLI, automation, or storage format
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, prior art, scale expectations, or compatibility concerns.

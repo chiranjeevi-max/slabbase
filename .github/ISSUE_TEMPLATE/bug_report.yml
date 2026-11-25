@@ -1,0 +1,99 @@
+name: Bug report
+description: Report a reproducible defect in SlabBase.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please search existing issues first and remove any private data from logs or workspace files.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I am using the latest release or current `main`.
+          required: true
+        - label: I searched existing issues and discussions for this problem.
+          required: true
+        - label: I read `README.md`, `ARCHITECTURE.md`, and the relevant troubleshooting notes.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: SlabBase version
+      description: The version shown in the app or the commit SHA when built from source.
+      placeholder: "1.0.0 or a commit SHA"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: macos
+    attributes:
+      label: macOS version
+      options:
+        - macOS 26
+        - macOS 15
+        - macOS 14
+        - macOS 13
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation
+      options:
+        - DMG release
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest sequence that reliably triggers the defect.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or diagnostic output
+      description: Paste relevant output. Do not include secrets or private workspace contents.
+      render: shell
+
+  - type: textarea
+    id: workspace
+    attributes:
+      label: Workspace details
+      description: Table shape, row count, relation shape, and whether the problem reproduces in a copy of the sample workspace.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Recent changes, external SQLite access, or anything else that narrows the report.
