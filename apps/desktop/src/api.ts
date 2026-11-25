@@ -7,9 +7,12 @@ import type {
   ImportPreviewDto,
   ImportSummaryDto,
   ImportValidationDto,
+  IndexSpec,
   IntegrityReportDto,
   Layout,
   Page,
+  PortalPage,
+  PortalQuery,
   PageQuery,
   PrintOptionsDto,
   Record as SlabRecord,
@@ -20,6 +23,8 @@ import type {
   SearchHit,
   Table,
   TableDraft,
+  TableHtmlResultDto,
+  TablePdfResultDto,
   UndoState,
   Value,
   WorkspaceInfoDto,
@@ -88,10 +93,28 @@ export const api = {
     call<Column>("add_column", { table, draft }),
   createRelation: (draft: RelationDraft) =>
     call<Relation>("create_relation", { draft }),
+  dropRelation: (name: string) => call<void>("drop_relation", { name }),
+  renameTable: (oldName: string, newName: string) =>
+    call<void>("rename_table", { old_name: oldName, new_name: newName }),
+  renameColumn: (table: string, oldName: string, newName: string) =>
+    call<void>("rename_column", {
+      table,
+      old_name: oldName,
+      new_name: newName,
+    }),
+  dropTable: (name: string) => call<void>("drop_table", { name }),
+  dropColumn: (table: string, column: string) =>
+    call<void>("drop_column", { table, column }),
+  listIndexes: (table: string) =>
+    call<IndexSpec[]>("list_indexes", { table }),
+  toggleIndex: (table: string, column: string, enabled: boolean) =>
+    call<IndexSpec[]>("toggle_index", { table, column, enabled }),
   saveLayout: (layout: Layout) => call<Layout>("save_layout", { layout }),
   deleteLayout: (id: string) => call<void>("delete_layout", { id }),
 
   pageRows: (query: PageQuery) => call<Page>("page_rows", { query }),
+  pagePortal: (query: PortalQuery) =>
+    call<PortalPage>("page_portal", { query }),
   readRecord: (table: string, id: number) =>
     call<SlabRecord>("read_record", { table, id }),
   readBundle: (table: string, id: number, portalLimit = 500) =>
@@ -171,7 +194,7 @@ export const api = {
     table: string,
     query: PageQuery,
     options: PrintOptionsDto,
-  ) => call<string>("render_table_html", { table, query, options }),
+  ) => call<TableHtmlResultDto>("render_table_html", { table, query, options }),
   exportFormPdf: (
     path: string,
     table: string,
@@ -191,5 +214,5 @@ export const api = {
     table: string,
     query: PageQuery,
     options: PrintOptionsDto,
-  ) => call<void>("export_table_pdf", { path, table, query, options }),
+  ) => call<TablePdfResultDto>("export_table_pdf", { path, table, query, options }),
 };

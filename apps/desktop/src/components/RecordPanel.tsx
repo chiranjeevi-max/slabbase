@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import type { Column, LayoutItem, Table, Value } from "../bindings";
+import type { LayoutItem, Table, Value } from "../bindings";
 import { useStore } from "../store";
 import { isComputedColumn, recordTitle } from "../types";
 import { FieldInput } from "./FieldInput";
+import { PortalGrid } from "./PortalGrid";
 import { DraftField, DraftFieldLabel, fallbackValue } from "./DraftFields";
 import { Icon } from "./Icons";
 
@@ -163,13 +164,11 @@ export function RecordPanel() {
             }
             if (item.kind.kind === "portal") {
               return (
-                <Portal
+                <PortalGrid
                   key={item.id}
                   relationName={item.kind.relation}
                   columns={item.kind.columns}
                   parentId={bundle.record.id}
-                  pulse={pulse}
-                  setPulse={setPulse}
                 />
               );
             }
@@ -178,111 +177,6 @@ export function RecordPanel() {
         </div>
       </div>
     </aside>
-  );
-}
-
-interface PortalProps {
-  relationName: string;
-  columns: string[];
-  parentId: number;
-  pulse: string | null;
-  setPulse: (key: string) => void;
-}
-
-function Portal({ relationName, columns, parentId, pulse, setPulse }: PortalProps) {
-  const schema = useStore((state) => state.schema);
-  const bundle = useStore((state) => state.bundle);
-  const relation = schema?.relations.find((candidate) => candidate.name === relationName);
-  const child = schema?.tables.find((candidate) => candidate.name === relation?.child_table);
-  if (!relation || !child) return null;
-  const visible: Column[] =
-    columns.length > 0
-      ? columns
-          .map((name) => child.columns.find((column) => column.name === name))
-          .filter((column): column is Column => column !== undefined)
-      : child.columns.filter((column) => !isComputedColumn(column));
-  const rows = bundle?.portals[relation.name] ?? [];
-
-  const update = async (rowId: number, column: Column, value: Value) => {
-    const key = `${child.name}:${rowId}:${column.name}`;
-    const ok = await useStore.getState().updateCell(child.name, rowId, column.name, value);
-    if (ok) setPulse(key);
-    return ok;
-  };
-
-  const addRow = async () => {
-    const values: Record<string, Value> = {
-      [relation.child_column]: { Integer: parentId },
-    };
-    for (const column of child.columns) {
-      if (column.name === relation.child_column || isComputedColumn(column)) continue;
-      if (column.required) values[column.name] = fallbackValue(column);
-    }
-    await useStore.getState().insertChildRow(child.name, values);
-  };
-
-  return (
-    <div className="form-portal">
-      <div className="portal-header">
-        <span>{relation.name}</span>
-        <button type="button" className="text-button" onClick={() => void addRow()}>
-          <Icon name="plus" size={13} /> Add line
-        </button>
-      </div>
-      <div className="portal-table-wrap">
-        <table className="portal-table">
-          <thead>
-            <tr>
-              {visible.map((column) => (
-                <th key={column.name}>
-                  {column.name}
-                  {isComputedColumn(column) && <span className="computed-mark"> ƒ</span>}
-                </th>
-              ))}
-              <th className="portal-actions" aria-label="Row actions" />
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr>
-                <td className="portal-empty" colSpan={visible.length + 1}>
-                  No child rows yet.
-                </td>
-              </tr>
-            )}
-            {rows.map((row) => (
-              <tr key={row.id}>
-                {visible.map((column) => (
-                  <td key={column.name}>
-                    <FieldInput
-                      compact
-                      column={column}
-                      value={row.values[column.name] ?? "Null"}
-                      pulse={pulse === `${child.name}:${row.id}:${column.name}`}
-                      onCommit={(value) => update(row.id, column, value)}
-                    />
-                  </td>
-                ))}
-                <td className="portal-actions">
-                  <button
-                    type="button"
-                    className="icon-button tiny"
-                    title="Delete line"
-                    onClick={() => {
-                      if (window.confirm("Delete this line?")) {
-                        void useStore.getState().deleteChildRow(child.name, row.id);
-                      }
-                    }}
-                  >
-                    <Icon name="x" size={12} />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
   );
 }
 

@@ -4,6 +4,7 @@ import type {
   AuditEntry,
   ColumnDraft,
   Filter,
+  IndexSpec,
   Layout,
   PageQuery,
   Record as SlabRecord,
@@ -115,12 +116,13 @@ export interface AppStore {
 
   paletteOpen: boolean;
   schemaOpen: boolean;
-  schemaTab: "table" | "column" | "relation";
+  schemaTab: "table" | "column" | "relation" | "manage";
   importOpen: boolean;
   printOpen: boolean;
   auditOpen: boolean;
   audit: AuditEntry[];
   saveTick: number;
+  historyTick: number;
   integrity: string;
 
   initialize: () => Promise<void>;
@@ -145,6 +147,14 @@ export interface AppStore {
   loadMore: () => Promise<void>;
 
   selectRow: (id: number) => Promise<void>;
+  updatePortalRow: (
+    table: string,
+    id: number,
+    column: string,
+    value: Value,
+  ) => Promise<SlabRecord | null>;
+  insertPortalRow: (table: string, values: RowValues) => Promise<SlabRecord | null>;
+  deletePortalRow: (table: string, id: number) => Promise<boolean>;
   jumpToRecord: (table: string, id: number) => Promise<void>;
   closeRecord: () => void;
   refreshBundle: () => Promise<void>;
@@ -166,6 +176,12 @@ export interface AppStore {
   createTable: (draft: TableDraft) => Promise<boolean>;
   addColumn: (table: string, draft: ColumnDraft) => Promise<boolean>;
   createRelation: (draft: RelationDraft) => Promise<boolean>;
+  renameTable: (oldName: string, newName: string) => Promise<boolean>;
+  renameColumn: (table: string, oldName: string, newName: string) => Promise<boolean>;
+  dropTable: (name: string) => Promise<boolean>;
+  dropColumn: (table: string, column: string) => Promise<boolean>;
+  dropRelation: (name: string) => Promise<boolean>;
+  toggleIndex: (table: string, column: string, enabled: boolean) => Promise<IndexSpec[] | null>;
   saveLayout: (layout: Layout) => Promise<boolean>;
 
   openAudit: () => Promise<void>;
@@ -176,7 +192,7 @@ export interface AppStore {
 
   setPaletteOpen: (open: boolean) => void;
   setSchemaOpen: (open: boolean) => void;
-  openSchema: (tab: "table" | "column" | "relation") => void;
+  openSchema: (tab: "table" | "column" | "relation" | "manage") => void;
   insertChildRow: (table: string, values: RowValues) => Promise<boolean>;
   deleteChildRow: (table: string, id: number) => Promise<void>;
   setImportOpen: (open: boolean) => void;
@@ -285,6 +301,7 @@ export const useStore = create<AppStore>((set, get) => {
     auditOpen: false,
     audit: [],
     saveTick: 0,
+    historyTick: 0,
     integrity: "ok",
 
     initialize: async () => {
@@ -490,8 +507,8 @@ export const useStore = create<AppStore>((set, get) => {
       if (!state.activeTable) return;
       set({ selectedId: id, creating: false });
       try {
-        const bundle = await api.readBundle(state.activeTable, id, 500);
-        set({ bundle });
+        const record = await api.readRecord(state.activeTable, id);
+        set({ bundle: { record, portals: {} } });
       } catch (error) {
         notifyError(error);
       }
@@ -510,8 +527,8 @@ export const useStore = create<AppStore>((set, get) => {
       const state = get();
       if (!state.activeTable || state.selectedId === null) return;
       try {
-        const bundle = await api.readBundle(state.activeTable, state.selectedId, 500);
-        set({ bundle });
+        const record = await api.readRecord(state.activeTable, state.selectedId);
+        set({ bundle: { record, portals: {} } });
       } catch (error) {
         notifyError(error);
       }
@@ -552,7 +569,7 @@ export const useStore = create<AppStore>((set, get) => {
         const record = await api.insertRow(state.activeTable, values);
         set({ creating: false, selectedId: record.id });
         await loadFirstPage();
-        const bundle = await api.readBundle(state.activeTable, record.id, 500);
+        const bundle = { record, portals: {} };
         const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
         set({ bundle, undoState, info: info ?? state.info, saveTick: state.saveTick + 1 });
         notify("success", "Record created");
@@ -585,7 +602,7 @@ export const useStore = create<AppStore>((set, get) => {
     undo: async () => {
       try {
         const undoState = await api.undo();
-        set({ undoState });
+        set((current) => ({ undoState, historyTick: current.historyTick + 1 }));
         await refreshMeta();
         await get().loadFirstPage();
         await get().refreshBundle();
@@ -598,7 +615,7 @@ export const useStore = create<AppStore>((set, get) => {
     redo: async () => {
       try {
         const undoState = await api.redo();
-        set({ undoState });
+        set((current) => ({ undoState, historyTick: current.historyTick + 1 }));
         await refreshMeta();
         await get().loadFirstPage();
         await get().refreshBundle();
@@ -645,6 +662,90 @@ export const useStore = create<AppStore>((set, get) => {
       } catch (error) {
         notifyError(error);
         return false;
+      }
+    },
+
+    renameTable: async (oldName, newName) => {
+      const state = get();
+      try {
+        await api.renameTable(oldName, newName);
+        await refreshMeta();
+        if (state.activeTable === oldName) {
+          await get().selectTable(newName);
+        } else {
+          await get().loadFirstPage();
+        }
+        notify("success", `Table renamed to ${newName}`);
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
+
+    renameColumn: async (table, oldName, newName) => {
+      try {
+        await api.renameColumn(table, oldName, newName);
+        await refreshMeta();
+        await get().loadFirstPage();
+        await get().refreshBundle();
+        notify("success", `Column renamed to ${newName}`);
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
+
+    dropTable: async (name) => {
+      try {
+        await api.dropTable(name);
+        await refreshMeta();
+        const next = get().activeTable;
+        if (next) await get().selectTable(next);
+        notify("success", `Table ${name} dropped`);
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
+
+    dropColumn: async (table, column) => {
+      try {
+        await api.dropColumn(table, column);
+        await refreshMeta();
+        await get().loadFirstPage();
+        await get().refreshBundle();
+        notify("success", `Column ${column} dropped`);
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
+
+    dropRelation: async (name) => {
+      try {
+        await api.dropRelation(name);
+        await refreshMeta();
+        await get().refreshBundle();
+        notify("success", `Relation ${name} dropped`);
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
+
+    toggleIndex: async (table, column, enabled) => {
+      try {
+        const indexes = await api.toggleIndex(table, column, enabled);
+        notify("success", enabled ? `Index enabled on ${column}` : `Index removed from ${column}`);
+        return indexes;
+      } catch (error) {
+        notifyError(error);
+        return null;
       }
     },
 
@@ -712,6 +813,55 @@ export const useStore = create<AppStore>((set, get) => {
     openSchema: (tab) => set({ schemaOpen: true, schemaTab: tab }),
     setImportOpen: (open) => set({ importOpen: open }),
     setPrintOpen: (open) => set({ printOpen: open }),
+
+    updatePortalRow: async (table, id, column, value) => {
+      const state = get();
+      try {
+        const record = await api.updateRow(table, id, { [column]: value });
+        const undoState = await api.undoState();
+        set({ undoState, saveTick: state.saveTick + 1 });
+        await get().refreshBundle();
+        if (state.activeTable === table) {
+          set((current) => ({
+            rows: current.rows.map((row) => (row.id === id ? record : row)),
+          }));
+        }
+        const info = await api.workspaceInfo();
+        if (info) set({ info });
+        return record;
+      } catch (error) {
+        notifyError(error);
+        return null;
+      }
+    },
+
+    insertPortalRow: async (table, values) => {
+      const state = get();
+      try {
+        const record = await api.insertRow(table, values);
+        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
+        set({ undoState, info: info ?? state.info, saveTick: state.saveTick + 1 });
+        await get().refreshBundle();
+        if (state.activeTable === table) await get().loadFirstPage();
+        return record;
+      } catch (error) {
+        notifyError(error);
+        return null;
+      }
+    },
+
+    deletePortalRow: async (table, id) => {
+      try {
+        await api.deleteRow(table, id);
+        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
+        set({ undoState, info: info ?? get().info });
+        await get().refreshBundle();
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
 
     insertChildRow: async (table, values) => {
       const state = get();

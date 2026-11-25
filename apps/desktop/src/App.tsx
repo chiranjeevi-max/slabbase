@@ -285,6 +285,9 @@ function Sidebar() {
         <button type="button" className="sidebar-action" onClick={() => openSchema("relation")}>
           <Icon name="sliders" size={14} /> Add relation
         </button>
+        <button type="button" className="sidebar-action" onClick={() => openSchema("manage")}>
+          <Icon name="shield" size={14} /> Manage schema
+        </button>
         <button type="button" className="sidebar-action" onClick={() => void openAudit()}>
           <Icon name="history" size={14} /> Audit log
         </button>

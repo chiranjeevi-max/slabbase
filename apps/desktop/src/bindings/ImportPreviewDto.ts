@@ -24,6 +24,14 @@ sample: Array<ImportSampleDto>,
  */
 rowsScanned: number, 
 /**
+ * Rows used for type inference.
+ */
+inferenceRows: number, 
+/**
+ * True when inference stopped at the configured prefix.
+ */
+inferenceLimited: boolean, 
+/**
  * Structural issues.
  */
 issues: Array<ImportIssueDto>, };

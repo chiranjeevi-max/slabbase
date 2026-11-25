@@ -24,6 +24,7 @@ export function PrintDialog() {
     marginPt: null,
   });
   const [html, setHtml] = useState<string>("");
+  const [warning, setWarning] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
   const layouts = schema?.layouts.filter((layout) => layout.table === activeTable) ?? [];
@@ -31,6 +32,7 @@ export function PrintDialog() {
   useEffect(() => {
     if (!open) return;
     setMode(selectedId !== null ? "record" : "table");
+    setWarning("");
     const current =
       schema?.layouts.filter((layout) => layout.table === activeTable) ?? [];
     setLayoutId(current[0]?.id ?? "");
@@ -53,13 +55,19 @@ export function PrintDialog() {
           options,
         );
         setHtml(result);
+        setWarning("");
       } else {
         const result = await api.renderTableHtml(
           activeTable,
           pageQueryFor(useStore.getState(), null, 500),
           options,
         );
-        setHtml(result);
+        setHtml(result.html);
+        setWarning(
+          result.truncated
+            ? `Preview stopped at the 25,000-row safety ceiling (${result.rows.toLocaleString()} rows). Filter the table to continue.`
+            : "",
+        );
       }
     } catch (error) {
       notify("error", errorText(error));
@@ -79,15 +87,23 @@ export function PrintDialog() {
     try {
       if (mode === "record" && selectedId !== null) {
         await api.exportFormPdf(path, activeTable, selectedId, layoutId || null, options);
+        notify("success", "PDF written");
       } else {
-        await api.exportTablePdf(
+        const result = await api.exportTablePdf(
           path,
           activeTable,
           pageQueryFor(useStore.getState(), null, 500),
           options,
         );
+        if (result.truncated) {
+          setWarning(
+            `PDF stopped at the 25,000-row safety ceiling after ${result.rows.toLocaleString()} rows across ${result.pages.toLocaleString()} pages. Filter the table to continue.`,
+          );
+          notify("error", "PDF written with an explicit 25,000-row ceiling");
+        } else {
+          notify("success", `PDF written · ${result.rows.toLocaleString()} rows`);
+        }
       }
-      notify("success", "PDF written");
     } catch (error) {
       notify("error", errorText(error));
     } finally {
@@ -226,6 +242,7 @@ export function PrintDialog() {
             )}
           </aside>
           <div className="print-preview">
+            {warning && <div className="print-warning">{warning}</div>}
             {html ? (
               <iframe title="Print preview" srcDoc={html} sandbox="" />
             ) : (

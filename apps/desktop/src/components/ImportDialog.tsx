@@ -12,6 +12,8 @@ function defaultOptions(): ImportOptionsDto {
     maxPreviewRows: 20,
     maxIssues: 100,
     skipInvalid: false,
+    inferenceLimit: 5_000,
+    batchSize: 500,
   };
 }
 
@@ -191,6 +193,22 @@ export function ImportDialog() {
                 }
               />
             </label>
+            <label className="compact-field">
+              <span>Infer rows</span>
+              <input
+                className="field-input small"
+                type="number"
+                min={1}
+                max={100_000}
+                value={options.inferenceLimit}
+                onChange={(event) =>
+                  setOptions({
+                    ...options,
+                    inferenceLimit: Number(event.target.value),
+                  })
+                }
+              />
+            </label>
             <button
               type="button"
               className="button primary"
@@ -207,6 +225,9 @@ export function ImportDialog() {
                 <span>
                   {preview.rowsScanned.toLocaleString()} rows · {preview.columns.length} columns
                   · {preview.format.toUpperCase()}
+                  {preview.inferenceLimited
+                    ? ` · inferred from first ${preview.inferenceRows.toLocaleString()}`
+                    : ""}
                 </span>
                 {preview.issues.length > 0 && (
                   <span className="badge warning">{preview.issues.length} structural issues</span>

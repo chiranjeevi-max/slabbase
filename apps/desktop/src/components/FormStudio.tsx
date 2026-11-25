@@ -25,6 +25,9 @@ export function FormStudio() {
   const [snap, setSnap] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [dragging, setDragging] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [guide, setGuide] = useState<{ x: number; y: number; w: number; h: number } | null>(
+    null,
+  );
   const canvasRef = useRef<HTMLDivElement>(null);
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
@@ -314,8 +317,25 @@ export function FormStudio() {
                   selected={item.id === selectedId}
                   onSelect={() => setSelectedId(item.id)}
                   onDragState={setDragging}
+                  onResize={(patch) => updateItem(item.id, patch)}
+                  onGuide={setGuide}
                 />
               ))}
+              {guide && (
+                <div
+                  className="resize-guide-box"
+                  style={{
+                    left: `${(guide.x / 12) * 100}%`,
+                    top: guide.y * ROW_HEIGHT,
+                    width: `${(guide.w / 12) * 100}%`,
+                    height: guide.h * ROW_HEIGHT - 4,
+                  }}
+                >
+                  <span>
+                    {guide.w} × {guide.h}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -370,6 +390,8 @@ function StudioItem({
   selected,
   onSelect,
   onDragState,
+  onResize,
+  onGuide,
 }: {
   item: LayoutItem;
   table: Table;
@@ -378,19 +400,88 @@ function StudioItem({
   selected: boolean;
   onSelect: () => void;
   onDragState: (dragging: boolean) => void;
+  onResize: (patch: Partial<LayoutItem>) => void;
+  onGuide: (guide: { x: number; y: number; w: number; h: number } | null) => void;
 }) {
+  const resizeRef = useRef(false);
+  const resizeOrigin = useRef<{
+    handle: ResizeHandle;
+    startX: number;
+    startY: number;
+    rect: DOMRect;
+    item: LayoutItem;
+  } | null>(null);
   const rounded = {
     left: `${(item.x / 12) * 100}%`,
     top: item.y * ROW_HEIGHT,
     width: `${(item.w / 12) * 100}%`,
     height: item.h * ROW_HEIGHT - 4,
   };
+
+  const beginResize = (event: React.PointerEvent, handle: ResizeHandle) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const canvas = event.currentTarget.closest(".canvas");
+    if (!(canvas instanceof HTMLElement)) return;
+    resizeRef.current = true;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    resizeOrigin.current = {
+      handle,
+      startX: event.clientX,
+      startY: event.clientY,
+      rect: canvas.getBoundingClientRect(),
+      item: { ...item },
+    };
+    onGuide({ x: item.x, y: item.y, w: item.w, h: item.h });
+  };
+
+  const moveResize = (event: React.PointerEvent) => {
+    const origin = resizeOrigin.current;
+    if (!origin) return;
+    const dx = Math.round(((event.clientX - origin.startX) / origin.rect.width) * 12);
+    const dy = Math.round((event.clientY - origin.startY) / ROW_HEIGHT);
+    let { x, y, w, h } = origin.item;
+    if (origin.handle.includes("e")) {
+      w = Math.max(1, Math.min(12 - x, origin.item.w + dx));
+    }
+    if (origin.handle.includes("w")) {
+      const nextX = Math.max(0, Math.min(origin.item.x + origin.item.w - 1, origin.item.x + dx));
+      x = nextX;
+      w = origin.item.w + (origin.item.x - nextX);
+    }
+    if (origin.handle.includes("s")) {
+      h = Math.max(1, origin.item.h + dy);
+    }
+    if (origin.handle.includes("n")) {
+      const nextY = Math.max(0, Math.min(origin.item.y + origin.item.h - 1, origin.item.y + dy));
+      y = nextY;
+      h = origin.item.h + (origin.item.y - nextY);
+    }
+    onResize({ x, y, w, h });
+    onGuide({ x, y, w, h });
+  };
+
+  const endResize = (event: React.PointerEvent) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    resizeRef.current = false;
+    resizeOrigin.current = null;
+    onGuide(null);
+  };
+
   return (
     <div
-      className={`studio-item ${selected ? "selected" : ""}`}
+      className={`studio-item ${selected ? "selected" : ""} ${
+        resizeRef.current ? "resizing" : ""
+      }`}
       style={rounded}
       draggable
       onDragStart={(event) => {
+        if (resizeRef.current) {
+          event.preventDefault();
+          return;
+        }
         event.dataTransfer.setData("text/plain", `slab-move:${item.id}`);
         onDragState(true);
       }}
@@ -455,9 +546,22 @@ function StudioItem({
             </div>
           );
         })()}
+      {selected &&
+        (["nw", "n", "ne", "e", "se", "s", "sw", "w"] as ResizeHandle[]).map((handle) => (
+          <span
+            key={handle}
+            className={`resize-handle ${handle}`}
+            onPointerDown={(event) => beginResize(event, handle)}
+            onPointerMove={moveResize}
+            onPointerUp={endResize}
+            onPointerCancel={endResize}
+          />
+        ))}
     </div>
   );
 }
+
+type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 
 function ItemInspector({
   item,

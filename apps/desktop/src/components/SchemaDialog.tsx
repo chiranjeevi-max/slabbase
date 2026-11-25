@@ -10,8 +10,9 @@ import type {
 } from "../bindings";
 import { useStore } from "../store";
 import { Icon } from "./Icons";
+import { SchemaManage } from "./SchemaManage";
 
-type Tab = "table" | "column" | "relation" | "map";
+type Tab = "table" | "column" | "relation" | "map" | "manage";
 type Kind =
   | "text"
   | "integer"
@@ -166,6 +167,7 @@ export function SchemaDialog() {
               ["column", "Add column"],
               ["relation", "Relation"],
               ["map", "Map"],
+              ["manage", "Manage"],
             ] as const
           ).map(([value, label]) => (
             <button
@@ -490,6 +492,15 @@ export function SchemaDialog() {
                 </button>
               </footer>
             </form>
+          )}
+
+          {tab === "manage" && (
+            <SchemaManage
+              schema={schema}
+              activeTable={columnTable}
+              onTableSelected={(name) => setColumnTable(name)}
+              onClose={() => setOpen(false)}
+            />
           )}
 
           {tab === "map" && (

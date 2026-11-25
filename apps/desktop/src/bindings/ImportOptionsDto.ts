@@ -23,4 +23,12 @@ maxIssues: number,
 /**
  * Skip invalid rows instead of stopping.
  */
-skipInvalid: boolean, };
+skipInvalid: boolean, 
+/**
+ * Rows used for type inference.
+ */
+inferenceLimit: number, 
+/**
+ * Rows per sink transaction.
+ */
+batchSize: number, };
