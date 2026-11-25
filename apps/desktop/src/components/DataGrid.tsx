@@ -2,12 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import type { Column } from "../bindings";
 import { api } from "../api";
+import { DENSITY_ROW_HEIGHT } from "../appearance";
 import { pageQueryFor, useStore } from "../store";
+import { confirmDestructive } from "../native";
 import { cellText, columnTypeGlyph, isComputedColumn, isNull, isNumericColumn } from "../types";
+import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { FieldInput } from "./FieldInput";
 import { Icon } from "./Icons";
 
-const ROW_HEIGHT = 29;
 const HEADER_HEIGHT = 28;
 const MIN_COLUMN_WIDTH = 150;
 
@@ -30,6 +32,8 @@ export function DataGrid() {
   const beginCreate = useStore((state) => state.beginCreate);
   const openSchema = useStore((state) => state.openSchema);
   const updateCell = useStore((state) => state.updateCell);
+  const density = useStore((state) => state.appearance.density);
+  const rowHeight = DENSITY_ROW_HEIGHT[density];
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
   const columns = table?.columns ?? [];
@@ -46,6 +50,11 @@ export function DataGrid() {
   const [active, setActive] = useState<{ row: number; column: number } | null>(null);
   const [filterDraft, setFilterDraft] = useState(filterText);
   const [exportOpen, setExportOpen] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    id: number;
+  } | null>(null);
 
   useEffect(() => {
     setEditing(null);
@@ -67,8 +76,8 @@ export function DataGrid() {
   }, []);
 
   const bodyScroll = Math.max(0, scrollTop - HEADER_HEIGHT);
-  const start = Math.max(0, Math.floor(bodyScroll / ROW_HEIGHT) - 6);
-  const visibleCount = Math.ceil(viewport / ROW_HEIGHT) + 12;
+  const start = Math.max(0, Math.floor(bodyScroll / rowHeight) - 6);
+  const visibleCount = Math.ceil(viewport / rowHeight) + 12;
   const end = Math.min(rows.length, start + visibleCount);
   const visibleRows = rows.slice(start, end);
   const sortSpec = sort[0];
@@ -76,11 +85,11 @@ export function DataGrid() {
   const ensureVisible = (index: number) => {
     const element = scrollRef.current;
     if (!element) return;
-    const top = HEADER_HEIGHT + index * ROW_HEIGHT;
+    const top = HEADER_HEIGHT + index * rowHeight;
     if (top < element.scrollTop + HEADER_HEIGHT) {
       element.scrollTo({ top: top - HEADER_HEIGHT });
-    } else if (top + ROW_HEIGHT > element.scrollTop + viewport) {
-      element.scrollTo({ top: top + ROW_HEIGHT - viewport + 12 });
+    } else if (top + rowHeight > element.scrollTop + viewport) {
+      element.scrollTo({ top: top + rowHeight - viewport + 12 });
     }
   };
 
@@ -149,8 +158,8 @@ export function DataGrid() {
   }
 
   return (
-    <div className="data-grid">
-      <div className="table-toolbar">
+    <div className="data-grid" data-testid="grid-pane">
+      <div className="table-toolbar" data-testid="sub-toolbar">
         <div className="table-filter">
           <Icon name="search" size={13} strokeWidth={1.5} />
           <input
@@ -247,6 +256,7 @@ export function DataGrid() {
       <div
         ref={scrollRef}
         className="grid-viewport"
+        data-testid="grid-scroll"
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onScroll={(event) => {
@@ -255,25 +265,34 @@ export function DataGrid() {
           if (
             hasMore &&
             !loadingRows &&
-            element.scrollTop + element.clientHeight >= rows.length * ROW_HEIGHT - 240
+            element.scrollTop + element.clientHeight >= rows.length * rowHeight - 240
           ) {
             void loadMore();
           }
         }}
       >
         <div className="grid-inner">
-          <div className="grid-header" style={{ gridTemplateColumns: gridTemplate }}>
-            <div className="grid-head-cell id-header">
+          <div
+            className={`grid-header ${scrollTop > 0 ? "scrolled" : ""}`}
+            style={{ gridTemplateColumns: gridTemplate }}
+            data-testid="grid-header"
+          >
+            <div className="grid-head-cell id-header" data-column="id">
               <span className="type-glyph">#</span>
               <span>ID</span>
             </div>
             {columns.map((column) => {
               const sorted = sortSpec?.column === column.name;
+              const numeric = isNumericColumn(column);
               return (
                 <button
                   type="button"
-                  className={`grid-head-cell column-header ${sorted ? "sorted" : ""}`}
+                  className={`grid-head-cell column-header ${numeric ? "numeric" : ""} ${
+                    sorted ? "sorted" : ""
+                  }`}
                   key={column.name}
+                  data-column={column.name}
+                  data-numeric={numeric ? "true" : "false"}
                   onClick={() => void setSort(column.name)}
                   title={`${column.name} · ${kindLabel(column)}`}
                 >
@@ -291,23 +310,31 @@ export function DataGrid() {
             })}
           </div>
 
-          <div className="grid-body" style={{ height: rows.length * ROW_HEIGHT }}>
+          <div className="grid-body" style={{ height: rows.length * rowHeight }}>
             {visibleRows.map((record, offset) => {
               const index = start + offset;
               return (
                 <div
                   className={`grid-row ${selectedId === record.id ? "selected" : ""}`}
                   key={record.id}
+                  data-testid="grid-row"
+                  data-record-id={record.id}
                   style={{
                     gridTemplateColumns: gridTemplate,
-                    transform: `translateY(${index * ROW_HEIGHT}px)`,
+                    transform: `translateY(${index * rowHeight}px)`,
                   }}
                   onMouseDown={() =>
                     setActive({ row: index, column: active?.column ?? 0 })
                   }
                   onClick={() => void selectRow(record.id)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setContextMenu({ x: event.clientX, y: event.clientY, id: record.id });
+                  }}
                 >
-                  <div className="grid-cell id-cell">{record.id}</div>
+                  <div className="grid-cell id-cell" data-column="id">
+                    <span className="cell-text">{record.id}</span>
+                  </div>
                   {columns.map((column, columnIndex) => {
                     const isEditing =
                       editing?.id === record.id && editing.column === column.name;
@@ -322,6 +349,8 @@ export function DataGrid() {
                             ? "focused"
                             : ""
                         }`}
+                        data-column={column.name}
+                        data-numeric={isNumericColumn(column) ? "true" : "false"}
                         onDoubleClick={() => {
                           if (!isComputedColumn(column)) {
                             setEditing({ id: record.id, column: column.name });
@@ -375,8 +404,57 @@ export function DataGrid() {
           </div>
         )}
       </div>
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          items={recordMenuItems(contextMenu.id)}
+        />
+      )}
     </div>
   );
+}
+
+function recordMenuItems(id: number): ContextMenuItem[] {
+  const state = useStore.getState();
+  return [
+    {
+      label: "Inspect Record",
+      icon: "panelRight",
+      onSelect: () => {
+        void state.selectRow(id);
+        state.setInspectorOpen(true);
+      },
+    },
+    {
+      label: "Copy Record ID",
+      icon: "copy",
+      onSelect: () => {
+        void navigator.clipboard
+          .writeText(String(id))
+          .then(() => state.notify("success", "Record ID copied"))
+          .catch(() => state.notify("error", "Could not copy record ID"));
+      },
+    },
+    {
+      label: "Delete Record…",
+      icon: "trash",
+      danger: true,
+      separatorBefore: true,
+      onSelect: () => {
+        void (async () => {
+          const ok = await confirmDestructive(
+            "Delete this record and its child rows? Undo can restore it.",
+            "Delete Record",
+            "Delete",
+          );
+          if (ok) await state.deleteRecord(id);
+        })();
+      },
+    },
+  ];
 }
 
 function kindLabel(column: Column): string {

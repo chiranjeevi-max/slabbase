@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Column, Cursor, Record as SlabRecord, Value } from "../bindings";
+import { DENSITY_ROW_HEIGHT } from "../appearance";
 import { api } from "../api";
 import { useStore } from "../store";
 import { columnTypeGlyph, isComputedColumn } from "../types";
@@ -8,7 +9,6 @@ import { fallbackValue } from "./DraftFields";
 import { FieldInput } from "./FieldInput";
 import { Icon } from "./Icons";
 
-const ROW_HEIGHT = 28;
 const PORTAL_HEIGHT = 224;
 const PAGE_SIZE = 100;
 
@@ -32,6 +32,8 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
   const [pulse, setPulse] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const requestRef = useRef(0);
+  const density = useStore((state) => state.appearance.density);
+  const rowHeight = DENSITY_ROW_HEIGHT[density];
 
   const visible: Column[] =
     !child
@@ -162,12 +164,12 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
     if (record) reload();
   };
 
-  const start = Math.max(0, Math.floor(Math.max(0, scrollTop - ROW_HEIGHT) / ROW_HEIGHT) - 3);
-  const visibleCount = Math.ceil(PORTAL_HEIGHT / ROW_HEIGHT) + 6;
+  const start = Math.max(0, Math.floor(Math.max(0, scrollTop - rowHeight) / rowHeight) - 3);
+  const visibleCount = Math.ceil(PORTAL_HEIGHT / rowHeight) + 6;
   const end = Math.min(rows.length, start + visibleCount);
   const bodyHeight = Math.max(
-    ROW_HEIGHT,
-    Math.min(rows.length * ROW_HEIGHT + (rows.length > 0 ? 2 : 0), PORTAL_HEIGHT),
+    rowHeight,
+    Math.min(rows.length * rowHeight + (rows.length > 0 ? 2 : 0), PORTAL_HEIGHT),
   );
   const addLabel = addRowLabel(child.name);
 
@@ -186,16 +188,21 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
       </div>
       <div
         className="portal-scroll"
-        style={{ height: bodyHeight + ROW_HEIGHT }}
+        data-testid="portal-scroll"
+        style={{ height: bodyHeight + rowHeight }}
         onScroll={(event) => {
           const element = event.currentTarget;
           setScrollTop(element.scrollTop);
           const remaining =
-            rows.length * ROW_HEIGHT - (element.scrollTop - ROW_HEIGHT + element.clientHeight);
-          if (remaining < ROW_HEIGHT * 4) loadMore();
+            rows.length * rowHeight - (element.scrollTop - rowHeight + element.clientHeight);
+          if (remaining < rowHeight * 4) loadMore();
         }}
       >
-        <div className="portal-grid-head" style={{ gridTemplateColumns: gridColumns(visible) }}>
+        <div
+          className={`portal-grid-head ${scrollTop > 0 ? "scrolled" : ""}`}
+          style={{ gridTemplateColumns: gridColumns(visible) }}
+          data-testid="portal-grid-head"
+        >
           {visible.map((column) => (
             <span key={column.name} className={isComputedColumn(column) ? "computed" : ""}>
               <span className="type-glyph">{columnTypeGlyph(column.ty)}</span>
@@ -204,16 +211,17 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
           ))}
           <span aria-hidden="true" />
         </div>
-        <div className="portal-spacer" style={{ height: rows.length * ROW_HEIGHT }}>
+        <div className="portal-spacer" style={{ height: rows.length * rowHeight }}>
           {rows.slice(start, end).map((row, offset) => {
             const index = start + offset;
             return (
               <div
                 className="portal-grid-row"
                 key={row.id}
+                data-row-id={row.id}
                 style={{
                   gridTemplateColumns: gridColumns(visible),
-                  transform: `translateY(${index * ROW_HEIGHT}px)`,
+                  transform: `translateY(${index * rowHeight}px)`,
                 }}
               >
                 {visible.map((column) => (
@@ -288,15 +296,15 @@ function gridColumns(columns: Column[]): string {
   return `${columns
     .map((column, index) => {
       const kind = column.ty.kind;
-      const priority = index === 0 || /name|title/i.test(column.name);
-      if (kind === "select") return "minmax(72px, 0.8fr)";
-      if (kind === "date" || kind === "timestamp") return "minmax(96px, 1fr)";
+      const priority = index === 0 || /name|title|description/i.test(column.name);
+      if (kind === "select") return "minmax(66px, 0.8fr)";
+      if (kind === "date" || kind === "timestamp") return "minmax(88px, 1fr)";
       if (kind === "currency" || kind === "decimal" || kind === "integer") {
-        return "minmax(76px, 0.9fr)";
+        return "minmax(68px, 0.9fr)";
       }
-      if (kind === "formula" || kind === "lookup") return "minmax(82px, 1fr)";
-      if (priority) return "minmax(120px, 1.6fr)";
-      return "minmax(88px, 1fr)";
+      if (kind === "formula" || kind === "lookup") return "minmax(70px, 1fr)";
+      if (priority) return "minmax(110px, 1.6fr)";
+      return "minmax(76px, 1fr)";
     })
     .join(" ")} 24px`;
 }
