@@ -78,6 +78,13 @@ Toolbar geometry:
 - Enter during IME composition is owned by the input method and never commits or dismisses an editor. Commit resumes after `compositionend`.
 - Date-only values round-trip as stored `YYYY-MM-DD` strings in every timezone; rendering never constructs a local `Date` for a calendar-only value.
 
+### Selection and drafts
+
+- The inspector shows only the record that is currently selected. A read that resolves after a table switch or a newer selection is discarded, and a pending row selection is cancelled by a table switch.
+- Double-clicking another row while the inspector is open loads that row into the inspector.
+- A New Record draft owns the inspector until it is saved or cancelled. Grid clicks and double-clicks do not change the selection while a draft is open.
+- Unsaved Form Studio edits survive a schema refresh, including one caused by the user's own save.
+
 ### Scroll surfaces
 
 - Scrollbars are thin and overlay-style. The thumb is a translucent neutral token.
@@ -214,3 +221,7 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | HiDPI parity | `hidpi borders stay crisp and layout does not drift` |
 | Date-only timezone invariance | `calendar dates never shift on display or edit` |
 | WCAG 2.2 AA | `axe WCAG 2.2 AA scan finds no serious violations` |
+| Stale inspector reads | `a stale inspector read cannot replace a newer table selection`, `a delayed row select is cancelled by a table switch` |
+| Inspector follows double-click | `double-clicking another row refreshes an open inspector` |
+| Draft isolation | `a grid double-click does not steal an open draft` |
+| Form Studio edit retention | `unsaved item edits survive a schema refresh` |
