@@ -23,14 +23,15 @@ pub mod view;
 
 pub use audit::{AuditEntry, UndoState};
 pub use clock::{Clock, Hlc};
-pub use command::Command;
+pub use command::{Command, RowValue};
 pub use date::{SlabDate, SlabTimestamp};
 pub use decimal::{CurrencyCode, Decimal, MAX_SCALE, Money, RoundingMode};
 pub use error::{CoreError, ErrorCode, SlabError, validate_identifier};
 pub use layout::{GridSpec, Layout, LayoutItem, LayoutItemKind};
 pub use policy::{NoopPolicy, PolicyHook};
 pub use query::{
-    Cursor, Filter, FilterOp, Page, PageQuery, SearchHit, SortDirection, SortSpec, TableSummary,
+    Cursor, Filter, FilterOp, Page, PageQuery, PortalPage, PortalQuery, SearchHit, SortDirection,
+    SortSpec, TableSummary,
 };
 pub use record::{Record, RecordBundle, RecordRef, RowData, RowId};
 pub use schema::{

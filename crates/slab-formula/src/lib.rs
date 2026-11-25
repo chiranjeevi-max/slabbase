@@ -24,9 +24,40 @@ pub use types::{FormulaType, TypeEnv, typecheck, validate_expression};
 #[cfg(test)]
 mod property_tests {
     use proptest::prelude::*;
+    use slab_core::{Column, ColumnType, Schema, Table};
 
     use crate::ast::{BinaryOp, Expr, UnaryOp};
-    use crate::{parser, types};
+    use crate::{FormulaDag, parser, types};
+
+    fn cyclic_schema(length: usize) -> Schema {
+        let columns = (0..length)
+            .map(|index| {
+                let next = (index + 1) % length;
+                Column {
+                    id: format!("c{index}"),
+                    table: "Cycle".into(),
+                    name: format!("C{index}"),
+                    ty: ColumnType::Formula {
+                        expression: format!("[C{next}] + 1"),
+                    },
+                    required: false,
+                    unique: false,
+                    default: None,
+                    position: u32::try_from(index).unwrap_or(0),
+                }
+            })
+            .collect();
+        Schema {
+            tables: vec![Table {
+                id: "t_cycle".into(),
+                name: "Cycle".into(),
+                columns,
+                created_at: 0,
+            }],
+            relations: Vec::new(),
+            layouts: Vec::new(),
+        }
+    }
 
     fn column_strategy() -> impl Strategy<Value = Expr> {
         prop::sample::select(vec!["Qty", "Price", "Subtotal", "Name", "Start"]).prop_map(|name| {
@@ -99,6 +130,20 @@ mod property_tests {
         }
 
         #[test]
+        fn guaranteed_cycles_are_rejected_deterministically(length in 1_usize..=8) {
+            let schema = cyclic_schema(length);
+            let first = FormulaDag::build(&schema).expect_err("cycle must be rejected");
+            let second = FormulaDag::build(&schema).expect_err("cycle must be rejected");
+            prop_assert_eq!(first.code_str(), "SLAB_E_CYCLE");
+            prop_assert_eq!(first.to_string(), second.to_string());
+            let dag = FormulaDag::default();
+            let check = dag.check(&schema, "Cycle", "C0", "[C0] + 1")
+                .expect_err("proposed cycle must be rejected");
+            prop_assert_eq!(check.code_str(), "SLAB_E_CYCLE");
+            prop_assert_eq!(dag.formula_columns("Cycle").count(), 0);
+        }
+
+        #[test]
         fn typecheck_never_panics(input in ".{0,120}") {
             if let Ok(expression) = parser::parse(&input) {
                 let env = types::TypeEnv::default()
@@ -106,6 +151,15 @@ mod property_tests {
                     .with_column("Price", types::FormulaType::Decimal);
                 let _ = types::typecheck(&expression, &env);
             }
+        }
+    }
+
+    #[test]
+    fn every_cycle_length_is_rejected_before_mutation() {
+        for length in 1..=8 {
+            let schema = cyclic_schema(length);
+            let error = FormulaDag::build(&schema).expect_err("cycle");
+            assert_eq!(error.code_str(), "SLAB_E_CYCLE");
         }
     }
 }

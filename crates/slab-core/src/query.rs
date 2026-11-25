@@ -150,6 +150,42 @@ pub struct Page {
     pub total_rows: Option<u64>,
 }
 
+/// A keyset-paginated request for one child relation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+pub struct PortalQuery {
+    /// Relation name.
+    pub relation: String,
+    /// Parent row id.
+    pub parent_id: RowId,
+    /// Maximum child rows to return.
+    pub limit: u32,
+    /// Cursor from a prior portal page.
+    pub cursor: Option<Cursor>,
+}
+
+/// One keyset page of child rows plus the exact relation row count.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+pub struct PortalPage {
+    /// Child rows for this page.
+    pub rows: Vec<Record>,
+    /// Cursor for the next page, absent on the final page.
+    pub next_cursor: Option<Cursor>,
+    /// Exact number of child rows for the parent.
+    pub total_rows: u64,
+    /// Time spent in storage, in milliseconds.
+    pub elapsed_ms: f64,
+}
+
 /// One full-text hit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

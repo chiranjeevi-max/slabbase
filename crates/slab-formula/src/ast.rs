@@ -155,6 +155,29 @@ impl Expr {
         found
     }
 
+    /// Rewrites column references in place. `table` is `None` for bare
+    /// references and `Some(relation)` for aggregate references.
+    pub fn rewrite_column(&mut self, table: Option<&str>, from: &str, to: &str) {
+        match self {
+            Self::Column { table: owner, name } => {
+                if owner.as_deref() == table && name == from {
+                    *name = to.to_owned();
+                }
+            }
+            Self::Unary { expr, .. } => expr.rewrite_column(table, from, to),
+            Self::Binary { left, right, .. } => {
+                left.rewrite_column(table, from, to);
+                right.rewrite_column(table, from, to);
+            }
+            Self::Call { args, .. } => {
+                for arg in args {
+                    arg.rewrite_column(table, from, to);
+                }
+            }
+            Self::Literal(_) => {}
+        }
+    }
+
     fn walk(&self, visit: &mut impl FnMut(&Expr)) {
         visit(self);
         match self {
