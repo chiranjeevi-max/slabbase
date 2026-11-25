@@ -83,6 +83,8 @@ Toolbar geometry:
 - Scrollbars are thin and overlay-style. The thumb is a translucent neutral token.
 - Every scroll pane sets `overscroll-behavior: contain`.
 - The sticky grid header and sticky portal header have no shadow at `scrollTop === 0`. Once scrolled, they show a 1px bottom hairline. The surface itself has no permanent heavy border.
+- The record history sheet is inline and non-modal inside the inspector. It uses the inspector's 16px padding, caps at 42% of the inspector height, and scrolls inside itself. It never traps focus or dismisses the record.
+- The Index Advisor pill is a 20px capsule in the status bar with 11px status typography, one action, and one dismiss control. Long column names ellipsize; the pill never widens the status bar.
 
 ### Dark mode surfaces
 
@@ -198,6 +200,8 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | Native traffic-light reserve | `native chrome reserves traffic lights` |
 | Wide and ultrawide containment | `wide table and long values stay inside the grid viewport` |
 | Rapid appearance changes | `rapid density, surface, theme, and inspector bursts keep scroll stable` |
+| Record history sheet containment | `record time-travel drawer shows diffs and restores a revision` |
+| Index Advisor pill containment | `index advisor pill creates an index and refreshes quietly` |
 | Portal density alignment | `portal rows keep density alignment during rapid appearance changes` |
 | Destructive error and recovery | `dropping a formula column reports an inline error and keeps state`, `relation-protected table drop, relation drop, and undo restore everything` |
 | Overlay focus return | `every overlay returns focus to its opener after Escape` |
