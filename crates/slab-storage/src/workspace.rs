@@ -372,7 +372,34 @@ impl Workspace {
         // trustworthy until a mutation through this engine refreshes it.
         // Dropping the cache here is cheap: reads rebuild lazily.
         rollup::clear(&workspace.conn)?;
+        workspace.repair_fts_if_pending()?;
         Ok(workspace)
+    }
+
+    /// Rebuilds the derived full-text index when a restored SQL export asks
+    /// for it.
+    ///
+    /// The export omits `_slab_fts` so a plain `sqlite3` can restore the
+    /// script without an FTS5 build. The marker is consumed here, once, in a
+    /// single transaction.
+    fn repair_fts_if_pending(&mut self) -> Result<(), StorageError> {
+        if self.read_only || self.path.is_none() {
+            return Ok(());
+        }
+        if read_meta(&self.conn, "fts_pending")?.as_deref() != Some("1") {
+            return Ok(());
+        }
+        let schema = self.schema()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM _slab_fts", [])?;
+        for table in &schema.tables {
+            rebuild_fts_for_table(&tx, table)?;
+        }
+        tx.execute("DELETE FROM _slab_meta WHERE key = 'fts_pending'", [])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Opens an existing workspace in read-only mode for a concurrent reader.
@@ -704,7 +731,9 @@ impl Workspace {
     /// The audit log is excluded, so its `_slab_meta` chain anchors are
     /// excluded too; a restored file starts a fresh genesis chain instead of
     /// claiming a head that has no entries. The derived full-text index is
-    /// exported so search keeps working after a restore.
+    /// omitted as well: a plain `sqlite3` must be able to restore the script
+    /// without an FTS5 build. A pending marker rebuilds the index once on the
+    /// next SlabBase open.
     pub fn export_sql(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
         let schema = self.schema()?;
         let file = File::create(path)?;
@@ -720,7 +749,6 @@ impl Workspace {
             "_slab_layouts".into(),
         ];
         table_names.extend(schema.tables.iter().map(|table| table.name.clone()));
-        table_names.push("_slab_fts".into());
         for table_name in &table_names {
             let create: Option<String> = self
                 .conn
@@ -739,7 +767,8 @@ impl Workspace {
                 // The audit log is not part of this dump. Carrying its head
                 // anchors would make every restored file look tampered.
                 format!(
-                    "SELECT * FROM {} WHERE key NOT IN ('audit_head_hash', 'audit_head_id')",
+                    "SELECT * FROM {} WHERE key NOT IN
+                        ('audit_head_hash', 'audit_head_id', 'fts_pending')",
                     quote_ident(table_name)
                 )
             } else {
@@ -764,6 +793,13 @@ impl Workspace {
                 )?;
             }
         }
+        writeln!(
+            out,
+            "INSERT INTO {} ({}, {}) VALUES ('fts_pending', '1');",
+            quote_ident("_slab_meta"),
+            quote_ident("key"),
+            quote_ident("value")
+        )?;
         // Emit every explicit index on an exported user table: advisor indexes
         // (`slab_idx_*`), relation indexes (`slab_ix_*`), and the unique index
         // that `add_column` creates for a late `UNIQUE` column (`slab_uq_*`).

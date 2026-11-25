@@ -745,6 +745,10 @@ fn sql_export_restores_the_search_index() {
 
     let restored_path = directory.path().join("search-restored.slab");
     let script = fs::read_to_string(&dump).expect("dump");
+    assert!(
+        !script.contains("fts5"),
+        "the SQL export must restore with a plain sqlite3 build"
+    );
     let connection = Connection::open(&restored_path).expect("restore open");
     connection.execute_batch(&script).expect("restore script");
     drop(connection);
@@ -753,6 +757,16 @@ fn sql_export_restores_the_search_index() {
     let hits = restored.search("needle", 10).expect("search");
     assert_eq!(hits.len(), 1, "restored workspace lost its search index");
     assert_eq!(hits[0].table, "Notes");
+
+    let pending: i64 = Connection::open(&restored_path)
+        .expect("raw open")
+        .query_row(
+            "SELECT COUNT(*) FROM _slab_meta WHERE key = 'fts_pending'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pending marker");
+    assert_eq!(pending, 0, "the restore marker was not consumed");
 }
 
 /// A revision recorded before a column rename cannot be mapped by name. The
