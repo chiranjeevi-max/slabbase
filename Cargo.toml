@@ -16,8 +16,8 @@ edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
 authors = ["SlabBase contributors"]
-repository = "https://github.com/slabbase/slabbase"
-homepage = "https://slabbase.app"
+repository = "https://github.com/chiranjeevi-max/slabbase"
+homepage = "https://github.com/chiranjeevi-max/slabbase"
 
 [workspace.dependencies]
 slab-core = { path = "crates/slab-core", version = "1.0.0" }
