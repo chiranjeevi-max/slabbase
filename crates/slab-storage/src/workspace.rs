@@ -209,6 +209,7 @@ pub struct Workspace {
     pub(crate) policy: Arc<dyn PolicyHook>,
     pub(crate) name: String,
     pub(crate) cancel: Arc<QueryCancel>,
+    pub(crate) search_cancel: Arc<QueryCancel>,
     pub(crate) read_only: bool,
 }
 
@@ -281,6 +282,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         };
         workspace.validate_schema()?;
@@ -361,6 +363,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name,
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         };
         workspace.validate_schema()?;
@@ -431,6 +434,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name,
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: true,
         };
         workspace.validate_schema()?;
@@ -457,6 +461,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         })
     }
@@ -481,14 +486,27 @@ impl Workspace {
         self.policy = policy;
     }
 
-    /// Shares the cancellation handle exposed to the shell.
+    /// Shares the page cancellation handle exposed to the shell.
     pub fn set_cancel_handle(&mut self, cancel: Arc<QueryCancel>) {
         self.cancel = cancel;
     }
 
-    /// Interrupts the active interactive query, if any.
+    /// Shares the search cancellation handle exposed to the shell.
+    pub fn set_search_cancel_handle(&mut self, cancel: Arc<QueryCancel>) {
+        self.search_cancel = cancel;
+    }
+
+    /// Interrupts the active page query, if any.
     pub fn cancel_query(&self) -> bool {
         self.cancel.interrupt()
+    }
+
+    /// Interrupts the active full-text search, if any.
+    ///
+    /// Search has its own handle so superseding a palette query cannot
+    /// interrupt a grid or portal page that is still loading.
+    pub fn cancel_search_query(&self) -> bool {
+        self.search_cancel.interrupt()
     }
 
     /// Returns a pooled read-only connection, or the writer for an in-memory

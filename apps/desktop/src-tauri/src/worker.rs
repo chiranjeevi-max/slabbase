@@ -25,6 +25,7 @@ pub struct DbHandle {
     path: Mutex<Option<PathBuf>>,
     lifecycle: RwLock<()>,
     cancel: Mutex<Arc<QueryCancel>>,
+    search_cancel: Mutex<Arc<QueryCancel>>,
     generation: AtomicU64,
     read_gate: ReadGate,
 }
@@ -38,6 +39,7 @@ impl DbHandle {
             path: Mutex::new(None),
             lifecycle: RwLock::new(()),
             cancel: Mutex::new(Arc::new(QueryCancel::new())),
+            search_cancel: Mutex::new(Arc::new(QueryCancel::new())),
             generation: AtomicU64::new(0),
             read_gate: ReadGate::new(),
         })
@@ -55,16 +57,40 @@ impl DbHandle {
         }
     }
 
-    /// Interrupts a superseded interactive query without taking the writer lock.
+    /// The search cancellation handle for the current workspace generation.
+    pub fn search_cancel_handle(&self) -> Arc<QueryCancel> {
+        match self.search_cancel.lock() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Interrupts a superseded page query without taking the writer lock.
     pub fn cancel_query(&self) -> bool {
         self.cancel_handle().interrupt()
     }
 
-    fn install_cancel(&self, cancel: Arc<QueryCancel>) -> Result<(), ApiError> {
+    /// Interrupts only a superseded full-text search.
+    ///
+    /// Pages and portals use a separate handle, so a palette search can never
+    /// cancel a grid read that is still loading.
+    pub fn cancel_search_query(&self) -> bool {
+        self.search_cancel_handle().interrupt()
+    }
+
+    fn install_cancels(
+        &self,
+        cancel: Arc<QueryCancel>,
+        search_cancel: Arc<QueryCancel>,
+    ) -> Result<(), ApiError> {
         *self
             .cancel
             .lock()
             .map_err(|_| ApiError::internal("cancel lock is poisoned"))? = cancel;
+        *self
+            .search_cancel
+            .lock()
+            .map_err(|_| ApiError::internal("search cancel lock is poisoned"))? = search_cancel;
         Ok(())
     }
 
@@ -77,7 +103,9 @@ impl DbHandle {
         let mut workspace = Workspace::open(&path, Box::new(HybridLogicalClock::new("desktop")))
             .map_err(ApiError::from)?;
         let cancel = Arc::new(QueryCancel::new());
+        let search_cancel = Arc::new(QueryCancel::new());
         workspace.set_cancel_handle(Arc::clone(&cancel));
+        workspace.set_search_cancel_handle(Arc::clone(&search_cancel));
         let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
         self.clear_readers();
         close_writer(&self.writer)?;
@@ -86,12 +114,12 @@ impl DbHandle {
             .lock()
             .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
             Some(PathBuf::from(&path));
-        self.install_cancel(Arc::clone(&cancel))?;
+        self.install_cancels(Arc::clone(&cancel), Arc::clone(&search_cancel))?;
         *self
             .writer
             .lock()
             .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
-        self.fill_readers(Path::new(&path), &cancel);
+        self.fill_readers(Path::new(&path), &cancel, &search_cancel);
         Ok(info)
     }
 
@@ -111,19 +139,21 @@ impl DbHandle {
             Workspace::create(&path, &name, Box::new(HybridLogicalClock::new("desktop")))
                 .map_err(ApiError::from)?;
         let cancel = Arc::new(QueryCancel::new());
+        let search_cancel = Arc::new(QueryCancel::new());
         workspace.set_cancel_handle(Arc::clone(&cancel));
+        workspace.set_search_cancel_handle(Arc::clone(&search_cancel));
         let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
         *self
             .path
             .lock()
             .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
             Some(PathBuf::from(&path));
-        self.install_cancel(Arc::clone(&cancel))?;
+        self.install_cancels(Arc::clone(&cancel), Arc::clone(&search_cancel))?;
         *self
             .writer
             .lock()
             .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
-        self.fill_readers(Path::new(&path), &cancel);
+        self.fill_readers(Path::new(&path), &cancel, &search_cancel);
         Ok(info)
     }
 
@@ -139,7 +169,7 @@ impl DbHandle {
             .path
             .lock()
             .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? = None;
-        self.install_cancel(Arc::new(QueryCancel::new()))?;
+        self.install_cancels(Arc::new(QueryCancel::new()), Arc::new(QueryCancel::new()))?;
         Ok(())
     }
 
@@ -257,7 +287,8 @@ impl DbHandle {
             Some(workspace) => Ok(workspace),
             None => {
                 let cancel = self.cancel_handle();
-                self.open_reader(path, &cancel)
+                let search_cancel = self.search_cancel_handle();
+                self.open_reader(path, &cancel, &search_cancel)
             }
         }
     }
@@ -273,18 +304,29 @@ impl DbHandle {
         }
     }
 
-    fn open_reader(&self, path: &Path, cancel: &Arc<QueryCancel>) -> Result<Workspace, ApiError> {
+    fn open_reader(
+        &self,
+        path: &Path,
+        cancel: &Arc<QueryCancel>,
+        search_cancel: &Arc<QueryCancel>,
+    ) -> Result<Workspace, ApiError> {
         let mut workspace =
             Workspace::open_read_only(path, Box::new(HybridLogicalClock::new("desktop-read")))
                 .map_err(ApiError::from)?;
         workspace.set_cancel_handle(Arc::clone(cancel));
+        workspace.set_search_cancel_handle(Arc::clone(search_cancel));
         Ok(workspace)
     }
 
-    fn fill_readers(&self, path: &Path, cancel: &Arc<QueryCancel>) {
+    fn fill_readers(
+        &self,
+        path: &Path,
+        cancel: &Arc<QueryCancel>,
+        search_cancel: &Arc<QueryCancel>,
+    ) {
         if let Ok(mut readers) = self.readers.lock() {
             while readers.len() < READER_POOL_SIZE {
-                match self.open_reader(path, cancel) {
+                match self.open_reader(path, cancel, search_cancel) {
                     Ok(workspace) => readers.push(workspace),
                     Err(_) => break,
                 }

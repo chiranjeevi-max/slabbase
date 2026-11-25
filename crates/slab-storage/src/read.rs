@@ -289,7 +289,7 @@ impl Workspace {
         }
         let limit = i64::from(limit.clamp(1, 200));
         let conn = self.read_conn();
-        let _active = ActiveQuery::begin(self.cancel.as_ref(), conn.get_interrupt_handle());
+        let _active = ActiveQuery::begin(self.search_cancel.as_ref(), conn.get_interrupt_handle());
         let sql = "SELECT table_name, CAST(row_id AS INTEGER),
                           snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
                           bm25(_slab_fts)

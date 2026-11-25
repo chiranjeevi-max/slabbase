@@ -528,7 +528,6 @@ export const useStore = create<AppStore>((set, get) => {
         current?.column === column
           ? [{ column, direction: current.direction === "asc" ? "desc" : "asc" }]
           : [{ column, direction: "asc" }];
-      void api.cancelSearch().catch(() => undefined);
       set({ sort });
       await get().loadFirstPage();
     },
@@ -547,7 +546,6 @@ export const useStore = create<AppStore>((set, get) => {
           ]
         : [];
       set({ filters, filterText: text });
-      void api.cancelSearch().catch(() => undefined);
       await get().loadFirstPage();
     },
 

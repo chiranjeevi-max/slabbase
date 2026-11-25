@@ -86,3 +86,57 @@ fn switching_workspaces_isolates_stale_cancel_handles() {
         "closing the workspace left a live cancellation registration"
     );
 }
+
+/// The page and search handles are distinct. Cancelling a page must not
+/// interrupt a running search, and the search-specific cancel must reach it.
+#[test]
+fn search_cancel_never_targets_a_page_handle() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let db = DbHandle::new().expect("db");
+    db.create(
+        directory
+            .path()
+            .join("search.slab")
+            .to_string_lossy()
+            .into_owned(),
+        "Search".into(),
+    )
+    .expect("create");
+    let page = db.cancel_handle();
+    let search = db.search_cancel_handle();
+    assert!(
+        !Arc::ptr_eq(&page, &search),
+        "page and search share one cancellation handle"
+    );
+
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    search.register(connection.get_interrupt_handle());
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = Arc::clone(&finished);
+    let worker = std::thread::spawn(move || {
+        let outcome: Result<i64, rusqlite::Error> =
+            connection.query_row(SLOW_QUERY, [], |row| row.get(0));
+        worker_finished.store(true, Ordering::SeqCst);
+        outcome.is_err()
+    });
+
+    std::thread::sleep(Duration::from_millis(40));
+    assert!(
+        !db.cancel_query(),
+        "the page cancel interrupted a search registration"
+    );
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "a page cancel stopped a running search"
+    );
+
+    assert!(
+        db.cancel_search_query(),
+        "the search generation must remain cancellable"
+    );
+    assert!(
+        worker.join().expect("worker join"),
+        "the search query was not interrupted"
+    );
+}

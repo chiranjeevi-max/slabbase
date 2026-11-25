@@ -285,7 +285,7 @@ pub async fn create_index(
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn cancel_search(state: State<'_, AppState>) -> bool {
-    state.db.cancel_query()
+    state.db.cancel_search_query()
 }
 
 #[tauri::command(rename_all = "snake_case")]
