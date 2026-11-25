@@ -28,6 +28,18 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 ### Fixed
 
 - Keep the desktop shell inside the viewport when macOS classic scrollbars are active, and stabilize the macOS release timing and UI audit CI gates.
+- Suspend foreign-key enforcement while rebuilding a relation or column, so `DROP TABLE` cannot fire `ON DELETE CASCADE` and silently delete child rows.
+- Invalidate derived rollup state on workspace open, use `i128` intermediates for `SUM`/`AVG` replacements, and keep the `MIN`/`MAX` cached count exact across NULL transitions.
+- Remove rollup contributions before forgetting parent state during a cascade delete, so no cache row survives for a deleted parent.
+- Treat only a wholly unhashed audit log as legacy, and backfill it in one transaction, so a partially NULLed log is reported as tampered instead of laundered.
+- Preserve search, embedded NUL text, late `UNIQUE` indexes, and a fresh audit genesis through a SQL export and restore.
+- Reject dangling-symlink snapshot targets, publish `VACUUM INTO` snapshots atomically, and never unlink a concurrently created target.
+- Roll back an abandoned import on the next write or clean close instead of wedging the writer in an open transaction.
+- Scope query cancellation to one workspace generation and one registration, so a stale interrupt cannot cancel another query.
+- Discard stale inspector responses and cancel the delayed row select on table or filter changes, preventing a write against a different table or row.
+- Bracket a renamed formula reference when the new column name is not a legal bare identifier.
+- Neutralize spreadsheet formula injection in CSV export, and validate the target table before truncating a JSON export.
+- Exclude concurrent read leases from schema-changing commands, so a read never prepares SQL against a schema that was renamed underneath it.
 
 ### Security
 
@@ -35,6 +47,8 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Stable `SLAB_E_*` error codes and `unwrap`/`expect`/`panic` denial in library crates.
 - Zero outbound network requests from the desktop shell, enforced by the Playwright air-gap audit.
 - Private vulnerability reporting, Dependabot alerts, automated security fixes, CodeQL, Scorecard, and dependency auditing in CI.
+- A partially hashed audit log is never repaired automatically; only a wholly legacy log migrates, so NULLing one hash cannot launder an altered entry into a fresh chain.
+- CSV export prefixes user text that starts with a spreadsheet formula character with an apostrophe, because quoting alone does not stop Excel or Numbers from evaluating it.
 
 ### Notes
 
