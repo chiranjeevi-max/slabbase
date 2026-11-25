@@ -9,14 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use slab_core::{
     AuditEntry, Clock, Column, ColumnDraft, ColumnType, Command, DeleteAction, FORMAT_VERSION, Hlc,
-    Layout, PolicyHook, Relation, RelationDraft, RowData, RowId, Schema, Table, TableDraft,
-    TableSummary, UndoState, Value, validate_identifier,
+    IndexSpec, Layout, LayoutItemKind, PolicyHook, Relation, RelationDraft, RowData, RowId,
+    RowValue, Schema, Table, TableDraft, TableSummary, UndoState, Value, validate_identifier,
 };
 use slab_formula::FormulaDag;
 
 use crate::ddl::{column_definition, create_table_sql, relation_index_sql, unique_index_sql};
 use crate::error::StorageError;
 use crate::sql::{decode_value, encode_value, normalize_value, quote_ident, stored_columns};
+use slab_formula::parse as parse_formula;
 
 const SYSTEM_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS _slab_meta (
@@ -646,6 +647,216 @@ impl Workspace {
         Ok(())
     }
 
+    /// Renames a table and every metadata reference to it.
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<(), StorageError> {
+        validate_identifier(new_name)?;
+        let schema = self.schema()?;
+        if schema.table(old_name).is_none() {
+            return Err(StorageError::NotFound(old_name.to_owned()));
+        }
+        if schema.table(new_name).is_some() {
+            return Err(StorageError::Unique(format!(
+                "table {new_name} already exists"
+            )));
+        }
+        let mut candidate = schema.clone();
+        let table = candidate
+            .table_mut(old_name)
+            .ok_or_else(|| StorageError::NotFound(old_name.to_owned()))?;
+        table.name = new_name.to_owned();
+        for column in &mut table.columns {
+            column.table = new_name.to_owned();
+        }
+        for relation in &mut candidate.relations {
+            if relation.parent_table == old_name {
+                relation.parent_table = new_name.to_owned();
+            }
+            if relation.child_table == old_name {
+                relation.child_table = new_name.to_owned();
+            }
+        }
+        for layout in &mut candidate.layouts {
+            if layout.table == old_name {
+                layout.table = new_name.to_owned();
+            }
+        }
+        candidate.validate()?;
+        FormulaDag::build(&candidate)?;
+        let command = Command::RenameTable {
+            old_name: old_name.to_owned(),
+            new_name: new_name.to_owned(),
+        };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
+    /// Renames a column and rewrites formulas, lookups, layouts, and relations.
+    pub fn rename_column(
+        &mut self,
+        table: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), StorageError> {
+        validate_identifier(new_name)?;
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        if definition.column(old_name).is_none() {
+            return Err(StorageError::NotFound(format!("{table}.{old_name}")));
+        }
+        if definition.column(new_name).is_some() {
+            return Err(StorageError::Unique(format!(
+                "{table}.{new_name} already exists"
+            )));
+        }
+        rename_column_in_schema(&schema, table, old_name, new_name)?;
+        let command = Command::RenameColumn {
+            table: table.to_owned(),
+            old_name: old_name.to_owned(),
+            new_name: new_name.to_owned(),
+        };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
+    /// Drops a table and retains its rows and layouts for undo.
+    pub fn drop_table(&mut self, name: &str) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let table = schema
+            .table(name)
+            .ok_or_else(|| StorageError::NotFound(name.to_owned()))?
+            .clone();
+        if let Some(relation) = schema
+            .relations
+            .iter()
+            .find(|relation| relation.parent_table == name || relation.child_table == name)
+        {
+            return Err(StorageError::Command(format!(
+                "table {name} is used by relation {}; drop the relation first",
+                relation.name
+            )));
+        }
+        let rows = stored_records(&self.conn, &table)?;
+        let layouts = schema
+            .layouts
+            .iter()
+            .filter(|layout| layout.table == name)
+            .cloned()
+            .collect();
+        let indexes = list_user_indexes(&self.conn, name)?;
+        let command = Command::DropTable {
+            table,
+            rows,
+            layouts,
+            indexes,
+        };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
+    /// Drops a column after blocking formula, relation, and layout references.
+    pub fn drop_column(&mut self, table: &str, column: &str) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let column_definition = definition
+            .column(column)
+            .ok_or_else(|| StorageError::NotFound(format!("{table}.{column}")))?
+            .clone();
+        if let Some(relation) = schema
+            .relations
+            .iter()
+            .find(|relation| relation.child_table == table && relation.child_column == column)
+        {
+            return Err(StorageError::Reference(format!(
+                "column {table}.{column} is used by relation {}; drop the relation first",
+                relation.name
+            )));
+        }
+        if let Some(reference) = formula_reference(&schema, table, column)? {
+            return Err(StorageError::Reference(format!(
+                "column {table}.{column} is referenced by {reference}"
+            )));
+        }
+        if let Some(layout) = layout_reference(&schema, table, column) {
+            return Err(StorageError::Reference(format!(
+                "column {table}.{column} is used by form {layout}"
+            )));
+        }
+        let values = stored_values(&self.conn, definition, &column_definition)?;
+        let command = Command::DropColumn {
+            table: table.to_owned(),
+            column: column_definition,
+            values,
+        };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
+    /// Lists user-created single-column indexes for a table.
+    pub fn list_indexes(&self, table: &str) -> Result<Vec<IndexSpec>, StorageError> {
+        let schema = self.schema()?;
+        if schema.table(table).is_none() {
+            return Err(StorageError::NotFound(table.to_owned()));
+        }
+        list_user_indexes(&self.conn, table)
+    }
+
+    /// Creates a single-column index if it does not already exist.
+    pub fn create_index(&mut self, table: &str, column: &str) -> Result<IndexSpec, StorageError> {
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let column_definition = definition
+            .column(column)
+            .ok_or_else(|| StorageError::NotFound(format!("{table}.{column}")))?;
+        if !column_definition.ty.is_stored() {
+            return Err(StorageError::Command(
+                "computed columns cannot be indexed".into(),
+            ));
+        }
+        let existing = list_user_indexes(&self.conn, table)?;
+        if let Some(index) = existing
+            .into_iter()
+            .find(|index| index.columns == vec![column.to_owned()])
+        {
+            return Ok(index);
+        }
+        let index = IndexSpec {
+            name: format!("slab_idx_{table}_{column}").replace(' ', "_"),
+            table: table.to_owned(),
+            columns: vec![column.to_owned()],
+            unique: false,
+        };
+        let command = Command::CreateIndex {
+            index: index.clone(),
+        };
+        self.apply_command(&command)?;
+        Ok(index)
+    }
+
+    /// Drops a user-created index.
+    pub fn drop_index(&mut self, name: &str) -> Result<(), StorageError> {
+        let schema = self.schema()?;
+        let mut found = None;
+        for table in &schema.tables {
+            if let Some(index) = list_user_indexes(&self.conn, &table.name)?
+                .into_iter()
+                .find(|index| index.name == name)
+            {
+                found = Some(index);
+                break;
+            }
+        }
+        let index = found.ok_or_else(|| StorageError::NotFound(format!("index {name}")))?;
+        let command = Command::DropIndex { index };
+        self.apply_command(&command)?;
+        Ok(())
+    }
+
     /// Inserts or updates a form layout.
     pub fn save_layout(&mut self, mut layout: Layout) -> Result<Layout, StorageError> {
         let schema = self.schema()?;
@@ -705,6 +916,58 @@ impl Workspace {
             StorageError::Internal("insert command did not carry a row id".into())
         })?;
         self.read_record(table, id)
+    }
+
+    /// Inserts several rows in one transaction. Every row still receives its
+    /// own audit entry and undo command, so undo semantics match single inserts.
+    pub fn insert_rows(
+        &mut self,
+        table: &str,
+        rows: &[RowData],
+    ) -> Result<Vec<slab_core::Record>, StorageError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table)
+            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+        let mut prepared = Vec::with_capacity(rows.len());
+        for values in rows {
+            prepared.push(prepare_row(definition, values, None, true)?);
+        }
+        let hlc = self.clock.now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut commands = Vec::with_capacity(prepared.len());
+        for values in prepared {
+            let row = slab_core::Record { id: 0, values };
+            let id = insert_record_tx(&tx, definition, &row, false)?;
+            let applied = slab_core::Record {
+                id,
+                values: row.values,
+            };
+            refresh_fts(&tx, definition, id, &applied.values)?;
+            let command = Command::InsertRow {
+                table: table.to_owned(),
+                row: applied,
+                children: Vec::new(),
+            };
+            append_audit(&tx, &command, &hlc, &self.actor, "insert", &command.label())?;
+            commands.push(command);
+        }
+        tx.commit()?;
+        for command in &commands {
+            self.push_undo(command.clone());
+        }
+        let mut records = Vec::with_capacity(commands.len());
+        for command in commands {
+            if let Command::InsertRow { row, .. } = command {
+                records.push(self.read_record(table, row.id)?);
+            }
+        }
+        Ok(records)
     }
 
     /// Updates a row from a partial column map and returns the stored record.
@@ -968,7 +1231,7 @@ impl Workspace {
                 insert_table_meta(&tx, table)?;
                 command.clone()
             }
-            Command::DropTable { table } => {
+            Command::DropTable { table, .. } => {
                 tx.execute_batch(&format!("DROP TABLE {}", quote_ident(&table.name)))?;
                 tx.execute(
                     "DELETE FROM _slab_tables WHERE name = ?1",
@@ -978,6 +1241,129 @@ impl Workspace {
                     "DELETE FROM _slab_fts WHERE table_name = ?1",
                     params![table.name],
                 )?;
+                command.clone()
+            }
+            Command::RestoreTable {
+                table,
+                rows,
+                layouts,
+                indexes,
+            } => {
+                let sql = create_table_sql(table, &table.name, &[])?;
+                tx.execute_batch(&sql)?;
+                insert_table_meta(&tx, table)?;
+                for layout in layouts {
+                    insert_layout_meta(&tx, layout)?;
+                }
+                for row in rows {
+                    insert_record_tx(&tx, table, row, true)?;
+                    refresh_fts(&tx, table, row.id, &row.values)?;
+                }
+                for index in indexes {
+                    tx.execute_batch(&create_index_sql(index))?;
+                }
+                command.clone()
+            }
+            Command::RenameTable { old_name, new_name } => {
+                tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {} RENAME TO {}",
+                    quote_ident(old_name),
+                    quote_ident(new_name)
+                ))?;
+                tx.execute(
+                    "UPDATE _slab_tables SET name = ?1 WHERE name = ?2",
+                    params![new_name, old_name],
+                )?;
+                tx.execute(
+                    "UPDATE _slab_columns SET table_name = ?1 WHERE table_name = ?2",
+                    params![new_name, old_name],
+                )?;
+                tx.execute(
+                    "UPDATE _slab_relations SET parent_table = ?1 WHERE parent_table = ?2",
+                    params![new_name, old_name],
+                )?;
+                tx.execute(
+                    "UPDATE _slab_relations SET child_table = ?1 WHERE child_table = ?2",
+                    params![new_name, old_name],
+                )?;
+                tx.execute(
+                    "UPDATE _slab_layouts SET table_name = ?1 WHERE table_name = ?2",
+                    params![new_name, old_name],
+                )?;
+                tx.execute(
+                    "UPDATE _slab_fts SET table_name = ?1 WHERE table_name = ?2",
+                    params![new_name, old_name],
+                )?;
+                let violations: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                if violations > 0 {
+                    return Err(StorageError::ForeignKey(format!(
+                        "{violations} rows violate foreign keys after renaming {old_name}"
+                    )));
+                }
+                command.clone()
+            }
+            Command::RenameColumn {
+                table,
+                old_name,
+                new_name,
+            } => {
+                let candidate = rename_column_in_schema(&schema, table, old_name, new_name)?;
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                if definition
+                    .column(old_name)
+                    .is_some_and(|column| column.ty.is_stored())
+                {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                        quote_ident(table),
+                        quote_ident(old_name),
+                        quote_ident(new_name)
+                    ))?;
+                }
+                for definition in &candidate.tables {
+                    for column in &definition.columns {
+                        tx.execute(
+                            "UPDATE _slab_columns SET name = ?1, type_json = ?2 WHERE id = ?3",
+                            params![column.name, serde_json::to_string(&column.ty)?, column.id],
+                        )?;
+                    }
+                }
+                for relation in &candidate.relations {
+                    tx.execute(
+                        "UPDATE _slab_relations SET parent_table = ?1, child_table = ?2,
+                            child_column = ?3, on_delete = ?4 WHERE id = ?5",
+                        params![
+                            relation.parent_table,
+                            relation.child_table,
+                            relation.child_column,
+                            match relation.on_delete {
+                                DeleteAction::Cascade => "cascade",
+                                DeleteAction::SetNull => "setNull",
+                                DeleteAction::Restrict => "restrict",
+                            },
+                            relation.id,
+                        ],
+                    )?;
+                }
+                for layout in &candidate.layouts {
+                    tx.execute(
+                        "UPDATE _slab_layouts SET name = ?1, table_name = ?2, spec_json = ?3,
+                            updated_at = ?4 WHERE id = ?5",
+                        params![
+                            layout.name,
+                            layout.table,
+                            serde_json::to_string(layout)?,
+                            layout.updated_at,
+                            layout.id
+                        ],
+                    )?;
+                }
                 command.clone()
             }
             Command::AddColumn { table, column } => {
@@ -1011,7 +1397,11 @@ impl Workspace {
                 insert_column_meta(&tx, column)?;
                 command.clone()
             }
-            Command::DropColumn { table, column } => {
+            Command::DropColumn {
+                table,
+                column,
+                values: _,
+            } => {
                 let definition = schema
                     .table(table)
                     .ok_or_else(|| StorageError::NotFound(table.clone()))?;
@@ -1034,6 +1424,51 @@ impl Workspace {
                     params![table, column.name],
                 )?;
                 rebuild_fts_for_table(&tx, &reduced)?;
+                command.clone()
+            }
+            Command::RestoreColumn {
+                table,
+                column,
+                values,
+            } => {
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                let mut expanded = definition.clone();
+                expanded.columns.push(column.clone());
+                expanded.columns.sort_by_key(|candidate| candidate.position);
+                let mut staged = expanded.clone();
+                if let Some(staged_column) = staged.column_mut(&column.name) {
+                    staged_column.required = false;
+                }
+                rebuild_table(&tx, &staged, &schema.relations)?;
+                insert_column_meta(&tx, column)?;
+                for row_value in values {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {} SET {} = ?1 WHERE {} = ?2",
+                            quote_ident(table),
+                            quote_ident(&column.name),
+                            quote_ident("id")
+                        ),
+                        params![
+                            encode_value(&row_value.value, &column.ty)?,
+                            row_value.row_id
+                        ],
+                    )?;
+                }
+                if column.required && column.ty.is_stored() {
+                    rebuild_table(&tx, &expanded, &schema.relations)?;
+                }
+                rebuild_fts_for_table(&tx, &expanded)?;
+                command.clone()
+            }
+            Command::CreateIndex { index } => {
+                tx.execute_batch(&create_index_sql(index))?;
+                command.clone()
+            }
+            Command::DropIndex { index } => {
+                tx.execute_batch(&format!("DROP INDEX {}", quote_ident(&index.name)))?;
                 command.clone()
             }
             Command::CreateRelation { relation } => {
@@ -1487,6 +1922,36 @@ fn insert_column_meta(tx: &Transaction<'_>, column: &Column) -> Result<(), Stora
     Ok(())
 }
 
+fn insert_layout_meta(tx: &Transaction<'_>, layout: &Layout) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO _slab_layouts (id, name, table_name, spec_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            layout.id,
+            layout.name,
+            layout.table,
+            serde_json::to_string(layout)?,
+            layout.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn create_index_sql(index: &IndexSpec) -> String {
+    format!(
+        "CREATE {}INDEX IF NOT EXISTS {} ON {} ({})",
+        if index.unique { "UNIQUE " } else { "" },
+        quote_ident(&index.name),
+        quote_ident(&index.table),
+        index
+            .columns
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn insert_relation_meta(tx: &Transaction<'_>, relation: &Relation) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO _slab_relations (id, name, parent_table, child_table, child_column, on_delete)
@@ -1544,6 +2009,7 @@ fn rebuild_table(
     table: &Table,
     relations: &[Relation],
 ) -> Result<(), StorageError> {
+    let existing_indexes = list_user_indexes(tx, &table.name)?;
     let temporary = format!("{}__slab_rebuild", table.name);
     tx.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(&temporary)))?;
     let create = create_table_sql(table, &temporary, relations)?;
@@ -1572,6 +2038,15 @@ fn rebuild_table(
         .filter(|relation| relation.child_table == table.name)
     {
         tx.execute_batch(&relation_index_sql(&table.name, &relation.child_column))?;
+    }
+    for index in existing_indexes {
+        if index
+            .columns
+            .iter()
+            .all(|name| table.column(name).is_some())
+        {
+            tx.execute_batch(&create_index_sql(&index))?;
+        }
     }
     let violations: i64 =
         tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1644,9 +2119,47 @@ fn audit_payload(
         ),
         Command::DeleteRow { row, children, .. } => (Some(row_value(row, children)?), None),
         Command::CreateTable { table } => (None, Some(serde_json::to_value(table)?)),
-        Command::DropTable { table } => (Some(serde_json::to_value(table)?), None),
+        Command::DropTable {
+            table,
+            layouts,
+            indexes,
+            ..
+        } => (
+            Some(serde_json::json!({
+                "table": table,
+                "layouts": layouts,
+                "indexes": indexes,
+            })),
+            None,
+        ),
+        Command::RestoreTable {
+            table,
+            layouts,
+            indexes,
+            ..
+        } => (
+            None,
+            Some(serde_json::json!({
+                "table": table,
+                "layouts": layouts,
+                "indexes": indexes,
+            })),
+        ),
+        Command::RenameTable { old_name, new_name } => (
+            Some(serde_json::json!({"name": old_name})),
+            Some(serde_json::json!({"name": new_name})),
+        ),
         Command::AddColumn { column, .. } => (None, Some(serde_json::to_value(column)?)),
         Command::DropColumn { column, .. } => (Some(serde_json::to_value(column)?), None),
+        Command::RestoreColumn { column, .. } => (None, Some(serde_json::to_value(column)?)),
+        Command::RenameColumn {
+            table,
+            old_name,
+            new_name,
+        } => (
+            Some(serde_json::json!({"table": table, "name": old_name})),
+            Some(serde_json::json!({"table": table, "name": new_name})),
+        ),
         Command::CreateRelation { relation } => (None, Some(serde_json::to_value(relation)?)),
         Command::DropRelation { relation } => (Some(serde_json::to_value(relation)?), None),
         Command::SaveLayout { before, after } => (
@@ -1654,7 +2167,265 @@ fn audit_payload(
             Some(serde_json::to_value(after)?),
         ),
         Command::DeleteLayout { layout } => (Some(serde_json::to_value(layout)?), None),
+        Command::CreateIndex { index } => (None, Some(serde_json::to_value(index)?)),
+        Command::DropIndex { index } => (Some(serde_json::to_value(index)?), None),
     })
+}
+
+fn rename_column_in_schema(
+    schema: &Schema,
+    table: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<Schema, StorageError> {
+    let mut candidate = schema.clone();
+    let child_relations: Vec<String> = schema
+        .relations
+        .iter()
+        .filter(|relation| relation.child_table == table)
+        .map(|relation| relation.name.clone())
+        .collect();
+    for definition in &mut candidate.tables {
+        for column in &mut definition.columns {
+            match &mut column.ty {
+                ColumnType::Formula { expression } => {
+                    let mut parsed = parse_formula(expression)?;
+                    let bare = parsed.bare_columns();
+                    let qualified = parsed.qualified_columns();
+                    let mut changed = false;
+                    if definition.name == table && bare.iter().any(|name| name == old_name) {
+                        parsed.rewrite_column(None, old_name, new_name);
+                        changed = true;
+                    }
+                    for relation in &child_relations {
+                        if qualified
+                            .iter()
+                            .any(|(name, column)| name == relation && column == old_name)
+                        {
+                            parsed.rewrite_column(Some(relation), old_name, new_name);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        *expression = parsed.to_string();
+                    }
+                }
+                ColumnType::Lookup {
+                    relation, column, ..
+                } if schema
+                    .relation(relation)
+                    .is_some_and(|relation| relation.child_table == table)
+                    && column == old_name =>
+                {
+                    *column = new_name.to_owned();
+                }
+                _ => {}
+            }
+            if definition.name == table && column.name == old_name {
+                column.name = new_name.to_owned();
+            }
+        }
+    }
+    for relation in &mut candidate.relations {
+        if relation.child_table == table && relation.child_column == old_name {
+            relation.child_column = new_name.to_owned();
+        }
+    }
+    for layout in &mut candidate.layouts {
+        let mut changed = false;
+        if layout.table == table {
+            for item in &mut layout.items {
+                if let LayoutItemKind::Field { column } = &mut item.kind
+                    && column == old_name
+                {
+                    *column = new_name.to_owned();
+                    changed = true;
+                }
+            }
+        }
+        for item in &mut layout.items {
+            if let LayoutItemKind::Portal {
+                relation, columns, ..
+            } = &mut item.kind
+            {
+                let is_renamed_table = schema
+                    .relation(relation)
+                    .is_some_and(|relation| relation.child_table == table);
+                if is_renamed_table {
+                    for column in columns {
+                        if column == old_name {
+                            *column = new_name.to_owned();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            layout.updated_at = now_ms();
+        }
+    }
+    candidate.validate()?;
+    FormulaDag::build(&candidate)?;
+    Ok(candidate)
+}
+
+fn formula_reference(
+    schema: &Schema,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, StorageError> {
+    for definition in &schema.tables {
+        for formula in &definition.columns {
+            match &formula.ty {
+                ColumnType::Formula { expression } => {
+                    let parsed = parse_formula(expression)?;
+                    let bare = parsed.bare_columns();
+                    if definition.name == table && bare.iter().any(|name| name == column) {
+                        return Ok(Some(format!(
+                            "formula {}.{}",
+                            definition.name, formula.name
+                        )));
+                    }
+                    for (relation_name, child_column) in parsed.qualified_columns() {
+                        if schema
+                            .relation(&relation_name)
+                            .is_some_and(|relation| relation.child_table == table)
+                            && child_column == column
+                        {
+                            return Ok(Some(format!(
+                                "formula {}.{}",
+                                definition.name, formula.name
+                            )));
+                        }
+                    }
+                }
+                ColumnType::Lookup {
+                    relation,
+                    column: child_column,
+                    ..
+                } if schema
+                    .relation(relation)
+                    .is_some_and(|relation| relation.child_table == table)
+                    && child_column == column =>
+                {
+                    return Ok(Some(format!("rollup {}.{}", definition.name, formula.name)));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn layout_reference(schema: &Schema, table: &str, column: &str) -> Option<String> {
+    for layout in &schema.layouts {
+        for item in &layout.items {
+            match &item.kind {
+                LayoutItemKind::Field {
+                    column: item_column,
+                } if layout.table == table && item_column == column => {
+                    return Some(layout.name.clone());
+                }
+                LayoutItemKind::Portal {
+                    relation, columns, ..
+                } if schema
+                    .relation(relation)
+                    .is_some_and(|relation| relation.child_table == table)
+                    && columns.iter().any(|name| name == column) =>
+                {
+                    return Some(layout.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn stored_records(
+    conn: &Connection,
+    table: &Table,
+) -> Result<Vec<slab_core::Record>, StorageError> {
+    let sql = format!(
+        "SELECT {} FROM {} ORDER BY {}",
+        quote_ident("id"),
+        quote_ident(&table.name),
+        quote_ident("id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let ids = stmt.query_map([], |row| row.get::<_, RowId>(0))?;
+    let mut output = Vec::new();
+    for id in ids {
+        let id = id?;
+        if let Some(record) = read_stored_record(conn, table, id)? {
+            output.push(record);
+        }
+    }
+    Ok(output)
+}
+
+fn stored_values(
+    conn: &Connection,
+    table: &Table,
+    column: &Column,
+) -> Result<Vec<RowValue>, StorageError> {
+    if !column.ty.is_stored() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {}, {} FROM {} ORDER BY {}",
+        quote_ident("id"),
+        quote_ident(&column.name),
+        quote_ident(&table.name),
+        quote_ident("id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, RowId>(0)?, decode_value(row, 1, &column.ty)))
+    })?;
+    let mut output = Vec::new();
+    for row in rows {
+        let (row_id, value) = row?;
+        output.push(RowValue {
+            row_id,
+            value: value?,
+        });
+    }
+    Ok(output)
+}
+
+fn list_user_indexes(conn: &Connection, table: &str) -> Result<Vec<IndexSpec>, StorageError> {
+    let sql = format!("PRAGMA index_list({})", quote_ident(table));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut indexes = Vec::new();
+    for row in rows {
+        let (name, unique, origin) = row?;
+        if origin != "c" || !name.starts_with("slab_idx_") {
+            continue;
+        }
+        let info_sql = format!("PRAGMA index_info({})", quote_ident(&name));
+        let mut info = conn.prepare(&info_sql)?;
+        let columns = info.query_map([], |row| row.get::<_, String>(2))?;
+        let mut names = Vec::new();
+        for column in columns {
+            names.push(column?);
+        }
+        indexes.push(IndexSpec {
+            name,
+            table: table.to_owned(),
+            columns: names,
+            unique: unique != 0,
+        });
+    }
+    Ok(indexes)
 }
 
 fn sql_value_literal(value: rusqlite::types::ValueRef<'_>) -> String {

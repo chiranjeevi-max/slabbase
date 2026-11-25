@@ -40,6 +40,9 @@ pub enum StorageError {
     /// A command was rejected.
     #[error("invalid command: {0}")]
     Command(String),
+    /// A schema object is still referenced by a formula, layout, or relation.
+    #[error("schema object is still referenced: {0}")]
+    Reference(String),
     /// The file is not a supported workspace.
     #[error("workspace error: {0}")]
     Workspace(String),
@@ -112,6 +115,7 @@ impl SlabError for StorageError {
             Self::NotFound(_) => codes::NOT_FOUND,
             Self::Query(_) => codes::QUERY,
             Self::Command(_) | Self::Unsupported(_) => codes::COMMAND,
+            Self::Reference(_) => codes::FORMULA_REF,
             Self::NothingToUndo | Self::NothingToRedo => codes::UNDO_EMPTY,
         }
     }

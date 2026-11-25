@@ -6,7 +6,8 @@ use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use slab_core::{
     Aggregate, ColumnType, Cursor, Decimal, FilterOp, MAX_PAGE_SIZE, Money, Page, PageQuery,
-    Record, RecordBundle, RowData, RowId, Schema, SearchHit, SortDirection, Table, Value,
+    PortalPage, PortalQuery, Record, RecordBundle, RowData, RowId, Schema, SearchHit,
+    SortDirection, Table, Value,
 };
 use slab_formula::{EvalContext, FormulaDag, FormulaError, evaluate_expression, parse};
 
@@ -211,6 +212,45 @@ impl Workspace {
             next_cursor,
             elapsed_ms,
             total_rows: None,
+        })
+    }
+
+    /// Returns one keyset page of child rows for a relation, plus the exact
+    /// number of children for the parent.
+    pub fn page_portal(&self, request: &PortalQuery) -> Result<PortalPage, StorageError> {
+        let schema = self.schema()?;
+        let relation = schema
+            .relation(&request.relation)
+            .ok_or_else(|| StorageError::NotFound(format!("relation {}", request.relation)))?;
+        let child = schema.table(&relation.child_table).ok_or_else(|| {
+            StorageError::NotFound(format!("child table {}", relation.child_table))
+        })?;
+        let page = self.page(&PageQuery {
+            table: child.name.clone(),
+            limit: request.limit,
+            cursor: request.cursor.clone(),
+            sort: Vec::new(),
+            filters: vec![slab_core::Filter {
+                column: relation.child_column.clone(),
+                op: FilterOp::Eq,
+                value: Some(Value::Integer(request.parent_id)),
+            }],
+            search: None,
+        })?;
+        let total: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {} WHERE {} = ?1",
+                quote_ident(&child.name),
+                quote_ident(&relation.child_column)
+            ),
+            params![request.parent_id],
+            |row| row.get(0),
+        )?;
+        Ok(PortalPage {
+            rows: page.rows,
+            next_cursor: page.next_cursor,
+            total_rows: u64::try_from(total).unwrap_or(0),
+            elapsed_ms: page.elapsed_ms,
         })
     }
 
