@@ -43,4 +43,8 @@ summary: string,
 /**
  * Whether this entry changed schema rather than data.
  */
-schema_change: boolean, };
+schema_change: boolean, 
+/**
+ * BLAKE3 hash chaining this entry to its predecessor.
+ */
+entry_hash: string | null, };

@@ -55,6 +55,9 @@ pub enum StorageError {
     /// The redo stack is empty.
     #[error("nothing to redo")]
     NothingToRedo,
+    /// A superseded interactive query was interrupted.
+    #[error("query cancelled")]
+    Cancelled,
     /// An internal invariant did not hold.
     #[error("internal error: {0}")]
     Internal(String),
@@ -63,6 +66,9 @@ pub enum StorageError {
 impl From<rusqlite::Error> for StorageError {
     fn from(error: rusqlite::Error) -> Self {
         if let rusqlite::Error::SqliteFailure(failure, message) = &error {
+            if failure.code == rusqlite::ErrorCode::OperationInterrupted {
+                return Self::Cancelled;
+            }
             let detail = message
                 .clone()
                 .unwrap_or_else(|| format!("{:?}", failure.code));
@@ -117,6 +123,7 @@ impl SlabError for StorageError {
             Self::Command(_) | Self::Unsupported(_) => codes::COMMAND,
             Self::Reference(_) => codes::FORMULA_REF,
             Self::NothingToUndo | Self::NothingToRedo => codes::UNDO_EMPTY,
+            Self::Cancelled => codes::CANCELLED,
         }
     }
 }

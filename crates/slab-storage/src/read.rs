@@ -5,13 +5,14 @@ use std::time::Instant;
 use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use slab_core::{
-    Aggregate, ColumnType, Cursor, Decimal, FilterOp, MAX_PAGE_SIZE, Money, Page, PageQuery,
+    Aggregate, Column, ColumnType, Cursor, FilterOp, IndexHint, MAX_PAGE_SIZE, Page, PageQuery,
     PortalPage, PortalQuery, Record, RecordBundle, RowData, RowId, Schema, SearchHit,
     SortDirection, Table, Value,
 };
 use slab_formula::{EvalContext, FormulaDag, FormulaError, evaluate_expression, parse};
 
 use crate::error::StorageError;
+use crate::rollup;
 use crate::sql::{decode_value, encode_value, quote_ident, stored_columns};
 use crate::workspace::{Workspace, now_ms, read_stored_record};
 
@@ -23,7 +24,7 @@ impl Workspace {
             .table(table_name)
             .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
         self.check_policy(table_name)?;
-        let mut record = read_stored_record(&self.conn, table, id)?
+        let mut record = read_stored_record(self.read_conn(), table, id)?
             .ok_or_else(|| StorageError::NotFound(format!("{table_name} #{id}")))?;
         self.compute_record(&schema, table, &mut record)?;
         self.redact_record(table, &mut record);
@@ -160,8 +161,7 @@ impl Workspace {
             )
         } else {
             format!(
-                "ORDER BY ({} IS NULL) ASC, {} {}, {} ASC",
-                quote_ident(sort_column),
+                "ORDER BY {} {} NULLS LAST, {} ASC",
                 quote_ident(sort_column),
                 match direction {
                     SortDirection::Asc => "ASC",
@@ -177,7 +177,10 @@ impl Workspace {
             quote_ident(&table.name),
         );
         bound.push(SqlValue::Integer(i64::from(limit) + 1));
-        let mut stmt = self.conn.prepare(&sql)?;
+        let explain_bound = bound.clone();
+        let conn = self.read_conn();
+        let _active = ActiveQuery::begin(self.cancel.as_ref(), conn.get_interrupt_handle());
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(bound))?;
         let mut records: Vec<Record> = Vec::new();
         let mut sort_values: Vec<Value> = Vec::new();
@@ -219,11 +222,22 @@ impl Workspace {
             None
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let active_column = if sort_column != "id" {
+            Some(sort_column)
+        } else {
+            query
+                .filters
+                .iter()
+                .map(|filter| filter.column.as_str())
+                .find(|column| *column != "id")
+        };
+        let index_hint = self.index_hint(table, &sql, &explain_bound, active_column, elapsed_ms)?;
         Ok(Page {
             rows: records,
             next_cursor,
             elapsed_ms,
             total_rows: None,
+            index_hint,
         })
     }
 
@@ -249,7 +263,7 @@ impl Workspace {
             }],
             search: None,
         })?;
-        let total: i64 = self.conn.query_row(
+        let total: i64 = self.read_conn().query_row(
             &format!(
                 "SELECT COUNT(*) FROM {} WHERE {} = ?1",
                 quote_ident(&child.name),
@@ -263,6 +277,7 @@ impl Workspace {
             next_cursor: page.next_cursor,
             total_rows: u64::try_from(total).unwrap_or(0),
             elapsed_ms: page.elapsed_ms,
+            index_hint: page.index_hint,
         })
     }
 
@@ -273,6 +288,8 @@ impl Workspace {
             return Ok(Vec::new());
         }
         let limit = i64::from(limit.clamp(1, 200));
+        let conn = self.read_conn();
+        let _active = ActiveQuery::begin(self.cancel.as_ref(), conn.get_interrupt_handle());
         let sql = "SELECT table_name, CAST(row_id AS INTEGER),
                           snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
                           bm25(_slab_fts)
@@ -280,7 +297,7 @@ impl Workspace {
                    WHERE _slab_fts MATCH ?1
                    ORDER BY bm25(_slab_fts)
                    LIMIT ?2";
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params![fts_query(term), limit], |row| {
             Ok(SearchHit {
                 table: row.get(0)?,
@@ -324,7 +341,7 @@ impl Workspace {
         self.compute_record_with_dag(schema, table, record, &dag)
     }
 
-    fn compute_record_with_dag(
+    pub(crate) fn compute_record_with_dag(
         &self,
         schema: &Schema,
         table: &Table,
@@ -403,6 +420,57 @@ impl Workspace {
         child_column: &str,
         aggregate: Aggregate,
     ) -> Result<Value, StorageError> {
+        self.aggregate_in_mode(
+            schema,
+            AggregateTarget {
+                parent_table,
+                parent_id,
+                relation_name,
+                child_column,
+                aggregate,
+            },
+            true,
+        )
+    }
+
+    /// Formula-level aggregates are evaluated against live child rows. They are
+    /// intentionally uncached so an arbitrary formula aggregate can never read
+    /// a rollup entry that no declared lookup column maintains.
+    fn aggregate_scan_in(
+        &self,
+        schema: &Schema,
+        parent_table: &str,
+        parent_id: RowId,
+        relation_name: &str,
+        child_column: &str,
+        aggregate: Aggregate,
+    ) -> Result<Value, StorageError> {
+        self.aggregate_in_mode(
+            schema,
+            AggregateTarget {
+                parent_table,
+                parent_id,
+                relation_name,
+                child_column,
+                aggregate,
+            },
+            false,
+        )
+    }
+
+    fn aggregate_in_mode(
+        &self,
+        schema: &Schema,
+        target: AggregateTarget<'_>,
+        use_cache: bool,
+    ) -> Result<Value, StorageError> {
+        let AggregateTarget {
+            parent_table,
+            parent_id,
+            relation_name,
+            child_column,
+            aggregate,
+        } = target;
         let relation = schema
             .relation(relation_name)
             .ok_or_else(|| StorageError::NotFound(format!("relation {relation_name}")))?;
@@ -420,8 +488,47 @@ impl Workspace {
                 child.name
             ))
         })?;
+        if use_cache
+            && let Some(state) = rollup::cached_state(
+                self.read_conn(),
+                parent_table,
+                parent_id,
+                relation_name,
+                child_column,
+                aggregate,
+            )?
+        {
+            return rollup::finalize_state(&state, aggregate, column);
+        }
+        let state =
+            self.compute_aggregate_state(schema, relation, child, column, parent_id, aggregate)?;
+        let value = rollup::finalize_state(&state, aggregate, column)?;
+        if use_cache && column.ty.is_stored() {
+            rollup::store_computed(
+                self.write_conn(),
+                parent_table,
+                parent_id,
+                relation_name,
+                child_column,
+                aggregate,
+                &state,
+            )?;
+        }
+        Ok(value)
+    }
+
+    fn compute_aggregate_state(
+        &self,
+        schema: &Schema,
+        relation: &slab_core::Relation,
+        child: &Table,
+        column: &Column,
+        parent_id: RowId,
+        aggregate: Aggregate,
+    ) -> Result<rollup::RollupState, StorageError> {
         let where_clause = format!("{} = ?1", quote_ident(&relation.child_column));
-        if aggregate == Aggregate::Count {
+        let conn = self.read_conn();
+        if aggregate == Aggregate::Count && column.ty.is_stored() {
             let sql = format!(
                 "SELECT COUNT({}) FROM {} WHERE {} AND {} IS NOT NULL",
                 quote_ident(&column.name),
@@ -429,10 +536,8 @@ impl Workspace {
                 where_clause,
                 quote_ident(&column.name)
             );
-            let count: i64 = self
-                .conn
-                .query_row(&sql, params![parent_id], |row| row.get(0))?;
-            return Ok(Value::Integer(count));
+            let count: i64 = conn.query_row(&sql, params![parent_id], |row| row.get(0))?;
+            return Ok(rollup::state_from_parts(count, None, None));
         }
         if column.ty.is_stored() && matches!(aggregate, Aggregate::Min | Aggregate::Max) {
             let direction = if aggregate == Aggregate::Min {
@@ -440,6 +545,14 @@ impl Workspace {
             } else {
                 "DESC"
             };
+            let count_sql = format!(
+                "SELECT COUNT({}) FROM {} WHERE {} AND {} IS NOT NULL",
+                quote_ident(&column.name),
+                quote_ident(&child.name),
+                where_clause,
+                quote_ident(&column.name)
+            );
+            let count: i64 = conn.query_row(&count_sql, params![parent_id], |row| row.get(0))?;
             let sql = format!(
                 "SELECT {} FROM {} WHERE {} AND {} IS NOT NULL ORDER BY {} {direction} LIMIT 1",
                 quote_ident(&column.name),
@@ -448,11 +561,14 @@ impl Workspace {
                 quote_ident(&column.name),
                 quote_ident(&column.name)
             );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(params![parent_id])?;
             return match rows.next()? {
-                Some(row) => Ok(decode_value(row, 0, &column.ty)?),
-                None => Ok(Value::Null),
+                Some(row) => {
+                    let value = decode_value(row, 0, &column.ty)?;
+                    Ok(rollup::state_from_parts(count, None, Some(value)))
+                }
+                None => Ok(rollup::state_from_parts(0, None, None)),
             };
         }
         let mut count: i64 = 0;
@@ -465,11 +581,11 @@ impl Workspace {
                 quote_ident(&child.name),
                 where_clause
             );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(params![parent_id])?;
             while let Some(row) = rows.next()? {
                 let value = decode_value(row, 0, &column.ty)?;
-                accumulate(&mut count, &mut sum, &mut best, aggregate, value)?;
+                rollup::accumulate(&mut count, &mut sum, &mut best, aggregate, value)?;
             }
         } else {
             let sql = format!(
@@ -479,7 +595,7 @@ impl Workspace {
                 where_clause,
                 quote_ident("id")
             );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(&sql)?;
             let ids = stmt.query_map(params![parent_id], |row| row.get::<_, RowId>(0))?;
             let mut child_ids = Vec::new();
             for id in ids {
@@ -488,7 +604,7 @@ impl Workspace {
             drop(stmt);
             let child_dag = FormulaDag::build(schema)?;
             for id in child_ids {
-                let Some(mut record) = read_stored_record(&self.conn, child, id)? else {
+                let Some(mut record) = read_stored_record(conn, child, id)? else {
                     continue;
                 };
                 self.compute_record_with_dag(schema, child, &mut record, &child_dag)?;
@@ -497,41 +613,119 @@ impl Workspace {
                     .get(&column.name)
                     .cloned()
                     .unwrap_or(Value::Null);
-                accumulate(&mut count, &mut sum, &mut best, aggregate, value)?;
+                rollup::accumulate(&mut count, &mut sum, &mut best, aggregate, value)?;
             }
         }
-        match aggregate {
-            Aggregate::Sum => {
-                if let Some(sum) = sum {
-                    return Ok(sum);
-                }
-                Ok(empty_aggregate_value(column))
-            }
-            Aggregate::Avg => {
-                let Some(sum) = sum else {
-                    return Ok(empty_aggregate_value(column));
-                };
-                if count == 0 {
-                    return Ok(empty_aggregate_value(column));
-                }
-                match sum {
-                    Value::Integer(integer) => Ok(Value::Decimal(
-                        Decimal::from_integer(integer).checked_div(Decimal::from_integer(count))?,
-                    )),
-                    Value::Decimal(decimal) => Ok(Value::Decimal(
-                        decimal.checked_div(Decimal::from_integer(count))?,
-                    )),
-                    Value::Currency(money) => {
-                        Ok(Value::Currency(money.checked_mul_ratio(1, count)?))
-                    }
-                    other => Ok(other),
-                }
-            }
-            Aggregate::Min | Aggregate::Max => Ok(best.unwrap_or(Value::Null)),
-            Aggregate::Count => Err(StorageError::Internal(
-                "count handled before accumulation".into(),
-            )),
+        Ok(rollup::state_from_parts(count, sum, best))
+    }
+
+    fn index_hint(
+        &self,
+        table: &Table,
+        sql: &str,
+        bound: &[SqlValue],
+        active_column: Option<&str>,
+        elapsed_ms: f64,
+    ) -> Result<Option<IndexHint>, StorageError> {
+        let Some(active_column) = active_column else {
+            return Ok(None);
+        };
+        if active_column == "id" {
+            return Ok(None);
         }
+        let conn = self.read_conn();
+        if has_index_for_column(conn, &table.name, active_column)? {
+            return Ok(None);
+        }
+        let scanned_rows: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM {}", quote_ident(&table.name)),
+            [],
+            |row| row.get(0),
+        )?;
+        if elapsed_ms <= 20.0 && scanned_rows < 1_000 {
+            return Ok(None);
+        }
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = conn.prepare_cached(&explain)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter().cloned()))?;
+        let mut details = Vec::new();
+        let mut scan = false;
+        while let Some(row) = rows.next()? {
+            let detail: String = row.get(3)?;
+            if detail.starts_with("SCAN ") {
+                scan = true;
+            }
+            details.push(detail);
+        }
+        if !scan {
+            return Ok(None);
+        }
+        Ok(Some(IndexHint {
+            table: table.name.clone(),
+            column: active_column.to_owned(),
+            suggested_index: format!("slab_idx_{}_{active_column}", table.name).replace(' ', "_"),
+            elapsed_ms,
+            scanned_rows: u64::try_from(scanned_rows).unwrap_or(0),
+            detail: details.join("; "),
+        }))
+    }
+}
+
+fn has_index_for_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, StorageError> {
+    let list_sql = format!("PRAGMA index_list({})", quote_ident(table));
+    let mut stmt = conn.prepare(&list_sql)?;
+    let indexes = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut names = Vec::new();
+    for index in indexes {
+        names.push(index?);
+    }
+    drop(stmt);
+    for name in names {
+        let info_sql = format!("PRAGMA index_info({})", quote_ident(&name));
+        let mut info = conn.prepare(&info_sql)?;
+        let columns = info.query_map([], |row| row.get::<_, String>(2))?;
+        let mut first = None;
+        for item in columns {
+            if first.is_none() {
+                first = Some(item?);
+            }
+        }
+        if first.as_deref() == Some(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// One aggregate request, used to keep the cached and live paths in sync.
+#[derive(Clone, Copy)]
+struct AggregateTarget<'a> {
+    parent_table: &'a str,
+    parent_id: RowId,
+    relation_name: &'a str,
+    child_column: &'a str,
+    aggregate: Aggregate,
+}
+
+/// Registers the active query handle and clears it on every exit path.
+struct ActiveQuery<'a> {
+    cancel: &'a crate::workspace::QueryCancel,
+}
+
+impl<'a> ActiveQuery<'a> {
+    fn begin(cancel: &'a crate::workspace::QueryCancel, handle: rusqlite::InterruptHandle) -> Self {
+        cancel.register(handle);
+        Self { cancel }
+    }
+}
+
+impl Drop for ActiveQuery<'_> {
+    fn drop(&mut self) {
+        self.cancel.clear();
     }
 }
 
@@ -555,7 +749,7 @@ impl EvalContext for RowContext<'_> {
         aggregate: Aggregate,
     ) -> Result<Value, FormulaError> {
         self.workspace
-            .aggregate_in(
+            .aggregate_scan_in(
                 self.schema,
                 self.table,
                 self.record_id,
@@ -572,106 +766,6 @@ impl EvalContext for RowContext<'_> {
 
     fn now(&self) -> slab_core::SlabTimestamp {
         slab_core::SlabTimestamp::from_millis(now_ms())
-    }
-}
-
-fn accumulate(
-    count: &mut i64,
-    sum: &mut Option<Value>,
-    best: &mut Option<Value>,
-    aggregate: Aggregate,
-    value: Value,
-) -> Result<(), StorageError> {
-    if value.is_null() {
-        return Ok(());
-    }
-    *count += 1;
-    match aggregate {
-        Aggregate::Sum | Aggregate::Avg => {
-            let current = sum.take();
-            *sum = Some(match current {
-                None => value,
-                Some(accumulated) => add_values(accumulated, value)?,
-            });
-        }
-        Aggregate::Min => {
-            if best
-                .as_ref()
-                .is_none_or(|current| value_less(&value, current))
-            {
-                *best = Some(value);
-            }
-        }
-        Aggregate::Max => {
-            if best
-                .as_ref()
-                .is_none_or(|current| value_less(current, &value))
-            {
-                *best = Some(value);
-            }
-        }
-        Aggregate::Count => {}
-    }
-    Ok(())
-}
-
-fn value_less(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left < right,
-        (Value::Decimal(left), Value::Decimal(right)) => left < right,
-        (Value::Integer(left), Value::Decimal(right)) => Decimal::from_integer(*left) < *right,
-        (Value::Decimal(left), Value::Integer(right)) => *left < Decimal::from_integer(*right),
-        (Value::Currency(left), Value::Currency(right)) => left.amount() < right.amount(),
-        (Value::Text(left), Value::Text(right))
-        | (Value::Select(left), Value::Text(right))
-        | (Value::Text(left), Value::Select(right))
-        | (Value::Select(left), Value::Select(right)) => left < right,
-        (Value::Date(left), Value::Date(right)) => left < right,
-        (Value::Timestamp(left), Value::Timestamp(right)) => left < right,
-        (Value::Boolean(left), Value::Boolean(right)) => left < right,
-        _ => false,
-    }
-}
-
-fn empty_aggregate_value(column: &slab_core::Column) -> Value {
-    match &column.ty {
-        ColumnType::Integer => Value::Integer(0),
-        ColumnType::Decimal { scale } => Decimal::zero(*scale)
-            .map(Value::Decimal)
-            .unwrap_or(Value::Null),
-        ColumnType::Currency { currency } => Money::from_minor(*currency, 0)
-            .map(Value::Currency)
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
-    }
-}
-
-fn add_values(left: Value, right: Value) -> Result<Value, StorageError> {
-    match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(
-            left.checked_add(right)
-                .ok_or_else(|| StorageError::Query("aggregate sum overflowed an integer".into()))?,
-        )),
-        (Value::Currency(left), Value::Currency(right)) => {
-            Ok(Value::Currency(left.checked_add(right)?))
-        }
-        (left, right) => {
-            let left = numeric_decimal(left)?;
-            let right = numeric_decimal(right)?;
-            Ok(Value::Decimal(left.checked_add(right)?))
-        }
-    }
-}
-
-fn numeric_decimal(value: Value) -> Result<Decimal, StorageError> {
-    match value {
-        Value::Integer(value) => Ok(Decimal::from_integer(value)),
-        Value::Decimal(value) => Ok(value),
-        Value::Currency(money) => Ok(money.amount()),
-        other => Err(StorageError::Query(format!(
-            "cannot sum {}",
-            other.type_name()
-        ))),
     }
 }
 

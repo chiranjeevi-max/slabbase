@@ -148,6 +148,93 @@ pub struct Page {
     pub elapsed_ms: f64,
     /// Total rows matching filters, when the caller requested it.
     pub total_rows: Option<u64>,
+    /// Optional advisor result for an unindexed sort or filter.
+    pub index_hint: Option<IndexHint>,
+}
+
+impl Page {
+    /// Converts the named-record payload to compact positional tuples.
+    ///
+    /// Column names travel once in `columns`; each row is a value array in the
+    /// same order. A value absent from a record is transmitted as `Null`.
+    pub fn into_frame(self, columns: Vec<String>) -> PageFrame {
+        let rows = self
+            .rows
+            .into_iter()
+            .map(|record| RowTuple {
+                id: record.id,
+                values: columns
+                    .iter()
+                    .map(|column| record.values.get(column).cloned().unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .collect();
+        PageFrame {
+            columns,
+            rows,
+            next_cursor: self.next_cursor,
+            elapsed_ms: self.elapsed_ms,
+            total_rows: self.total_rows,
+            index_hint: self.index_hint,
+        }
+    }
+}
+
+/// A stable identifier for a column in a tuple-framed page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+pub struct RowTuple {
+    /// Primary key.
+    pub id: RowId,
+    /// Values aligned with `PageFrame::columns`.
+    pub values: Vec<Value>,
+}
+
+/// A page whose column metadata is sent once and whose rows are positional.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+pub struct PageFrame {
+    /// Column names, in row-value order.
+    pub columns: Vec<String>,
+    /// Positional rows.
+    pub rows: Vec<RowTuple>,
+    /// Cursor for the next page, absent on the final page.
+    pub next_cursor: Option<Cursor>,
+    /// Time spent in storage, in milliseconds.
+    pub elapsed_ms: f64,
+    /// Total rows matching filters, when requested.
+    pub total_rows: Option<u64>,
+    /// Optional advisor result for an unindexed sort or filter.
+    pub index_hint: Option<IndexHint>,
+}
+
+impl PageFrame {
+    /// Rebuilds named records for consumers that still need them.
+    pub fn records(&self) -> Vec<Record> {
+        self.rows
+            .iter()
+            .map(|tuple| {
+                let values = self
+                    .columns
+                    .iter()
+                    .cloned()
+                    .zip(tuple.values.iter().cloned())
+                    .collect();
+                Record {
+                    id: tuple.id,
+                    values,
+                }
+            })
+            .collect()
+    }
 }
 
 /// A keyset-paginated request for one child relation.
@@ -184,6 +271,99 @@ pub struct PortalPage {
     pub total_rows: u64,
     /// Time spent in storage, in milliseconds.
     pub elapsed_ms: f64,
+    /// Optional advisor result for an unindexed sort or filter.
+    pub index_hint: Option<IndexHint>,
+}
+
+impl PortalPage {
+    /// Converts the portal payload to compact positional tuples.
+    pub fn into_frame(self, columns: Vec<String>) -> PortalFrame {
+        let rows = self
+            .rows
+            .into_iter()
+            .map(|record| RowTuple {
+                id: record.id,
+                values: columns
+                    .iter()
+                    .map(|column| record.values.get(column).cloned().unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .collect();
+        PortalFrame {
+            columns,
+            rows,
+            next_cursor: self.next_cursor,
+            total_rows: self.total_rows,
+            elapsed_ms: self.elapsed_ms,
+            index_hint: self.index_hint,
+        }
+    }
+}
+
+/// A portal page whose column metadata is sent once and whose rows are positional.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+pub struct PortalFrame {
+    /// Column names, in row-value order.
+    pub columns: Vec<String>,
+    /// Positional rows.
+    pub rows: Vec<RowTuple>,
+    /// Cursor for the next page, absent on the final page.
+    pub next_cursor: Option<Cursor>,
+    /// Exact number of child rows for the parent.
+    pub total_rows: u64,
+    /// Time spent in storage, in milliseconds.
+    pub elapsed_ms: f64,
+    /// Optional advisor result for an unindexed sort or filter.
+    pub index_hint: Option<IndexHint>,
+}
+
+impl PortalFrame {
+    /// Rebuilds named records for consumers that still need them.
+    pub fn records(&self) -> Vec<Record> {
+        self.rows
+            .iter()
+            .map(|tuple| {
+                let values = self
+                    .columns
+                    .iter()
+                    .cloned()
+                    .zip(tuple.values.iter().cloned())
+                    .collect();
+                Record {
+                    id: tuple.id,
+                    values,
+                }
+            })
+            .collect()
+    }
+}
+
+/// A quiet, dismissible suggestion emitted when a page performed a full scan.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexHint {
+    /// Table that was scanned.
+    pub table: String,
+    /// Sort or filter column that triggered the scan.
+    pub column: String,
+    /// Index name the shell should create on one click.
+    pub suggested_index: String,
+    /// Page latency that exposed the scan.
+    pub elapsed_ms: f64,
+    /// Rows present in the table when the hint was produced.
+    pub scanned_rows: u64,
+    /// Raw `EXPLAIN QUERY PLAN` detail line.
+    pub detail: String,
 }
 
 /// One full-text hit.

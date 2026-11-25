@@ -84,6 +84,8 @@ pub mod codes {
     pub const WORKSPACE: ErrorCode = ErrorCode::new("SLAB_E_WORKSPACE");
     /// Nothing to undo or redo.
     pub const UNDO_EMPTY: ErrorCode = ErrorCode::new("SLAB_E_UNDO_EMPTY");
+    /// A superseded interactive query was interrupted.
+    pub const CANCELLED: ErrorCode = ErrorCode::new("SLAB_E_CANCELLED");
     /// Invalid command.
     pub const COMMAND: ErrorCode = ErrorCode::new("SLAB_E_COMMAND");
     /// Internal invariant violated.

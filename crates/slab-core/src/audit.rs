@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::record::RowId;
+use crate::value::Value;
 
 /// One row from `_slab_audit_log`, without the full before/after payloads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +33,50 @@ pub struct AuditEntry {
     pub summary: String,
     /// Whether this entry changed schema rather than data.
     pub schema_change: bool,
+    /// BLAKE3 hash chaining this entry to its predecessor.
+    pub entry_hash: Option<String>,
+}
+
+/// One field-level change inside a record revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldDiff {
+    /// Column name.
+    pub column: String,
+    /// Value before the revision, or absent when the field did not exist.
+    pub before: Option<Value>,
+    /// Value after the revision, or absent when the field was removed.
+    pub after: Option<Value>,
+}
+
+/// One chronological revision of a single record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "../../../apps/desktop/src/bindings/")
+)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordRevision {
+    /// Audit entry that produced the revision.
+    pub audit_id: i64,
+    /// Physical time in Unix milliseconds.
+    pub timestamp_ms: i64,
+    /// Hybrid logical clock reading.
+    pub hlc: String,
+    /// Actor recorded with the write.
+    pub actor: String,
+    /// Operation label such as `insert`, `update`, or `restore`.
+    pub operation: String,
+    /// Short description.
+    pub summary: String,
+    /// Field-level differences for this revision.
+    pub diffs: Vec<FieldDiff>,
 }
 
 /// The current undo and redo availability.
