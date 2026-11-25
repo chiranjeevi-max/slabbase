@@ -2501,7 +2501,7 @@ pub(crate) fn read_stored_record(
         quote_ident(&table.name),
         quote_ident("id")
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query(params![id])?;
     let Some(row) = rows.next()? else {
         return Ok(None);

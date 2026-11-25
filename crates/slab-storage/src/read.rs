@@ -561,7 +561,7 @@ impl Workspace {
                 quote_ident(&column.name),
                 quote_ident(&column.name)
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let mut rows = stmt.query(params![parent_id])?;
             return match rows.next()? {
                 Some(row) => {
@@ -581,7 +581,7 @@ impl Workspace {
                 quote_ident(&child.name),
                 where_clause
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let mut rows = stmt.query(params![parent_id])?;
             while let Some(row) = rows.next()? {
                 let value = decode_value(row, 0, &column.ty)?;
@@ -595,7 +595,7 @@ impl Workspace {
                 where_clause,
                 quote_ident("id")
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let ids = stmt.query_map(params![parent_id], |row| row.get::<_, RowId>(0))?;
             let mut child_ids = Vec::new();
             for id in ids {
@@ -677,7 +677,7 @@ fn has_index_for_column(
     column: &str,
 ) -> Result<bool, StorageError> {
     let list_sql = format!("PRAGMA index_list({})", quote_ident(table));
-    let mut stmt = conn.prepare(&list_sql)?;
+    let mut stmt = conn.prepare_cached(&list_sql)?;
     let indexes = stmt.query_map([], |row| row.get::<_, String>(1))?;
     let mut names = Vec::new();
     for index in indexes {
@@ -686,7 +686,7 @@ fn has_index_for_column(
     drop(stmt);
     for name in names {
         let info_sql = format!("PRAGMA index_info({})", quote_ident(&name));
-        let mut info = conn.prepare(&info_sql)?;
+        let mut info = conn.prepare_cached(&info_sql)?;
         let columns = info.query_map([], |row| row.get::<_, String>(2))?;
         let mut first = None;
         for item in columns {
