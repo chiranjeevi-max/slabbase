@@ -12,8 +12,8 @@ The application is built in Rust with a thin Tauri shell and a React front end. 
 - **Virtualized grid.** Keyboard-first browsing and editing over keyset-paginated queries.
 - **Search.** SQLite FTS5 across all text columns, opened with `Cmd+K`.
 - **Audit and undo.** Every write appends a before/after delta to `_slab_audit_log` in the same transaction, and can be undone or redone.
-- **Import and export.** Streaming CSV and JSON import with inference and a dry-run preview; CSV, JSON, and SQL export. SQL exports include user tables and SlabBase metadata but omit the audit log and search index; use the backup command for a byte-for-byte snapshot.
-- **Print and PDF.** Paginated HTML preview and vector PDF export for records, portals, and filtered tables.
+- **Import and export.** Streaming CSV and array/NDJSON JSON import with bounded inference and batched commits; CSV, JSON, and SQL export. SQL exports include user tables and SlabBase metadata but omit the audit log and search index; use the backup command for a byte-for-byte snapshot.
+- **Print and PDF.** Paginated HTML preview and vector PDF export for records, portals, and filtered tables. Table exports stream keyset pages and stop at an explicit 25,000-row ceiling with a warning in the report and the UI.
 - **Backup.** One-click `VACUUM INTO` snapshots that are consistent while the workspace is open.
 
 ## Design commitments
@@ -47,6 +47,16 @@ Launch the built app with the sample workspace:
 open target/release/bundle/macos/SlabBase.app \
   --args --workspace "$PWD/fixtures/design-studio.slab"
 ```
+
+For an auditable release binary:
+
+```bash
+cargo install cargo-auditable
+cargo auditable build --release -p slabbase-desktop
+otool -l target/release/slabbase-desktop | grep dep-v0
+```
+
+The release profile keeps the `.dep-v0` section used by `cargo-auditable`; `strip = "debuginfo"` does not remove it.
 
 For development:
 

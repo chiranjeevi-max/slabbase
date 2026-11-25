@@ -15,6 +15,7 @@
 
 ## v1.1
 
+- Arbitrary column data-type conversion migrations. v1.0 supports renaming, adding, and dropping columns, but changing an existing stored type is deliberately deferred because it requires a row-level conversion plan and rollback proof.
 - Additional view types through `slab_core::ViewConfig`: kanban, gallery, calendar.
 - Airtable CSV and FileMaker XML adapters implementing `slab_import::ImportAdapter`.
 - Saved filters and per-table view presets.

@@ -29,12 +29,14 @@ Pure domain types shared by every layer:
 - `Schema`, `Table`, `Column`, `ColumnType`, `Relation`, `IndexSpec`.
 - `Layout` and `LayoutItem` for form definitions, including portals.
 - `Command` for reversible writes and schema changes.
-- `PageQuery`, `Page`, `Cursor`, `Filter`, `SortSpec`, and `SearchHit`.
+- `PageQuery`, `Page`, `PortalQuery`, `PortalPage`, `Cursor`, `Filter`, `SortSpec`, and `SearchHit`.
 - `ViewConfig` (table, kanban, gallery, calendar) and `PolicyHook` as extension seams.
 
 All wire types derive `serde` and, behind the `ts` feature, `ts-rs`. The Tauri crate enables that feature and exports bindings to `apps/desktop/src/bindings`. Shell-only payloads live in `apps/desktop/src-tauri/src/dto.rs` because import and print crates stay free of IPC concerns.
 
-Relation child columns receive a secondary SQLite index when a relation is created. Relation changes rebuild the child table inside a transaction with foreign keys temporarily disabled, copy every row, rename the rebuilt table, and run `PRAGMA foreign_key_check` before commit.
+Relation child columns receive a secondary SQLite index when a relation is created. Relation changes rebuild the child table inside a transaction with foreign keys temporarily disabled, copy every row, rename the rebuilt table, and run `PRAGMA foreign_key_check` before commit. User-created single-column indexes are named with the `slab_idx_` prefix and are preserved across rebuilds.
+
+Table and column renames rewrite metadata, layouts, relations, lookup configurations, and formula source references in one transaction. Dropped tables, columns, layouts, and indexes retain their data in the inverse command so undo restores the exact previous state. Formula and form references block a column drop with a structured error instead of leaving an invalid schema.
 
 ### `slab-formula`
 
@@ -111,6 +113,10 @@ LIMIT :limit + 1
 ```
 
 The extra row determines `next_cursor` without a count query. `NULL` values sort last in ascending order. No query materializes a full table.
+
+Child portals use the same keyset path through `PortalQuery` and `PortalPage`, filtered by the parent foreign key. The storage layer returns an exact child count; the desktop portal grid loads pages as the user scrolls and keeps only the loaded rows in memory.
+
+The 100,000-row pagination benchmark runs in release mode against an indexed sort column. The 15 ms p95 assertion is a measurement of indexed keyset pagination, not a promise that an unindexed arbitrary sort will meet the same bound. Users can add a single-column index from the schema management screen.
 
 ## Formula DAG
 

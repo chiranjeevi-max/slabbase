@@ -38,6 +38,14 @@ npm --prefix apps/desktop run typecheck
 npm --prefix apps/desktop run build
 ```
 
+For release candidates, build the auditable binary:
+
+```bash
+cargo install cargo-auditable
+cargo auditable build --release -p slabbase-desktop
+otool -l target/release/slabbase-desktop | grep dep-v0
+```
+
 If you changed Rust types that cross the IPC boundary, regenerate the TypeScript bindings:
 
 ```bash
