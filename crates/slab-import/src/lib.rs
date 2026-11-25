@@ -184,10 +184,11 @@ impl ImportAdapter for CsvAdapter {
                         .iter()
                         .enumerate()
                         .map(|(index, value)| {
-                            if value.trim().is_empty() {
+                            let value = value.strip_prefix('\u{FEFF}').unwrap_or(value).trim();
+                            if value.is_empty() {
                                 format!("Column {}", index + 1)
                             } else {
-                                value.trim().to_owned()
+                                value.to_owned()
                             }
                         })
                         .collect()
@@ -209,12 +210,12 @@ impl ImportAdapter for CsvAdapter {
         if !options.has_headers
             && let Some(record) = first
         {
-            emit_csv_row(&headers, &record, 1, on_row);
+            emit_csv_row(&headers, &record, 1, true, on_row);
         }
         for record in records {
             row_number += 1;
             let record = record?;
-            emit_csv_row(&headers, &record, row_number, on_row);
+            emit_csv_row(&headers, &record, row_number, false, on_row);
         }
         Ok(())
     }
@@ -224,6 +225,7 @@ fn emit_csv_row(
     headers: &[String],
     record: &csv::StringRecord,
     row_number: u64,
+    strip_bom: bool,
     on_row: &mut dyn FnMut(SourceRow),
 ) {
     let mut row = SourceRow {
@@ -238,8 +240,14 @@ fn emit_csv_row(
         ));
     }
     for (index, header) in headers.iter().enumerate() {
-        row.values
-            .insert(header.clone(), record.get(index).map(str::to_owned));
+        let value = record.get(index).map(|value| {
+            if strip_bom && index == 0 {
+                value.strip_prefix('\u{FEFF}').unwrap_or(value).to_owned()
+            } else {
+                value.to_owned()
+            }
+        });
+        row.values.insert(header.clone(), value);
     }
     on_row(row);
 }
@@ -260,11 +268,15 @@ impl ImportAdapter for JsonAdapter {
         on_columns: &mut dyn FnMut(&[String]),
         on_row: &mut dyn FnMut(SourceRow),
     ) -> Result<(), ImportError> {
-        let mut deserializer = serde_json::Deserializer::from_reader(reader);
+        let mut tail = TailReader {
+            inner: reader,
+            last_non_whitespace: None,
+        };
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut tail);
         let mut columns: Vec<String> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut row_number = 0_u64;
-        loop {
+        let eof = loop {
             let visitor = JsonVisitor {
                 columns: &mut columns,
                 seen: &mut seen,
@@ -274,11 +286,41 @@ impl ImportAdapter for JsonAdapter {
             };
             match deserializer.deserialize_any(visitor) {
                 Ok(()) => {}
-                Err(error) if error.is_eof() => break,
+                Err(error) if error.is_eof() => break Some(error),
                 Err(error) => return Err(error.into()),
+            }
+        };
+        drop(deserializer);
+        if let Some(error) = eof {
+            // serde_json reports a clean end-of-stream and a value truncated
+            // at EOF with the same error category. A clean end after a
+            // complete top-level value ends in `}` or `]` (or only whitespace
+            // was present); anything else is a truncated document.
+            let clean = tail.last_non_whitespace.is_none()
+                || (error.to_string().contains("EOF while parsing a value")
+                    && matches!(tail.last_non_whitespace, Some(b'}') | Some(b']')));
+            if !clean {
+                return Err(error.into());
             }
         }
         Ok(())
+    }
+}
+
+struct TailReader<'a> {
+    inner: &'a mut dyn Read,
+    last_non_whitespace: Option<u8>,
+}
+
+impl Read for TailReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        for byte in &buffer[..read] {
+            if !byte.is_ascii_whitespace() {
+                self.last_non_whitespace = Some(*byte);
+            }
+        }
+        Ok(read)
     }
 }
 
@@ -420,7 +462,6 @@ impl JsonVisitor<'_> {
                 }
                 None => {
                     row.values.insert(column.clone(), None);
-                    row.issues.push(format!("missing value for {column}"));
                 }
             }
         }
@@ -679,6 +720,24 @@ pub fn apply(
     let mut failure: Option<ImportError> = None;
     adapter.read(reader, options, &mut |_| {}, &mut |row| {
         if failure.is_some() {
+            return;
+        }
+        if !row.issues.is_empty() {
+            summary.skipped += 1;
+            for issue in &row.issues {
+                if summary.issues.len() < max_issues {
+                    summary.issues.push(RowIssue {
+                        row_number: row.number,
+                        column: None,
+                        message: issue.clone(),
+                    });
+                }
+            }
+            if !options.skip_invalid {
+                failure = Some(ImportError::Validation {
+                    issues: summary.issues.clone(),
+                });
+            }
             return;
         }
         match convert_row(target, mapping, &row) {
