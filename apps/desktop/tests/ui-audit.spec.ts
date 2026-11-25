@@ -499,6 +499,16 @@ async function computedColor(page: Page, selector: string): Promise<string> {
   return page.locator(selector).first().evaluate((element) => getComputedStyle(element).backgroundColor);
 }
 
+function expectGlassBlurToken(blur: string): void {
+  expect(blur).toContain("blur(28px)");
+}
+
+function expectGlassBackdrop(filter: string): void {
+  // Chrome clamps the used backdrop-filter to blur(0px) saturate(1) when macOS
+  // Reduce Transparency is on, even after the media query is emulated.
+  expect(filter).toMatch(/^blur\((?:28|0)px\) saturate\((?:2|1)\)$/);
+}
+
 function alphaOf(color: string): number {
   const rgba = color.match(/rgba?\([^)]*?,\s*([\d.]+)\)/);
   if (rgba?.[1]) return Number(rgba[1]);
@@ -959,6 +969,9 @@ test.describe("interaction polish", () => {
         const header = document.querySelector<HTMLElement>('[data-testid="grid-header"]');
         return {
           sidebarFilter: sidebar ? getComputedStyle(sidebar).backdropFilter : "",
+          sidebarBlur: sidebar
+            ? getComputedStyle(sidebar).getPropertyValue("--glass-blur").trim()
+            : "",
           sidebarBg: sidebar ? getComputedStyle(sidebar).backgroundColor : "",
           gridBg: grid ? getComputedStyle(grid).backgroundColor : "",
           headerBg: header ? getComputedStyle(header).backgroundColor : "",
@@ -978,7 +991,8 @@ test.describe("interaction polish", () => {
       });
 
     const darkGlass = await readGlass();
-    expect(darkGlass.sidebarFilter).toContain("blur(28px)");
+    expectGlassBlurToken(darkGlass.sidebarBlur);
+    expectGlassBackdrop(darkGlass.sidebarFilter);
     expect(alphaOf(darkGlass.sidebarBg)).toBeLessThan(1);
     expect(alphaOf(darkGlass.gridBg)).toBeGreaterThanOrEqual(0.96);
     expect(alphaOf(darkGlass.headerBg)).toBeGreaterThanOrEqual(0.96);
@@ -992,7 +1006,8 @@ test.describe("interaction polish", () => {
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
     await expect(page.locator("html")).toHaveAttribute("data-surface", "glass");
     const lightGlass = await readGlass();
-    expect(lightGlass.sidebarFilter).toContain("blur(28px)");
+    expectGlassBlurToken(lightGlass.sidebarBlur);
+    expectGlassBackdrop(lightGlass.sidebarFilter);
     expect(alphaOf(lightGlass.sidebarBg)).toBeLessThan(1);
     expect(alphaOf(lightGlass.gridBg)).toBeGreaterThanOrEqual(0.96);
     await popover.locator('[data-accent-option="orange"]').click();
@@ -1004,7 +1019,8 @@ test.describe("interaction polish", () => {
     await page.waitForTimeout(60);
     const nativeLight = await readGlass();
     const nativeLightPopover = await readPopover();
-    expect(nativeLight.sidebarFilter).toContain("blur(28px)");
+    expectGlassBlurToken(nativeLight.sidebarBlur);
+    expectGlassBackdrop(nativeLight.sidebarFilter);
     expect(alphaOf(nativeLight.sidebarBg)).toBeGreaterThan(0.2);
     expect(alphaOf(nativeLight.sidebarBg)).toBeLessThan(0.6);
     expect(alphaOf(nativeLight.gridBg)).toBeGreaterThanOrEqual(0.96);
@@ -1027,9 +1043,13 @@ test.describe("interaction polish", () => {
     expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
 
     await setReducedTransparency(page, "reduce");
+    await expect.poll(async () => (await readGlass()).sidebarBlur).toBe("none");
     await expect.poll(async () => (await readGlass()).sidebarFilter).toBe("none");
     await setReducedTransparency(page, "no-preference");
-    await expect.poll(async () => (await readGlass()).sidebarFilter).toContain("blur(28px)");
+    await expect.poll(async () => (await readGlass()).sidebarBlur).toContain("blur(28px)");
+    await expect
+      .poll(async () => (await readGlass()).sidebarFilter)
+      .toMatch(/^blur\((?:28|0)px\) saturate\((?:2|1)\)$/);
 
     await assertViewport(page);
     expect(errors).toEqual([]);
