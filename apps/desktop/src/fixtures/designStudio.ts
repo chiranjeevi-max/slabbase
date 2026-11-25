@@ -1444,7 +1444,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_table",
     "summary": "Create table Clients",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 2,
@@ -1456,7 +1457,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_table",
     "summary": "Create table Projects",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 3,
@@ -1468,7 +1470,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_table",
     "summary": "Create table Invoices",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 4,
@@ -1480,7 +1483,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_table",
     "summary": "Create table Line Items",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 5,
@@ -1492,7 +1496,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_relation",
     "summary": "Create relation Client Projects",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 6,
@@ -1504,7 +1509,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_relation",
     "summary": "Create relation Project Invoices",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 7,
@@ -1516,7 +1522,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_relation",
     "summary": "Create relation Client Invoices",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 8,
@@ -1528,7 +1535,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "create_relation",
     "summary": "Create relation Invoice Lines",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 9,
@@ -1540,7 +1548,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "add_column",
     "summary": "Add Invoices.Subtotal",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 10,
@@ -1552,7 +1561,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "add_column",
     "summary": "Add Invoices.Tax",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 11,
@@ -1564,7 +1574,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "add_column",
     "summary": "Add Invoices.Total",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 12,
@@ -1576,7 +1587,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 1,
     "operation": "insert",
     "summary": "Insert Clients #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 13,
@@ -1588,7 +1600,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 2,
     "operation": "insert",
     "summary": "Insert Clients #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 14,
@@ -1600,7 +1613,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 3,
     "operation": "insert",
     "summary": "Insert Clients #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 15,
@@ -1612,7 +1626,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 1,
     "operation": "insert",
     "summary": "Insert Projects #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 16,
@@ -1624,7 +1639,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 2,
     "operation": "insert",
     "summary": "Insert Projects #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 17,
@@ -1636,7 +1652,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 3,
     "operation": "insert",
     "summary": "Insert Projects #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 18,
@@ -1648,7 +1665,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 4,
     "operation": "insert",
     "summary": "Insert Projects #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 19,
@@ -1660,7 +1678,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 1,
     "operation": "insert",
     "summary": "Insert Invoices #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 20,
@@ -1672,7 +1691,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 2,
     "operation": "insert",
     "summary": "Insert Invoices #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 21,
@@ -1684,7 +1704,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 3,
     "operation": "insert",
     "summary": "Insert Invoices #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 22,
@@ -1696,7 +1717,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 4,
     "operation": "insert",
     "summary": "Insert Invoices #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 23,
@@ -1708,7 +1730,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 1,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 24,
@@ -1720,7 +1743,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 2,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 25,
@@ -1732,7 +1756,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 3,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 26,
@@ -1744,7 +1769,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 4,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 27,
@@ -1756,7 +1782,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 5,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 28,
@@ -1768,7 +1795,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 6,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 29,
@@ -1780,7 +1808,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 7,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 30,
@@ -1792,7 +1821,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 8,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 31,
@@ -1804,7 +1834,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 9,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 32,
@@ -1816,7 +1847,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": 10,
     "operation": "insert",
     "summary": "Insert Line Items #0",
-    "schema_change": false
+    "schema_change": false,
+    "entry_hash": null
   },
   {
     "id": 33,
@@ -1828,7 +1860,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "save_layout",
     "summary": "Save form Client Record",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 34,
@@ -1840,7 +1873,8 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "save_layout",
     "summary": "Save form Project Record",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   },
   {
     "id": 35,
@@ -1852,6 +1886,7 @@ export const DESIGN_STUDIO_AUDIT: AuditEntry[] = [
     "row_id": null,
     "operation": "save_layout",
     "summary": "Save form Invoice",
-    "schema_change": true
+    "schema_change": true,
+    "entry_hash": null
   }
 ];

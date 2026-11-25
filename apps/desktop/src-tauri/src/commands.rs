@@ -10,9 +10,9 @@ use std::io::{BufReader, BufWriter, Write};
 use std::sync::Arc;
 
 use slab_core::{
-    AuditEntry, Column, ColumnDraft, GridSpec, IndexSpec, Layout, LayoutItem, LayoutItemKind, Page,
-    PageQuery, PortalPage, PortalQuery, Record, RecordBundle, Relation, RelationDraft, RowData,
-    RowId, Schema, SearchHit, Table, TableDraft, UndoState,
+    AuditEntry, Column, ColumnDraft, GridSpec, IndexSpec, Layout, LayoutItem, LayoutItemKind,
+    PageFrame, PageQuery, PortalFrame, PortalQuery, Record, RecordBundle, RecordRevision, Relation,
+    RelationDraft, RowData, RowId, Schema, SearchHit, Table, TableDraft, UndoState,
 };
 use slab_import::{CsvAdapter, ImportAdapter, ImportError, ImportSink, JsonAdapter};
 use slab_storage::Workspace;
@@ -254,16 +254,63 @@ pub async fn toggle_index(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn page_rows(state: State<'_, AppState>, query: PageQuery) -> Result<Page, ApiError> {
-    run_db(&state, move |workspace| Ok(workspace.page(&query)?)).await
+pub async fn create_index(
+    state: State<'_, AppState>,
+    table: String,
+    column: String,
+) -> Result<IndexSpec, ApiError> {
+    run_db(&state, move |workspace| {
+        Ok(workspace.create_index(&table, &column)?)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn cancel_search(state: State<'_, AppState>) -> bool {
+    state.db.cancel_query()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn page_rows(
+    state: State<'_, AppState>,
+    query: PageQuery,
+) -> Result<PageFrame, ApiError> {
+    run_db(&state, move |workspace| {
+        let schema = workspace.schema()?;
+        let table = schema
+            .table(&query.table)
+            .ok_or_else(|| ApiError::new("SLAB_E_NOT_FOUND", "table is missing"))?;
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        Ok(workspace.page(&query)?.into_frame(columns))
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn page_portal(
     state: State<'_, AppState>,
     query: PortalQuery,
-) -> Result<PortalPage, ApiError> {
-    run_db(&state, move |workspace| Ok(workspace.page_portal(&query)?)).await
+) -> Result<PortalFrame, ApiError> {
+    run_db(&state, move |workspace| {
+        let schema = workspace.schema()?;
+        let relation = schema
+            .relation(&query.relation)
+            .ok_or_else(|| ApiError::new("SLAB_E_NOT_FOUND", "relation is missing"))?;
+        let table = schema
+            .table(&relation.child_table)
+            .ok_or_else(|| ApiError::new("SLAB_E_NOT_FOUND", "child table is missing"))?;
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        Ok(workspace.page_portal(&query)?.into_frame(columns))
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -366,9 +413,34 @@ pub async fn audit_entries(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn record_history(
+    state: State<'_, AppState>,
+    table: String,
+    row_id: RowId,
+) -> Result<Vec<RecordRevision>, ApiError> {
+    run_db(&state, move |workspace| {
+        Ok(workspace.record_history(&table, row_id)?)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn restore_record_revision(
+    state: State<'_, AppState>,
+    table: String,
+    row_id: RowId,
+    audit_id: i64,
+) -> Result<Record, ApiError> {
+    run_db(&state, move |workspace| {
+        Ok(workspace.restore_record_revision(&table, row_id, audit_id)?)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn backup_workspace(state: State<'_, AppState>, path: String) -> Result<(), ApiError> {
     run_db(&state, move |workspace| {
-        workspace.backup_to(&path)?;
+        workspace.snapshot_to(&path)?;
         Ok(())
     })
     .await

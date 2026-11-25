@@ -11,13 +11,14 @@ import type {
   IndexSpec,
   IntegrityReportDto,
   Layout,
-  Page,
-  PortalPage,
+  PageFrame,
+  PortalFrame,
   PortalQuery,
   PageQuery,
   PrintOptionsDto,
   Record as SlabRecord,
   RecordBundle,
+  RecordRevision,
   Relation,
   RelationDraft,
   Schema,
@@ -44,6 +45,11 @@ export class SlabError extends Error {
     this.name = "SlabError";
     this.code = code;
   }
+}
+
+/** True when a superseded interactive query was interrupted. */
+export function isCancelledError(error: unknown): boolean {
+  return error instanceof SlabError && error.code === "SLAB_E_CANCELLED";
 }
 
 function isApiError(value: unknown): value is ApiErrorShape {
@@ -98,6 +104,17 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 
 export type RowValues = Record<string, Value>;
 
+/** Expands a positional page frame into named records for the grid. */
+export function frameRecords(frame: PageFrame | PortalFrame): SlabRecord[] {
+  return frame.rows.map((row) => {
+    const values: RowValues = {};
+    frame.columns.forEach((column, index) => {
+      values[column] = row.values[index] ?? "Null";
+    });
+    return { id: row.id, values };
+  });
+}
+
 export const api = {
   openWorkspace: (path: string) =>
     call<WorkspaceInfoDto>("open_workspace", { path }),
@@ -132,12 +149,15 @@ export const api = {
     call<IndexSpec[]>("list_indexes", { table }),
   toggleIndex: (table: string, column: string, enabled: boolean) =>
     call<IndexSpec[]>("toggle_index", { table, column, enabled }),
+  createIndex: (table: string, column: string) =>
+    call<IndexSpec>("create_index", { table, column }),
+  cancelSearch: () => call<boolean>("cancel_search"),
   saveLayout: (layout: Layout) => call<Layout>("save_layout", { layout }),
   deleteLayout: (id: string) => call<void>("delete_layout", { id }),
 
-  pageRows: (query: PageQuery) => call<Page>("page_rows", { query }),
+  pageRows: (query: PageQuery) => call<PageFrame>("page_rows", { query }),
   pagePortal: (query: PortalQuery) =>
-    call<PortalPage>("page_portal", { query }),
+    call<PortalFrame>("page_portal", { query }),
   readRecord: (table: string, id: number) =>
     call<SlabRecord>("read_record", { table, id }),
   readBundle: (table: string, id: number, portalLimit = 500) =>
@@ -160,6 +180,14 @@ export const api = {
     call<SearchHit[]>("search", { term, limit }),
   auditEntries: (limit = 100, offset = 0) =>
     call<AuditEntry[]>("audit_entries", { limit, offset }),
+  recordHistory: (table: string, id: number) =>
+    call<RecordRevision[]>("record_history", { table, row_id: id }),
+  restoreRecordRevision: (table: string, id: number, auditId: number) =>
+    call<SlabRecord>("restore_record_revision", {
+      table,
+      row_id: id,
+      audit_id: auditId,
+    }),
 
   backup: (path: string) => call<void>("backup_workspace", { path }),
   integrityCheck: () => call<IntegrityReportDto>("integrity_check"),

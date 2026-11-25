@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, SlabError, type RowValues } from "./api";
+import { api, frameRecords, isCancelledError, SlabError, type RowValues } from "./api";
 import {
   applyAppearance,
   initialAppearance,
@@ -13,12 +13,14 @@ import type {
   AuditEntry,
   ColumnDraft,
   Filter,
+  IndexHint,
   IndexSpec,
   IntegrityReportDto,
   Layout,
   PageQuery,
   Record as SlabRecord,
   RecordBundle,
+  RecordRevision,
   RelationDraft,
   Schema,
   SortSpec,
@@ -119,11 +121,15 @@ export interface AppStore {
   filters: Filter[];
   filterColumn: string;
   filterText: string;
+  indexHint: IndexHint | null;
 
   selectedId: number | null;
   bundle: RecordBundle | null;
   creating: boolean;
   undoState: UndoState;
+  historyOpen: boolean;
+  recordHistory: RecordRevision[];
+  historyLoading: boolean;
 
   paletteOpen: boolean;
   schemaOpen: boolean;
@@ -162,6 +168,12 @@ export interface AppStore {
   clearFilter: () => Promise<void>;
   loadFirstPage: () => Promise<void>;
   loadMore: () => Promise<void>;
+
+  applyIndexHint: () => Promise<void>;
+  dismissIndexHint: () => void;
+  openHistory: () => Promise<void>;
+  closeHistory: () => void;
+  restoreRevision: (auditId: number) => Promise<boolean>;
 
   selectRow: (id: number) => Promise<void>;
   updatePortalRow: (
@@ -269,15 +281,17 @@ export const useStore = create<AppStore>((set, get) => {
       const page = await api.pageRows(query);
       if (token !== pageRequest) return;
       set({
-        rows: page.rows,
+        rows: frameRecords(page),
         nextCursor: page.next_cursor,
         hasMore: page.next_cursor !== null,
         elapsedMs: page.elapsed_ms,
+        indexHint: page.index_hint,
         loadingRows: false,
       });
     } catch (error) {
       if (token !== pageRequest) return;
       set({ loadingRows: false });
+      if (isCancelledError(error)) return;
       notifyError(error);
     }
   };
@@ -306,11 +320,15 @@ export const useStore = create<AppStore>((set, get) => {
     filters: [],
     filterColumn: "id",
     filterText: "",
+    indexHint: null,
 
     selectedId: null,
     bundle: null,
     creating: false,
     undoState: EMPTY_UNDO,
+    historyOpen: false,
+    recordHistory: [],
+    historyLoading: false,
 
     paletteOpen: false,
     schemaOpen: false,
@@ -445,9 +463,12 @@ export const useStore = create<AppStore>((set, get) => {
         sort: [],
         filters: [],
         filterText: "",
+        indexHint: null,
         filterColumn: definition?.columns[0]?.name ?? "id",
         view: "table",
         inspectorOpen: false,
+        historyOpen: false,
+        recordHistory: [],
       });
       await loadFirstPage();
     },
@@ -478,6 +499,7 @@ export const useStore = create<AppStore>((set, get) => {
         current?.column === column
           ? [{ column, direction: current.direction === "asc" ? "desc" : "asc" }]
           : [{ column, direction: "asc" }];
+      void api.cancelSearch().catch(() => undefined);
       set({ sort });
       await get().loadFirstPage();
     },
@@ -496,6 +518,7 @@ export const useStore = create<AppStore>((set, get) => {
           ]
         : [];
       set({ filters, filterText: text });
+      void api.cancelSearch().catch(() => undefined);
       await get().loadFirstPage();
     },
 
@@ -505,6 +528,64 @@ export const useStore = create<AppStore>((set, get) => {
     },
 
     loadFirstPage,
+
+    applyIndexHint: async () => {
+      const state = get();
+      const hint = state.indexHint;
+      if (!hint) return;
+      try {
+        await api.createIndex(hint.table, hint.column);
+        set({ indexHint: null });
+        await get().loadFirstPage();
+        notify("success", `Index created on ${hint.column}`);
+      } catch (error) {
+        notifyError(error);
+      }
+    },
+
+    dismissIndexHint: () => set({ indexHint: null }),
+
+    openHistory: async () => {
+      const state = get();
+      if (!state.activeTable || state.selectedId === null) return;
+      set({ historyOpen: true, historyLoading: true });
+      try {
+        const recordHistory = await api.recordHistory(
+          state.activeTable,
+          state.selectedId,
+        );
+        set({ recordHistory, historyLoading: false });
+      } catch (error) {
+        set({ historyLoading: false });
+        notifyError(error);
+      }
+    },
+
+    closeHistory: () => set({ historyOpen: false, recordHistory: [] }),
+
+    restoreRevision: async (auditId) => {
+      const state = get();
+      if (!state.activeTable || state.selectedId === null) return false;
+      try {
+        await api.restoreRecordRevision(
+          state.activeTable,
+          state.selectedId,
+          auditId,
+        );
+        const [undoState, recordHistory] = await Promise.all([
+          api.undoState(),
+          api.recordHistory(state.activeTable, state.selectedId),
+        ]);
+        set({ undoState, recordHistory });
+        await get().loadFirstPage();
+        await get().refreshBundle();
+        notify("success", "Revision restored");
+        return true;
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    },
 
     loadMore: async () => {
       const state = get();
@@ -524,18 +605,20 @@ export const useStore = create<AppStore>((set, get) => {
         if (token !== pageRequest) return;
         set((current) => {
           const seen = new Set(current.rows.map((row) => row.id));
-          const appended = page.rows.filter((row) => !seen.has(row.id));
+          const appended = frameRecords(page).filter((row) => !seen.has(row.id));
           return {
             rows: [...current.rows, ...appended],
             nextCursor: page.next_cursor,
             hasMore: page.next_cursor !== null,
             loadingRows: false,
             elapsedMs: page.elapsed_ms,
+            indexHint: page.index_hint ?? current.indexHint,
           };
         });
       } catch (error) {
         if (token !== pageRequest) return;
         set({ loadingRows: false });
+        if (isCancelledError(error)) return;
         notifyError(error);
       }
     },
@@ -543,12 +626,18 @@ export const useStore = create<AppStore>((set, get) => {
     selectRow: async (id) => {
       const state = get();
       if (!state.activeTable) return;
-      set({ selectedId: id, creating: false, inspectorOpen: true });
+      set({
+        selectedId: id,
+        creating: false,
+        inspectorOpen: true,
+        historyOpen: false,
+        recordHistory: [],
+      });
       try {
         const record = await api.readRecord(state.activeTable, id);
         set({ bundle: { record, portals: {} } });
       } catch (error) {
-        notifyError(error);
+        if (!isCancelledError(error)) notifyError(error);
       }
     },
 
@@ -559,7 +648,14 @@ export const useStore = create<AppStore>((set, get) => {
       await get().selectRow(id);
     },
 
-    closeRecord: () => set({ selectedId: null, bundle: null, inspectorOpen: false }),
+    closeRecord: () =>
+      set({
+        selectedId: null,
+        bundle: null,
+        inspectorOpen: false,
+        historyOpen: false,
+        recordHistory: [],
+      }),
 
     refreshBundle: async () => {
       const state = get();
@@ -568,7 +664,7 @@ export const useStore = create<AppStore>((set, get) => {
         const record = await api.readRecord(state.activeTable, state.selectedId);
         set({ bundle: { record, portals: {} } });
       } catch (error) {
-        notifyError(error);
+        if (!isCancelledError(error)) notifyError(error);
       }
     },
 
@@ -844,17 +940,20 @@ export const useStore = create<AppStore>((set, get) => {
     checkIntegrity: async () => {
       try {
         const report = await api.integrityCheck();
+        const healthy =
+          report.integrity === "ok" &&
+          report.foreignKeyViolations === 0 &&
+          report.auditChain;
         set({
-          integrity:
-            report.integrity === "ok" && report.foreignKeyViolations === 0
-              ? "ok"
-              : "check",
+          integrity: healthy ? "ok" : "check",
           integrityReport: report,
           integrityCheckedAt: Date.now(),
         });
         notify(
-          report.integrity === "ok" && report.foreignKeyViolations === 0 ? "success" : "error",
-          `SQLite integrity: ${report.integrity}; foreign key violations: ${report.foreignKeyViolations}`,
+          healthy ? "success" : "error",
+          report.auditTamper
+            ? `Audit chain: ${report.auditTamper}`
+            : `SQLite integrity: ${report.integrity}; foreign keys: ${report.foreignKeyViolations}; audit entries: ${report.auditEntries}`,
         );
       } catch (error) {
         notifyError(error);

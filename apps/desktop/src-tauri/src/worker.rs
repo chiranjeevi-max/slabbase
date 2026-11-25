@@ -1,12 +1,13 @@
 //! A worker thread that exclusively owns the SQLite workspace.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use slab_storage::Workspace;
+use slab_storage::{QueryCancel, Workspace};
 use slab_sync::HybridLogicalClock;
 
 use crate::dto::WorkspaceInfoDto;
@@ -24,6 +25,7 @@ struct Job {
 pub struct DbHandle {
     sender: Mutex<Option<Sender<Job>>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    cancel: Arc<QueryCancel>,
 }
 
 impl DbHandle {
@@ -42,14 +44,23 @@ impl DbHandle {
         Ok(Self {
             sender: Mutex::new(Some(sender)),
             join: Mutex::new(Some(join)),
+            cancel: Arc::new(QueryCancel::new()),
         })
+    }
+
+    /// Interrupts a superseded interactive query without queueing work.
+    pub fn cancel_query(&self) -> bool {
+        self.cancel.interrupt()
     }
 
     /// Opens a workspace, replacing any current one.
     pub fn open(&self, path: String) -> Result<WorkspaceInfoDto, ApiError> {
+        let cancel = Arc::clone(&self.cancel);
         self.submit(move |slot| {
-            let workspace = Workspace::open(&path, Box::new(HybridLogicalClock::new("desktop")))
-                .map_err(ApiError::from)?;
+            let mut workspace =
+                Workspace::open(&path, Box::new(HybridLogicalClock::new("desktop")))
+                    .map_err(ApiError::from)?;
+            workspace.set_cancel_handle(Arc::clone(&cancel));
             let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
             close_slot(slot)?;
             *slot = Some(workspace);
@@ -59,11 +70,13 @@ impl DbHandle {
 
     /// Creates a workspace, replacing any current one.
     pub fn create(&self, path: String, name: String) -> Result<WorkspaceInfoDto, ApiError> {
+        let cancel = Arc::clone(&self.cancel);
         self.submit(move |slot| {
             close_slot(slot)?;
-            let workspace =
+            let mut workspace =
                 Workspace::create(&path, &name, Box::new(HybridLogicalClock::new("desktop")))
                     .map_err(ApiError::from)?;
+            workspace.set_cancel_handle(cancel);
             let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
             *slot = Some(workspace);
             Ok(info)

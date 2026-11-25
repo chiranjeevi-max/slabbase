@@ -821,6 +821,9 @@ function Statusbar() {
   const report = useStore((state) => state.integrityReport);
   const checkedAt = useStore((state) => state.integrityCheckedAt);
   const checkIntegrity = useStore((state) => state.checkIntegrity);
+  const indexHint = useStore((state) => state.indexHint);
+  const applyIndexHint = useStore((state) => state.applyIndexHint);
+  const dismissIndexHint = useStore((state) => state.dismissIndexHint);
 
   const [detailsOpen, setDetailsOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
@@ -891,6 +894,27 @@ function Statusbar() {
         )}
       </div>
       <div className="status-right">
+        {indexHint && (
+          <div className="index-hint" data-testid="index-hint">
+            <button
+              type="button"
+              className="index-hint-action"
+              title={`Create index ${indexHint.suggestedIndex}`}
+              onClick={() => void applyIndexHint()}
+            >
+              Full scan ({Math.round(indexHint.elapsedMs)} ms) · Index &quot;
+              {indexHint.column}&quot;
+            </button>
+            <button
+              type="button"
+              className="index-hint-dismiss"
+              aria-label="Dismiss index suggestion"
+              onClick={dismissIndexHint}
+            >
+              <Icon name="x" size={10} strokeWidth={1.6} />
+            </button>
+          </div>
+        )}
         <div className="status-anchor" ref={anchorRef}>
           <button
             type="button"
@@ -932,6 +956,16 @@ function Statusbar() {
                 <div>
                   <dt>Pages</dt>
                   <dd>{report ? report.pageCount.toLocaleString() : "…"}</dd>
+                </div>
+                <div>
+                  <dt>Audit chain</dt>
+                  <dd>
+                    {report
+                      ? report.auditChain
+                        ? `${report.auditEntries.toLocaleString()} entries`
+                        : (report.auditTamper ?? "broken")
+                      : "Not run"}
+                  </dd>
                 </div>
                 <div>
                   <dt>Journal</dt>

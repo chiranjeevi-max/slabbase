@@ -6,6 +6,7 @@ import {
   isLongField,
   isMultilineField,
   recordTitle,
+  valueText,
 } from "../types";
 import { confirmDestructive } from "../native";
 import { FieldInput } from "./FieldInput";
@@ -26,6 +27,12 @@ export function RecordPanel({
   const bundle = useStore((state) => state.bundle);
   const creating = useStore((state) => state.creating);
   const activeLayoutId = useStore((state) => state.activeLayoutId);
+  const historyOpen = useStore((state) => state.historyOpen);
+  const recordHistory = useStore((state) => state.recordHistory);
+  const historyLoading = useStore((state) => state.historyLoading);
+  const openHistory = useStore((state) => state.openHistory);
+  const closeHistory = useStore((state) => state.closeHistory);
+  const restoreRevision = useStore((state) => state.restoreRevision);
   const [pulse, setPulse] = useState<string | null>(null);
   const panelStyle = { "--inspector-w": `${width}px` } as CSSProperties;
 
@@ -118,6 +125,20 @@ export function RecordPanel({
         <div className="record-header-actions">
           <button
             type="button"
+            className={`icon-control ${historyOpen ? "active" : ""}`}
+            title="Revision history"
+            aria-label="Revision history"
+            aria-expanded={historyOpen}
+            data-testid="record-history-toggle"
+            onClick={() => {
+              if (historyOpen) closeHistory();
+              else void openHistory();
+            }}
+          >
+            <Icon name="history" size={14} strokeWidth={1.5} />
+          </button>
+          <button
+            type="button"
             className="icon-control danger"
             title="Delete record"
             aria-label="Delete record"
@@ -145,6 +166,68 @@ export function RecordPanel({
           </button>
         </div>
       </header>
+
+      {historyOpen && (
+        <section
+          className="record-history"
+          data-testid="record-history"
+          aria-label="Revision history"
+        >
+          <div className="record-history-head">
+            <span className="eyebrow">History</span>
+            <button
+              type="button"
+              className="icon-control tiny"
+              aria-label="Close revision history"
+              onClick={closeHistory}
+            >
+              <Icon name="x" size={11} />
+            </button>
+          </div>
+          {historyLoading ? (
+            <p className="inspector-hint">Loading revisions…</p>
+          ) : recordHistory.length === 0 ? (
+            <p className="inspector-hint">No revisions recorded yet.</p>
+          ) : (
+            <ol className="revision-list">
+              {[...recordHistory].reverse().map((revision) => (
+                <li className="revision" key={revision.auditId}>
+                  <div className="revision-head">
+                    <span className="revision-operation">{revision.operation}</span>
+                    <span className="revision-time">
+                      {new Date(revision.timestampMs).toLocaleString()}
+                    </span>
+                  </div>
+                  <p className="revision-summary">{revision.summary}</p>
+                  <div className="revision-diffs">
+                    {revision.diffs.map((diff) => (
+                      <div className="revision-diff" key={diff.column}>
+                        <span className="revision-column">{diff.column}</span>
+                        <span className="revision-value before">
+                          {valueText(diff.before) || "—"}
+                        </span>
+                        <span className="revision-arrow" aria-hidden="true">
+                          →
+                        </span>
+                        <span className="revision-value after">
+                          {valueText(diff.after) || "—"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    className="button compact revision-restore"
+                    onClick={() => void restoreRevision(revision.auditId)}
+                  >
+                    Restore
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      )}
 
       <div className="record-scroll">
         <div className={`record-form ${narrow ? "narrow" : ""}`}>

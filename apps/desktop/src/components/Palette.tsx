@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { SearchHit } from "../bindings";
-import { api } from "../api";
+import { api, isCancelledError } from "../api";
 import { useFocusTrap } from "../focus";
 import { usePresence } from "../presence";
 import { errorText, useStore } from "../store";
@@ -41,13 +41,16 @@ export function Palette() {
     }
     let cancelled = false;
     const timer = window.setTimeout(() => {
+      void api.cancelSearch().catch(() => undefined);
       api
         .search(term, 8)
         .then((results) => {
           if (!cancelled) setHits(results);
         })
         .catch((error) => {
-          if (!cancelled) notify("error", errorText(error));
+          if (cancelled) return;
+          if (isCancelledError(error)) return;
+          notify("error", errorText(error));
         });
     }, 140);
     return () => {

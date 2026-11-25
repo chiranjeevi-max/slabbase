@@ -19,4 +19,16 @@ journalMode: string,
 /**
  * Page count.
  */
-pageCount: number, };
+pageCount: number, 
+/**
+ * True when the BLAKE3 audit chain is continuous.
+ */
+auditChain: boolean, 
+/**
+ * Number of audit entries verified.
+ */
+auditEntries: number, 
+/**
+ * Explicit diagnostic when the chain was altered outside SlabBase.
+ */
+auditTamper: string | null, };

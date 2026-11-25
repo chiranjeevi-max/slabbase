@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Column, Cursor, Record as SlabRecord, Value } from "../bindings";
 import { DENSITY_ROW_HEIGHT } from "../appearance";
-import { api } from "../api";
+import { api, frameRecords, isCancelledError } from "../api";
 import { useStore } from "../store";
 import { columnTypeGlyph, isComputedColumn } from "../types";
 import { confirmDestructive } from "../native";
@@ -63,13 +63,14 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
       })
       .then((page) => {
         if (requestRef.current !== token) return;
-        setRows(page.rows);
+        setRows(frameRecords(page));
         setCursor(page.next_cursor);
         setTotal(page.total_rows);
         setHasMore(page.next_cursor !== null);
       })
       .catch((reason: unknown) => {
         if (requestRef.current !== token) return;
+        if (isCancelledError(reason)) return;
         setError(reason instanceof Error ? reason.message : "Could not load child rows");
         useStore.getState().notify("error", errorText(reason));
       })
@@ -95,7 +96,10 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
         if (requestRef.current !== token) return;
         setRows((current) => {
           const seen = new Set(current.map((row) => row.id));
-          return [...current, ...page.rows.filter((row) => !seen.has(row.id))];
+          return [
+            ...current,
+            ...frameRecords(page).filter((row) => !seen.has(row.id)),
+          ];
         });
         setCursor(page.next_cursor);
         setTotal(page.total_rows);
@@ -103,7 +107,7 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
       })
       .catch((reason: unknown) => {
         if (requestRef.current !== token) return;
-        useStore.getState().notify("error", errorText(reason));
+        if (!isCancelledError(reason)) useStore.getState().notify("error", errorText(reason));
       })
       .finally(() => {
         if (requestRef.current === token) setLoading(false);
@@ -124,14 +128,14 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
       })
       .then((page) => {
         if (requestRef.current !== token) return;
-        setRows(page.rows);
+        setRows(frameRecords(page));
         setCursor(page.next_cursor);
         setTotal(page.total_rows);
         setHasMore(page.next_cursor !== null);
       })
       .catch((reason: unknown) => {
         if (requestRef.current !== token) return;
-        useStore.getState().notify("error", errorText(reason));
+        if (!isCancelledError(reason)) useStore.getState().notify("error", errorText(reason));
       })
       .finally(() => {
         if (requestRef.current === token) setLoading(false);

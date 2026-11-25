@@ -68,6 +68,12 @@ pub struct IntegrityReportDto {
     pub journal_mode: String,
     /// Page count.
     pub page_count: u64,
+    /// True when the BLAKE3 audit chain is continuous.
+    pub audit_chain: bool,
+    /// Number of audit entries verified.
+    pub audit_entries: u64,
+    /// Explicit diagnostic when the chain was altered outside SlabBase.
+    pub audit_tamper: Option<String>,
 }
 
 impl From<IntegrityReport> for IntegrityReportDto {
@@ -77,6 +83,9 @@ impl From<IntegrityReport> for IntegrityReportDto {
             foreign_key_violations: report.foreign_key_violations,
             journal_mode: report.journal_mode,
             page_count: report.page_count,
+            audit_chain: report.audit_chain,
+            audit_entries: report.audit_entries,
+            audit_tamper: report.audit_tamper,
         }
     }
 }

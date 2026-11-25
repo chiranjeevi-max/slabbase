@@ -1,13 +1,16 @@
 import type {
   AuditEntry,
   Column,
+  IndexHint,
   IntegrityReportDto,
   Layout,
-  Page,
+  PageFrame,
   PageQuery,
+  PortalFrame,
   PortalQuery,
   Record as SlabRecord,
   RecordBundle,
+  RecordRevision,
   Relation,
   RelationDraft,
   Schema,
@@ -31,6 +34,7 @@ interface FixtureSnapshot {
   schema: Schema;
   rows: Record<string, SlabRecord[]>;
   layouts: Layout[];
+  indexed: string[];
 }
 
 interface FixtureState {
@@ -43,6 +47,7 @@ interface FixtureState {
   undo: UndoState;
   history: FixtureSnapshot[];
   future: FixtureSnapshot[];
+  indexed: string[];
 }
 
 const EMPTY_INFO: WorkspaceInfoDto = {
@@ -89,6 +94,7 @@ function initialState(mode: FixtureMode): FixtureState {
     },
     history: [],
     future: [],
+    indexed: [],
   };
 }
 
@@ -211,6 +217,7 @@ function stressState(): FixtureState {
     },
     history: [],
     future: [],
+    indexed: [],
   };
 }
 
@@ -219,6 +226,7 @@ function snapshot(state: FixtureState): FixtureSnapshot {
     schema: state.schema,
     rows: state.rows,
     layouts: state.layouts,
+    indexed: state.indexed,
   });
 }
 
@@ -239,6 +247,7 @@ function restore(state: FixtureState, snap: FixtureSnapshot): void {
   state.schema = snap.schema;
   state.rows = snap.rows;
   state.layouts = snap.layouts;
+  state.indexed = snap.indexed;
   state.schema.layouts = snap.layouts;
 }
 
@@ -305,12 +314,69 @@ function filterRows(rows: SlabRecord[], query: PageQuery): SlabRecord[] {
   return next;
 }
 
-function pageOf(rows: SlabRecord[], limit: number): Page {
+function indexHintFor(
+  state: FixtureState,
+  table: string,
+  sort: SortSpec[],
+  filters: PageQuery["filters"],
+): IndexHint | null {
+  if (state.mode !== "stress") return null;
+  const column = sort[0]?.column ?? filters[0]?.column;
+  if (!column || column === "id") return null;
+  if (state.indexed.includes(`${table}:${column}`)) return null;
   return {
-    rows: rows.slice(0, limit),
+    table,
+    column,
+    suggestedIndex: `slab_idx_${table}_${column}`.replaceAll(" ", "_"),
+    elapsedMs: 38.2,
+    scannedRows: tableRows(state, table).length,
+    detail: `SCAN ${table}`,
+  };
+}
+
+function pageOf(
+  state: FixtureState,
+  table: string,
+  rows: SlabRecord[],
+  query: PageQuery,
+): PageFrame {
+  const definition = state.schema.tables.find((candidate) => candidate.name === table);
+  const columns =
+    definition?.columns.map((column) => column.name) ??
+    Object.keys(rows[0]?.values ?? {});
+  return {
+    columns,
+    rows: rows.slice(0, query.limit).map((row) => ({
+      id: row.id,
+      values: columns.map((column) => row.values[column] ?? "Null"),
+    })),
     next_cursor: null,
     elapsed_ms: 0.8,
     total_rows: rows.length,
+    index_hint: indexHintFor(state, table, query.sort, query.filters),
+  };
+}
+
+function portalFrameOf(
+  state: FixtureState,
+  relation: Relation,
+  rows: SlabRecord[],
+  limit: number,
+): PortalFrame {
+  const definition = state.schema.tables.find(
+    (candidate) => candidate.name === relation.child_table,
+  );
+  const columns = definition?.columns.map((column) => column.name) ?? [];
+  return {
+    columns,
+    rows: rows.slice(0, limit).map((row) => ({
+      id: row.id,
+      values: columns.map((column) => row.values[column] ?? "Null"),
+    })),
+    next_cursor: null,
+    total_rows: rows.length,
+    elapsed_ms: 0.5,
+    index_hint: null,
   };
 }
 
@@ -413,7 +479,7 @@ export async function fixtureCall<T>(
     case "page_rows": {
       const query = payload["query"] as PageQuery;
       const rows = filterRows(sortRows(tableRows(state, query.table), query.sort), query);
-      return pageOf(rows, query.limit) as T;
+      return pageOf(state, query.table, rows, query) as T;
     }
     case "read_record": {
       const table = String(payload["table"]);
@@ -435,14 +501,18 @@ export async function fixtureCall<T>(
     case "page_portal": {
       const query = payload["query"] as PortalQuery;
       const relation = relationByName(state, query.relation);
-      if (!relation) return { rows: [], next_cursor: null, total_rows: 0, elapsed_ms: 0 } as T;
+      if (!relation) {
+        return {
+          columns: [],
+          rows: [],
+          next_cursor: null,
+          total_rows: 0,
+          elapsed_ms: 0,
+          index_hint: null,
+        } satisfies PortalFrame as T;
+      }
       const rows = childRows(state, relation, query.parent_id);
-      return {
-        rows: rows.slice(0, query.limit),
-        next_cursor: null,
-        total_rows: rows.length,
-        elapsed_ms: 0.5,
-      } as T;
+      return portalFrameOf(state, relation, rows, query.limit) as T;
     }
     case "search": {
       const term = String(payload["term"] ?? "");
@@ -451,12 +521,43 @@ export async function fixtureCall<T>(
     }
     case "audit_entries":
       return state.audit as T;
+    case "record_history": {
+      const table = String(payload["table"]);
+      const rowId = Number(payload["row_id"]);
+      const record = findRecord(state, table, rowId);
+      const revisions: RecordRevision[] = Object.entries(record.values)
+        .slice(0, 3)
+        .map(([column, value], index) => ({
+          auditId: index + 1,
+          timestampMs: Date.now() - (index + 1) * 86_400_000,
+          hlc: `000179555907591${index}-000000-fixture`,
+          actor: "local",
+          operation: index === 0 ? "insert" : "update",
+          summary: index === 0 ? `Insert ${table} row` : `Update ${column}`,
+          diffs: [
+            {
+              column,
+              before: index === 0 ? null : "Null",
+              after: value,
+            },
+          ],
+        }));
+      return revisions as T;
+    }
+    case "restore_record_revision": {
+      const table = String(payload["table"]);
+      const rowId = Number(payload["row_id"]);
+      return findRecord(state, table, rowId) as T;
+    }
     case "integrity_check":
       return {
         integrity: "ok",
         foreignKeyViolations: 0,
         journalMode: "wal",
         pageCount: 42,
+        auditChain: true,
+        auditEntries: state.audit.length,
+        auditTamper: null,
       } satisfies IntegrityReportDto as T;
     case "update_row": {
       const table = String(payload["table"]);
@@ -744,8 +845,30 @@ export async function fixtureCall<T>(
     }
     case "list_indexes":
       return [] as T;
-    case "toggle_index":
+    case "create_index": {
+      const table = String(payload["table"]);
+      const column = String(payload["column"]);
+      state.indexed.push(`${table}:${column}`);
+      return {
+        name: `slab_idx_${table}_${column}`.replaceAll(" ", "_"),
+        table,
+        columns: [column],
+        unique: false,
+      } as T;
+    }
+    case "toggle_index": {
+      const table = String(payload["table"]);
+      const column = String(payload["column"]);
+      const key = `${table}:${column}`;
+      if (payload["enabled"] === false) {
+        state.indexed = state.indexed.filter((candidate) => candidate !== key);
+      } else if (!state.indexed.includes(key)) {
+        state.indexed.push(key);
+      }
       return [] as T;
+    }
+    case "cancel_search":
+      return false as T;
     case "load_sample":
     case "open_workspace":
     case "create_workspace":
