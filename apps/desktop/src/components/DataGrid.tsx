@@ -284,7 +284,7 @@ export function DataGrid() {
         data-testid="grid-scroll"
         tabIndex={0}
         onFocus={() => {
-          if (!active && rows.length > 0) {
+          if (!active && rows.length > 0 && !useStore.getState().creating) {
             setActive({ row: 0, column: 0 });
             void selectRow(rows[0]!.id);
           }
@@ -389,14 +389,18 @@ export function DataGrid() {
                             selectTimer.current = null;
                           }
                           const state = useStore.getState();
-                          if (state.inspectorOpen && !state.creating) {
-                            // The panel is already visible; load the row so the
-                            // heading and fields do not blank out after the
-                            // selection changes. An open New Record draft stays
-                            // in front and must not be cancelled by a grid click.
-                            void state.selectRow(record.id);
-                          } else {
-                            useStore.setState({ selectedId: record.id });
+                          // An open New Record draft owns the inspector. A grid
+                          // click may start an inline edit, but it must not
+                          // change the selection underneath the draft.
+                          if (!state.creating) {
+                            if (state.inspectorOpen) {
+                              // The panel is already visible; load the row so the
+                              // heading and fields do not blank out after the
+                              // selection changes.
+                              void state.selectRow(record.id);
+                            } else {
+                              useStore.setState({ selectedId: record.id });
+                            }
                           }
                           setEditing({ id: record.id, column: column.name });
                         }}

@@ -2050,3 +2050,25 @@ test.describe("inspector state", () => {
     expect(errors).toEqual([]);
   });
 });
+
+test.describe("draft isolation", () => {
+  test("a grid double-click does not steal an open draft", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "draft isolation runs once at the laptop size");
+    const errors = await boot(page);
+    await page.getByRole("button", { name: /New Record/ }).first().click();
+    await expect(page.getByTestId("inspector")).toContainText("New Record");
+
+    const row = page.locator('[data-testid="grid-row"]').nth(1);
+    await row.locator('[data-column="Name"]').dblclick();
+    await page
+      .getByTestId("inspector")
+      .getByRole("button", { name: "Cancel" })
+      .first()
+      .click();
+
+    await expect(page.getByTestId("inspector")).not.toContainText("New Record");
+    await expect(page.locator(".grid-row.selected")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+});
