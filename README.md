@@ -1,35 +1,89 @@
 # SlabBase
 
-SlabBase is a local-first relational database, form studio, and report workbench for macOS. It stores every workspace as an ordinary SQLite 3 file in WAL mode, so the records remain readable with `sqlite3`, Python, DuckDB, or any other SQLite client. There is no account, no cloud service, and no proprietary container format.
+SlabBase is a native Mac database and form studio for the work FileMaker has traditionally owned: typed relational tables, snap-to-grid form layouts, live child portals, and printable reports. Every workspace is an ordinary SQLite 3 database in WAL mode, so the same records remain readable with `sqlite3` today and with any SQLite client you can still build twenty years from now — no account, no lock-in, no proprietary container.
 
-The application is built in Rust with a thin Tauri shell and a React front end. It is licensed under Apache-2.0, with every feature included.
+![SlabBase in light mode: the Clients grid beside the record inspector and a live Client Projects portal](docs/screenshots/table-inspector-light.png)
 
-## What it does
+## Visual tour
 
-- **Relational tables.** Typed columns, foreign keys, indexes, and an interactive schema map.
-- **Concurrent reads.** A serialized writer and four read-only replicas keep pagination, search, history, and PDF reads responsive during imports and writes.
-- **Formula columns.** A small expression language for derived values and parent-level rollups over child rows. `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` rollups are maintained incrementally, not rescanned on every read.
-- **Visual forms.** Snap-to-grid form layouts bound to a table, with embedded child portals edited inline.
-- **Virtualized grid.** Keyboard-first browsing and editing over keyset-paginated queries. Page payloads use positional tuples with column metadata sent once.
-- **Search.** SQLite FTS5 across all text columns, opened with `Cmd+K`. A newer search interrupts the superseded one without an error toast.
-- **Audit and undo.** Every write appends a before/after delta to `_slab_audit_log` in the same transaction, and can be undone or redone. The log is a BLAKE3 hash chain; `Integrity Check` detects external edits and deleted entries.
-- **Record time travel.** The Record Inspector lists field-level revisions and restores any earlier revision as a new, audited, undoable write.
-- **Index advisor.** An unindexed sort or filter on a large table surfaces a quiet status-bar suggestion; one click creates the index and reloads.
-- **Import and export.** Streaming CSV and array/NDJSON JSON import with bounded inference and batched commits; CSV, JSON, and SQL export. SQL exports include user tables and SlabBase metadata but omit the audit log and search index; use the snapshot command for a self-contained copy.
-- **Print and PDF.** Paginated HTML preview and vector PDF export for records, portals, and filtered tables. Table exports stream keyset pages and stop at an explicit 25,000-row ceiling with a warning in the report and the UI.
-- **Snapshots.** One-click APFS copy-on-write snapshots on macOS with a transactional `VACUUM INTO` fallback, consistent while the workspace is open.
-- **Native macOS shell.** Native menu bar actions, System/Light/Dark themes, Solid/Glass `NSVisualEffectView` vibrancy, seven accents plus custom hex, three densities, keyboard focus handling, reduced motion/transparency support, and the automated `docs/DESIGN_CONTRACT.md` audit.
+### Forms that bind to the schema, not beside it
 
-## Design commitments
+![Form Studio in dark mode: the Client Record drafting grid, field palette, and item inspector](docs/screenshots/form-studio-dark.png)
 
-1. **Open storage.** Workspaces are SQLite databases. Metadata lives in `_slab_*` tables; user data lives in plain tables with real foreign key constraints.
-2. **Exact arithmetic.** Currency and fixed-precision decimals are stored as integer minor units with an explicit scale. Floating point is never used for money.
-3. **Bounded memory.** Grids and portals use keyset pagination and virtualized rendering. Full tables are never loaded.
-4. **Acyclic formulas.** Formula dependencies form a DAG. Schema changes that would introduce a cycle are rejected before any mutation.
-5. **Transactional audit.** Data and schema writes run in one SQLite transaction that also records the audit delta, its BLAKE3 chain hash, and the inverse command.
-6. **No panics in shipping code.** Library crates deny `unwrap`, `expect`, and `panic`; errors carry stable codes such as `SLAB_E_CYCLE`, `SLAB_E_FK_VIOLATION`, and the benign `SLAB_E_CANCELLED`.
+Fields, sections, labels, and child portals are placed on a 12-column grid with 30-pixel rows; the layout is stored as validated JSON in `_slab_layouts`, and every field resolves against the live table schema.
 
-The normative visual and interaction contract is [docs/DESIGN_CONTRACT.md](docs/DESIGN_CONTRACT.md), enforced by `apps/desktop/tests/ui-audit.spec.ts`.
+### One model for columns and relations
+
+![Relations & Schema in light mode: the Clients column editor beside the monochrome relation graph](docs/screenshots/schema-graph-light.png)
+
+The split view keeps the typed column editor and the relation graph on the same schema: each 1:N relation creates a real foreign key, a secondary index on the child column, and a line in the monochrome map.
+
+### Revisions you can read without a server
+
+![Record time travel in dark mode: a City field revision showing San Francisco → Oakland](docs/screenshots/time-travel-dark.png)
+
+Every write appends a field-level before/after delta to `_slab_audit_log` and chains it with BLAKE3; `Restore` replays an earlier value as a new audited write that stays undoable with `⌘Z`.
+
+## Why it feels fast
+
+Fast is a budget, not an adjective. These are release-build numbers from `cargo run --release -p slab-storage --example systems_bench` on Apple silicon. The fixtures, assertions, and measurement code are in the repository.
+
+| Path | Release measurement | Mechanism |
+| --- | ---: | --- |
+| Rollup read, 100k children | **0.018 ms** cached vs **3.701 ms** cold `SUM` — **205× faster** | Incremental `(count, sum, extreme)` parent state; no child scan on read |
+| Keyset pagination, 100k rows | **1.48 ms** median / **2.86 ms** p95 over 1,000 pages | Cursor predicates and `LIMIT n + 1`; no count query, no full materialization |
+| Index Advisor, first page at 100k rows | **3.02 ms → 0.104 ms** after one click | `EXPLAIN QUERY PLAN` detects the scan, creates the index, reopens the readers |
+| Tuple IPC, 100 × 10 page | **35,073 → 23,205 bytes** (**33.8% smaller**) | Column names travel once per page; rows cross as positional tuples |
+| APFS snapshot, 4.4 MB | **1.75 ms** clone vs **6.44 ms** `VACUUM INTO` | Copy-on-write `clonefile` under the writer lock, with a transactional fallback |
+| 20k-row write under active reads | **Zero `SQLITE_BUSY` failures** | One serialized writer, four read-only WAL replicas, five-second busy timeout |
+
+The 100k pagination test asserts a 15 ms p95 in release builds. That budget covers indexed keyset pagination; an unindexed arbitrary sort is deliberately not promised the same bound.
+
+## Engineering principles
+
+- **One writer, four readers.** Writes serialize through `BEGIN IMMEDIATE`; reads lease read-only WAL connections and see the last committed snapshot while an import is still open.
+- **Exact money.** Currency and fixed-precision decimals are `i64` minor units with an explicit scale and `i128` intermediates. Binary floating point is never used for money.
+- **Bounded by construction.** Grids and portals use keyset pagination and virtualized rows. No query materializes a full table.
+- **Acyclic formulas.** Formula dependencies form a DAG; a schema change that would introduce a cycle is rejected before the transaction starts.
+- **Audit is part of the write.** The data mutation, rollup adjustment, FTS update, before/after delta, BLAKE3 chain entry, and inverse command commit together.
+- **No panics in shipping code.** Library crates deny `unwrap`, `expect`, and `panic`; errors carry stable `SLAB_E_*` codes such as `SLAB_E_CYCLE` and `SLAB_E_FK_VIOLATION`.
+
+## Open format, not a promise
+
+A `.slab` file is a SQLite 3 database. Point any SQLite client at it:
+
+```bash
+sqlite3 studio.slab '.tables'
+sqlite3 studio.slab 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
+sqlite3 studio.slab 'SELECT Number, Total FROM Invoices;'
+sqlite3 studio.slab 'SELECT * FROM _slab_audit_log ORDER BY id DESC LIMIT 3;'
+```
+
+User data lives in ordinary tables with real foreign keys. SlabBase metadata lives in `_slab_*` tables; no page of user data depends on a proprietary decoder. Closing the application checkpoints and truncates the WAL so the file is self-contained, while a crash still leaves a valid WAL database.
+
+## Crates
+
+`slab-core` is the floor. `slab-formula` sits on core. `slab-storage`, `slab-import`, `slab-print`, and `slab-sync` build on core and formula as needed and never depend on one another. `apps/desktop` depends on all of them and owns every process, thread, and synchronization boundary.
+
+| Crate | Responsibility | Depends on |
+| --- | --- | --- |
+| `slab-core` | Domain types: values, exact decimals, schema, layouts, commands, queries | — |
+| `slab-formula` | Parser, typechecker, evaluator, dependency DAG | `slab-core` |
+| `slab-storage` | SQLite engine, reader/writer pool, DDL, pagination, search, rollups, audit chain, undo | `slab-core`, `slab-formula` |
+| `slab-import` | Streaming CSV and JSON adapters with inference and preview | `slab-core` |
+| `slab-print` | Layout to paginated HTML and PDF | `slab-core` |
+| `slab-sync` | Hybrid logical clock, change sets, transport trait | `slab-core` |
+| `apps/desktop` | Tauri shell, concurrent read pool, typed IPC, React UI | all of the above |
+
+`slab-core` and `slab-formula` compile without filesystem, network, SQLite, or UI dependencies.
+
+## Design and security
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — dependency graph, storage schema, reader/writer concurrency, pagination, rollups, audit chain, and failure containment.
+- [docs/DESIGN_CONTRACT.md](docs/DESIGN_CONTRACT.md) — the normative visual and interaction contract, enforced by the Playwright audit.
+- [ROADMAP.md](ROADMAP.md) — shipped scope, next versions, known limits, and the workspace compatibility policy.
+- [SECURITY.md](SECURITY.md) — reporting, scope, response targets, and security design notes.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — DCO, commit signing, the local gate, and commit style.
 
 ## Build from source
 
@@ -52,16 +106,6 @@ open target/release/bundle/macos/SlabBase.app \
   --args --workspace "$PWD/fixtures/design-studio.slab"
 ```
 
-For an auditable release binary:
-
-```bash
-cargo install cargo-auditable
-cargo auditable build --release -p slabbase-desktop
-otool -l target/release/slabbase-desktop | grep dep-v0
-```
-
-The release profile keeps the `.dep-v0` section used by `cargo-auditable`; `strip = "debuginfo"` does not remove it.
-
 For development:
 
 ```bash
@@ -69,6 +113,8 @@ npm --prefix apps/desktop run tauri dev
 ```
 
 ## Verification
+
+Run the full gate:
 
 ```bash
 cargo fmt --check
@@ -83,55 +129,34 @@ npm --prefix apps/desktop run build
 npm --prefix apps/desktop run test:ui
 ```
 
-The test suite includes property tests for the formula language, randomized integer currency sums, a 100,000-row keyset pagination benchmark, randomized incremental-rollup parity against full SQL recomputation, BLAKE3 audit tamper detection through external `sqlite3`, Index Advisor and APFS snapshot checks, a shell-level concurrent-read test against an active import, an external `sqlite3` integrity check of a generated workspace, and undo/redo parity across portal edits. The benchmark asserts a 15 ms p95 in release builds and a looser bound in debug builds.
+The suite includes property tests for the formula language, randomized integer currency sums, a 100,000-row keyset pagination benchmark, randomized incremental-rollup parity against full SQL recomputation, BLAKE3 audit tamper detection through external `sqlite3`, Index Advisor and APFS snapshot checks, a shell-level concurrent-read test against an active import, an external `sqlite3` integrity check of a generated workspace, and undo/redo parity across portal edits.
 
-Reference release measurements from `systems_bench` on Apple silicon:
-
-| Metric | Result |
-| --- | ---: |
-| 100k pagination (1,000 pages) | 1.48 ms median / 2.86 ms p95 |
-| Index advisor first page, 100k rows | 3.02 ms → 0.104 ms |
-| Rollup read, 10k children | 0.021 ms cached vs 0.303 ms cold `SUM` |
-| Rollup read, 100k children | 0.018 ms cached vs 3.701 ms cold `SUM` |
-| Child edit + rollup read, 10k children | 0.169 ms cached vs 0.692 ms cold `SUM` |
-| Child edit + rollup read, 100k children | 0.199 ms cached vs 3.654 ms cold `SUM` |
-| Tuple IPC, 100 × 10 page | 35,073 → 23,205 bytes (33.8% smaller) |
-| APFS clone snapshot, 4.4 MB | 1.75 ms vs 6.44 ms `VACUUM INTO` |
-
-## Workspace format
-
-A `.slab` file is a SQLite 3 database. Inspect it without SlabBase:
+For an auditable release binary:
 
 ```bash
-sqlite3 studio.slab '.tables'
-sqlite3 studio.slab 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
-sqlite3 studio.slab 'SELECT * FROM _slab_tables;'
+cargo install cargo-auditable
+cargo auditable build --release -p slabbase-desktop
+otool -l target/release/slabbase-desktop | grep dep-v0
 ```
 
-SlabBase sets `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = NORMAL`, a 64 MB page cache, and a 256 MB mmap window on the writer; readers open read-only with `query_only = ON` and the same cache and mmap settings. Closing the application drops the readers, runs `PRAGMA optimize`, and truncates the WAL so the `.slab` file remains one self-contained database. The database remains valid if the process exits without doing so.
+The release profile keeps the `.dep-v0` section used by `cargo-auditable`; `strip = "debuginfo"` does not remove it.
 
-## Crates
+## v1.0 boundaries
 
-| Crate | Responsibility | Depends on |
-| --- | --- | --- |
-| `slab-core` | Domain types: values, exact decimals, schema, layouts, commands, queries | — |
-| `slab-formula` | Parser, typechecker, evaluator, dependency DAG | `slab-core` |
-| `slab-storage` | SQLite engine, reader/writer pool, DDL, pagination, search, rollups, audit chain, undo | `slab-core`, `slab-formula` |
-| `slab-import` | Streaming CSV and JSON adapters with inference and preview | `slab-core` |
-| `slab-print` | Layout to paginated HTML and PDF | `slab-core` |
-| `slab-sync` | Hybrid logical clock, change sets, transport trait | `slab-core` |
-| `apps/desktop` | Tauri shell, concurrent read pool, typed IPC, React UI | all of the above |
+SlabBase targets macOS. The storage format and core crates are platform independent; Windows and Linux builds are expected to work but are not part of the v1.0 verification matrix.
 
-`slab-core` and `slab-formula` compile without filesystem, network, SQLite, or UI dependencies.
+- PDF text is base-14 Helvetica with WinAnsiEncoding. Latin-1 and CP1252 text encodes exactly; unsupported scripts and emoji become `?`.
+- User identifiers are ASCII up to 64 bytes; non-Latin names are rejected rather than quoted.
+- Table PDF exports stop at an explicit 25,000-row ceiling and report that they did.
+- The BLAKE3 audit chain is tamper-evident, not tamper-proof against an attacker who rewrites the entire chain. SQLCipher encryption at rest and external anchoring are v1.2 work.
+- The v1.0 build does not encrypt data at rest.
 
-## Status
-
-v1.0 targets macOS. The storage format and core crates are platform independent; Windows and Linux builds are expected to work but are not part of the v1.0 verification matrix.
+See [ROADMAP.md](ROADMAP.md) for the complete known-limitations list and the compatibility policy.
 
 ## License
 
-Apache License 2.0. See `LICENSE` and `NOTICE`.
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-## Commercial support and signed distributions
+## Commercial support
 
-All features in this repository are and remain Apache-2.0 open source. Organizations that need more than the source tree can purchase Apple-notarized, MDM-distributable `.pkg` installers, long-term security backports for pinned releases, and response-time support agreements. These offerings cover packaging, signing, and support; they do not gate any product capability. Contact the maintainer through GitHub Issues or Discussions at `chiranjeevi-max/slabbase`.
+Every feature in this repository is and remains Apache-2.0 open source. Organizations that need Apple-notarized, MDM-distributable `.pkg` installers, long-term security backports for pinned releases, or response-time support agreements can contact the maintainer through GitHub Issues or Discussions at [chiranjeevi-max/slabbase](https://github.com/chiranjeevi-max/slabbase). These offerings cover packaging, signing, and support; they never gate a product capability.

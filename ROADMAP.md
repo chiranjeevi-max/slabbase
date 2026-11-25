@@ -30,11 +30,15 @@
 - Kanban, gallery, and calendar views through `slab_core::ViewConfig`.
 - Airtable CSV and FileMaker XML adapters implementing `slab_import::ImportAdapter`.
 - Multi-column sort, group-by, and batch edit for selected rows.
+- Split-view side-by-side tables for two related tables or a table beside the schema map.
+- Customizable keyboard command chords and saved quick actions in `⌘K`.
 
 ## v1.2
 
 - SQLCipher encryption at rest with Touch ID key release from the macOS keychain.
-- Branded print studio with logo, palette, typography, and saved report templates.
+- Schema version snapshots with safe migration diffs that inspect and roll back multi-step refactors as a unit.
+- Parameterized saved reports for reusable filtered PDF and invoice presets.
+- Branded print studio with logo, palette, and typography controls.
 - Declarative local triggers and auto-numbering with transactional audit entries.
 - MDM configuration plus SIEM and workspace access-log export for managed fleets.
 - Label and barcode templates driven by the existing `slab-print` layout model.
