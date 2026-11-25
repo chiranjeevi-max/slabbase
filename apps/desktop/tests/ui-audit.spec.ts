@@ -1016,31 +1016,37 @@ test.describe("interaction polish", () => {
     await page.evaluate(() => {
       document.documentElement.dataset["native"] = "true";
     });
-    await page.waitForTimeout(60);
-    const nativeLight = await readGlass();
-    const nativeLightPopover = await readPopover();
-    expectGlassBlurToken(nativeLight.sidebarBlur);
-    expectGlassBackdrop(nativeLight.sidebarFilter);
-    expect(alphaOf(nativeLight.sidebarBg)).toBeGreaterThan(0.2);
-    expect(alphaOf(nativeLight.sidebarBg)).toBeLessThan(0.6);
-    expect(alphaOf(nativeLight.gridBg)).toBeGreaterThanOrEqual(0.96);
-    expect(nativeLightPopover).not.toBeNull();
-    expect(alphaOf(nativeLightPopover?.background ?? "")).toBeGreaterThan(0.5);
-    expect(alphaOf(nativeLightPopover?.background ?? "")).toBeLessThan(0.75);
-    expect(alphaOf(nativeLightPopover?.border ?? "")).toBeGreaterThan(0.4);
-    expect(nativeLightPopover?.bevel).toContain("inset");
+    // Reduced motion collapses every transition to 0.01ms, yet each computed
+    // value still changes only when its transition finishes on the next
+    // animation frame, and a loaded runner can delay that frame past any
+    // fixed sleep. Retry the whole snapshot until every token has settled.
+    await expect(async () => {
+      const nativeLight = await readGlass();
+      const nativeLightPopover = await readPopover();
+      expectGlassBlurToken(nativeLight.sidebarBlur);
+      expectGlassBackdrop(nativeLight.sidebarFilter);
+      expect(alphaOf(nativeLight.sidebarBg)).toBeGreaterThan(0.2);
+      expect(alphaOf(nativeLight.sidebarBg)).toBeLessThan(0.6);
+      expect(alphaOf(nativeLight.gridBg)).toBeGreaterThanOrEqual(0.96);
+      expect(nativeLightPopover).not.toBeNull();
+      expect(alphaOf(nativeLightPopover?.background ?? "")).toBeGreaterThan(0.5);
+      expect(alphaOf(nativeLightPopover?.background ?? "")).toBeLessThan(0.75);
+      expect(alphaOf(nativeLightPopover?.border ?? "")).toBeGreaterThan(0.4);
+      expect(nativeLightPopover?.bevel).toContain("inset");
+    }).toPass();
 
     await popover.getByRole("button", { name: "Dark", exact: true }).click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-    await page.waitForTimeout(60);
-    const nativeDark = await readGlass();
-    const nativeDarkPopover = await readPopover();
-    expect(alphaOf(nativeDark.sidebarBg)).toBeGreaterThan(0.3);
-    expect(alphaOf(nativeDark.sidebarBg)).toBeLessThan(0.5);
-    expect(alphaOf(nativeDark.gridBg)).toBeGreaterThanOrEqual(0.96);
-    expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
-    expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
-    expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
+    await expect(async () => {
+      const nativeDark = await readGlass();
+      const nativeDarkPopover = await readPopover();
+      expect(alphaOf(nativeDark.sidebarBg)).toBeGreaterThan(0.3);
+      expect(alphaOf(nativeDark.sidebarBg)).toBeLessThan(0.5);
+      expect(alphaOf(nativeDark.gridBg)).toBeGreaterThanOrEqual(0.96);
+      expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
+      expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
+      expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
+    }).toPass();
 
     await setReducedTransparency(page, "reduce");
     await expect.poll(async () => (await readGlass()).sidebarBlur).toBe("none");
