@@ -277,7 +277,13 @@ export const useStore = create<AppStore>((set, get) => {
   const loadFirstPage = async () => {
     const state = get();
     if (!state.activeTable) {
-      set({ rows: [], hasMore: false, nextCursor: null, elapsedMs: 0 });
+      set({
+        rows: [],
+        hasMore: false,
+        nextCursor: null,
+        elapsedMs: 0,
+        loadingRows: false,
+      });
       return;
     }
     const token = ++pageRequest;
