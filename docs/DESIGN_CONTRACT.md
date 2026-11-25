@@ -25,6 +25,7 @@ Toolbar geometry:
 - The sidebar `+` button's visible glyph right edge and the row count right edge share one 10px inset axis.
 - Numeric and currency column headers right-align to the same 9px inset as their cell values. The `ID` header and `ID` cell use the same 9px inset.
 - The sidebar is 240px by default and resizes from 200px to 300px. The record inspector is 360px by default and resizes from 320px to 480px.
+- When both panes are docked, the inspector's effective maximum shrinks first so the workspace keeps at least 540px. This keeps the sub-toolbar intact while preserving the sidebar's 200px to 300px range.
 
 ## 2. Viewport and containment laws
 

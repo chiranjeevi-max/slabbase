@@ -601,6 +601,25 @@ test.describe("geometry", () => {
     expect(errors).toEqual([]);
   });
 
+  test("max pane widths preserve the grid budget", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem("slabbase.sidebarWidth", "300");
+      window.localStorage.setItem("slabbase.inspectorWidth", "480");
+    });
+    const errors = await boot(page);
+    await openInspector(page);
+    await assertViewport(page);
+    await assertChromeContainment(page);
+    const grid = await getRect(page, '[data-testid="grid-pane"]');
+    expect(grid.width).toBeGreaterThanOrEqual(480);
+    const sub = await page.getByTestId("sub-toolbar").evaluate((element) => ({
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+    }));
+    expect(sub.scrollWidth).toBeLessThanOrEqual(sub.clientWidth + 1);
+    expect(errors).toEqual([]);
+  });
+
   test("density keeps virtual rows aligned", async ({ page }) => {
     const errors = await boot(page);
     await selectTable(page, "Invoices");

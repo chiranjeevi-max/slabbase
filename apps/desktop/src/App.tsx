@@ -24,6 +24,7 @@ const SIDEBAR_MAX = 300;
 const INSPECTOR_DEFAULT = 360;
 const INSPECTOR_MIN = 320;
 const INSPECTOR_MAX = 480;
+const WORKSPACE_MIN = 540;
 
 export function App() {
   const booting = useStore((state) => state.booting);
@@ -48,11 +49,18 @@ export function App() {
   );
   const [sidebarDocked, setSidebarDocked] = useState(true);
   const [sidebarOverlay, setSidebarOverlay] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const inspectorPresence = usePresence(view === "table" && inspectorOpen, 110);
 
   useEffect(() => {
     if (isNarrowSidebar) setSidebarOverlay(false);
   }, [isNarrowSidebar]);
+
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem("slabbase.sidebarWidth", String(sidebarWidth));
@@ -130,6 +138,16 @@ export function App() {
   const sidebarVisible = isNarrowSidebar ? sidebarOverlay : sidebarDocked;
   const showSidebar = Boolean(info);
   const reserveTrafficLights = native && (!info || isNarrowSidebar || !sidebarDocked);
+  const inspectorMaxWidth = isInspectorOverlay
+    ? INSPECTOR_MAX
+    : Math.max(
+        INSPECTOR_MIN,
+        Math.min(
+          INSPECTOR_MAX,
+          viewportWidth - sidebarWidth - WORKSPACE_MIN - 10,
+        ),
+      );
+  const effectiveInspectorWidth = Math.min(inspectorWidth, inspectorMaxWidth);
 
   const toggleSidebar = () => {
     if (isNarrowSidebar) setSidebarOverlay((open) => !open);
@@ -199,14 +217,14 @@ export function App() {
                   {inspectorOpen && !isInspectorOverlay && (
                     <PaneResizer
                       side="right"
-                      width={inspectorWidth}
+                      width={effectiveInspectorWidth}
                       min={INSPECTOR_MIN}
-                      max={INSPECTOR_MAX}
+                      max={inspectorMaxWidth}
                       onResize={setInspectorWidth}
                     />
                   )}
                   <RecordPanel
-                    width={inspectorWidth}
+                    width={effectiveInspectorWidth}
                     closing={inspectorPresence.closing}
                   />
                 </>
