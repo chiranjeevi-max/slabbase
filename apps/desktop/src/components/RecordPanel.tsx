@@ -25,6 +25,7 @@ export function RecordPanel({
   const activeTable = useStore((state) => state.activeTable);
   const selectedId = useStore((state) => state.selectedId);
   const bundle = useStore((state) => state.bundle);
+  const bundleTable = useStore((state) => state.bundleTable);
   const creating = useStore((state) => state.creating);
   const activeLayoutId = useStore((state) => state.activeLayoutId);
   const historyOpen = useStore((state) => state.historyOpen);
@@ -71,7 +72,12 @@ export function RecordPanel({
     return <DraftRecord table={table} width={width} closing={closing} />;
   }
 
-  if (!bundle || selectedId === null) {
+  if (
+    !bundle ||
+    selectedId === null ||
+    bundleTable !== table.name ||
+    bundle.record.id !== selectedId
+  ) {
     return (
       <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle}>
         <header className="record-header">
@@ -105,9 +111,18 @@ export function RecordPanel({
   const narrow = width < 340;
 
   const commit = async (column: string, value: Value): Promise<boolean> => {
+    // The row id must come from the selection, not from a bundle that may have
+    // arrived for another table after the user moved on.
+    if (
+      selectedId === null ||
+      bundleTable !== table.name ||
+      bundle.record.id !== selectedId
+    ) {
+      return false;
+    }
     const ok = await useStore
       .getState()
-      .updateCell(table.name, bundle.record.id, column, value);
+      .updateCell(table.name, selectedId, column, value);
     if (ok) setPulse(column);
     return ok;
   };
@@ -149,7 +164,9 @@ export function RecordPanel({
                   "Delete Record",
                   "Delete",
                 );
-                if (ok) await useStore.getState().deleteRecord(bundle.record.id);
+                if (ok && selectedId !== null) {
+                  await useStore.getState().deleteRecord(selectedId);
+                }
               })();
             }}
           >

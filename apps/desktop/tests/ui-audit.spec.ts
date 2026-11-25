@@ -1921,3 +1921,106 @@ test.describe("accessibility", () => {
     }
   });
 });
+
+test.describe("async races", () => {
+  test("a stale inspector read cannot replace a newer table selection", async ({ page }) => {
+    const errors = await boot(page);
+
+    const clientsRow = page.locator('[data-testid="grid-row"]').first();
+    const clientsName = (
+      await clientsRow.locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+    await clientsRow.click();
+
+    // Arm the delay after the click but before the 180 ms inspector timer
+    // fires, so the delayed request is unambiguously the Clients read.
+    await page.evaluate(() => {
+      (
+        window as unknown as {
+          __slabFixtureDelay?: { command: string; ms: number; once?: boolean };
+        }
+      ).__slabFixtureDelay = { command: "read_record", ms: 2_500, once: true };
+    });
+    await page.waitForTimeout(300);
+
+    await selectSidebarItem(page, "Invoices");
+    await expect(
+      page.locator('[data-testid="grid-header"] [data-column="Number"]'),
+    ).toBeVisible();
+
+    const invoiceRow = page.locator('[data-testid="grid-row"]').first();
+    const invoiceNumber = (
+      await invoiceRow.locator('[data-column="Number"] .cell-text').innerText()
+    ).trim();
+    await invoiceRow.click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      invoiceNumber,
+    );
+
+    // The slow Clients response resolves now. It must be discarded.
+    await page.waitForTimeout(2_800);
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      invoiceNumber,
+    );
+    await expect(page.getByTestId("inspector")).not.toContainText(clientsName);
+    expect(errors).toEqual([]);
+  });
+
+  test("a delayed row select is cancelled by a table switch", async ({ page }) => {
+    const errors = await boot(page);
+
+    // Select a Clients row and switch tables in one task, well inside the
+    // 180 ms inspector delay. The pending select must not open an unrelated
+    // Invoices row with the same id.
+    await page.evaluate(() => {
+      document
+        .querySelector<HTMLElement>('[data-testid="grid-row"]')
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      document
+        .querySelector<HTMLElement>('[data-testid="sidebar"] [data-table="Invoices"]')
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await page.waitForTimeout(650);
+    await expect(page.getByTestId("inspector")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe("form studio state", () => {
+  test("unsaved item edits survive a schema refresh", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "form inspector survival runs once at the laptop size");
+    const errors = await boot(page);
+    // Seed the fixture undo stack so Cmd+Z below actually replaces the schema
+    // object, which is what triggers the Form Studio reset in the old code.
+    const cell = page.locator('.grid-cell[data-column="Name"]').first();
+    await cell.dblclick();
+    const inline = cell.locator("input.field-input");
+    await inline.fill("Northlight Edited");
+    await page.keyboard.press("Enter");
+    await expect(cell.locator(".cell-text")).toHaveText("Northlight Edited");
+
+    await page.getByRole("tab", { name: "Form" }).click();
+    await expect(page.locator(".studio")).toBeVisible();
+
+    const item = page.locator(".studio-item").first();
+    await item.click();
+    const x = page.locator(".inspector-grid input").first();
+    await expect(x).toBeVisible();
+    await x.fill("3");
+    await expect(x).toHaveValue("3");
+
+    // Blur the number input so Cmd+Z is an app undo, not native text undo.
+    await item.click();
+    await page.keyboard.press("Meta+z");
+    await page.waitForTimeout(500);
+
+    // The undo refreshed the schema object. The unsaved X position and the
+    // item selection must still be there.
+    await expect(page.locator(".inspector-grid input").first()).toHaveValue("3");
+    await expect(page.locator(".studio-item.selected")).toHaveCount(1);
+    expect(errors).toEqual([]);
+  });
+});

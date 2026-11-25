@@ -58,6 +58,12 @@ export function DataGrid() {
   } | null>(null);
 
   useEffect(() => {
+    // A delayed inspector select carries a row id from the previous table or
+    // filter. Cancel it before the window changes underneath it.
+    if (selectTimer.current !== null) {
+      window.clearTimeout(selectTimer.current);
+      selectTimer.current = null;
+    }
     setEditing(null);
     setActive(null);
     setScrollTop(0);
