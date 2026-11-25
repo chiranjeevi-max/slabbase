@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { FixtureMode } from "./fixture";
 import type {
   AuditEntry,
   Column,
@@ -67,7 +68,22 @@ function normalizeError(error: unknown): SlabError {
   return new SlabError("SLAB_E_INTERNAL", "Unexpected failure");
 }
 
+function requestedFixture(): FixtureMode | null {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get("fixture");
+  if (value === "design-studio") return "full";
+  if (value === "empty") return "empty";
+  return null;
+}
+
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (import.meta.env.DEV) {
+    const mode = requestedFixture();
+    if (mode) {
+      const { fixtureCall } = await import("./fixture");
+      return fixtureCall<T>(command, args, mode);
+    }
+  }
   try {
     return await invoke<T>(command, args);
   } catch (error) {

@@ -1,0 +1,1040 @@
+import { expect, test, type Page } from "@playwright/test";
+
+type Theme = "light" | "dark";
+type Surface = "solid" | "glass";
+type Density = "compact" | "default" | "comfortable";
+
+interface Prefs {
+  version: 1;
+  theme: Theme | "system";
+  surface: Surface;
+  accent: string;
+  customAccent: string;
+  density: Density;
+}
+
+const BASE_PREFS: Prefs = {
+  version: 1,
+  theme: "light",
+  surface: "solid",
+  accent: "blue",
+  customAccent: "#0a84ff",
+  density: "default",
+};
+
+const DENSITY_HEIGHT: Record<Density, number> = {
+  compact: 26,
+  default: 29,
+  comfortable: 34,
+};
+
+const DENSITY_LABEL: Record<Density, string> = {
+  compact: "Compact",
+  default: "Default",
+  comfortable: "Comfortable",
+};
+
+interface BootOptions {
+  theme?: Theme | "system";
+  surface?: Surface;
+  accent?: string;
+  customAccent?: string;
+  density?: Density;
+  fixture?: "design-studio" | "empty";
+  seed?: boolean;
+  tauri?: boolean;
+  colorScheme?: "light" | "dark";
+}
+
+async function boot(page: Page, options: BootOptions = {}): Promise<string[]> {
+  const prefs: Prefs = {
+    ...BASE_PREFS,
+    theme: options.theme ?? BASE_PREFS.theme,
+    surface: options.surface ?? BASE_PREFS.surface,
+    accent: options.accent ?? BASE_PREFS.accent,
+    customAccent: options.customAccent ?? BASE_PREFS.customAccent,
+    density: options.density ?? BASE_PREFS.density,
+  };
+  const errors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error" || message.type() === "warning") {
+      errors.push(`${message.type()}: ${message.text()}`);
+    }
+  });
+  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+
+  if (options.seed !== false) {
+    await page.addInitScript((value) => {
+      window.localStorage.setItem("slabbase.appearance.v1", JSON.stringify(value));
+    }, prefs);
+  }
+  if (options.tauri) {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {};
+    });
+  }
+  if (options.colorScheme) {
+    await page.emulateMedia({ colorScheme: options.colorScheme });
+  }
+
+  const fixture = options.fixture ?? "design-studio";
+  await page.goto(`/?fixture=${fixture}`);
+  await expect(page.getByTestId("toolbar")).toBeVisible();
+  if (fixture === "empty") {
+    await expect(page.getByTestId("empty-workspace")).toBeVisible();
+  } else {
+    await expect(page.getByTestId("grid-pane")).toBeVisible();
+  }
+  await page.evaluate(() => document.fonts.ready);
+  return errors;
+}
+
+async function ensureSidebar(page: Page): Promise<void> {
+  const sidebar = page.getByTestId("sidebar");
+  let box = await sidebar.boundingBox();
+  if (box && box.x >= 0) return;
+
+  await page.waitForFunction(() => {
+    const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+    const toggle = document.querySelector<HTMLElement>('[data-testid="sidebar-toggle"]');
+    return Boolean(node && node.getBoundingClientRect().x >= 0) || Boolean(toggle);
+  });
+
+  box = await sidebar.boundingBox();
+  if (!box || box.x < 0) {
+    const toggle = page.getByTestId("sidebar-toggle");
+    if ((await toggle.count()) > 0 && (await toggle.isVisible())) {
+      await toggle.click();
+    }
+  }
+  await page.waitForFunction(() => {
+    const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+    return node ? node.getBoundingClientRect().x >= 0 : false;
+  });
+}
+
+async function selectTable(page: Page, table: string): Promise<void> {
+  await ensureSidebar(page);
+  await page.getByTestId("sidebar").getByText(table, { exact: true }).click();
+  await expect(page.getByTestId("grid-pane")).toBeVisible();
+  await expect(page.getByTestId("sidebar").locator(".source-row.active")).toContainText(table);
+  await expect(page.getByTestId("grid-row").first()).toBeVisible();
+}
+
+async function selectSidebarItem(page: Page, label: string): Promise<void> {
+  await ensureSidebar(page);
+  await page.getByTestId("sidebar").getByText(label, { exact: true }).click();
+}
+
+async function openInspector(page: Page): Promise<void> {
+  await page.locator('[data-testid="grid-row"]').first().click();
+  await expect(page.getByTestId("inspector")).toBeVisible();
+}
+
+const VIEWS: Array<{
+  name: string;
+  fixture?: "design-studio" | "empty";
+  open: (page: Page) => Promise<void>;
+}> = [
+  {
+    name: "empty workspace",
+    fixture: "empty",
+    open: async () => {},
+  },
+  {
+    name: "clients table",
+    open: async () => {},
+  },
+  {
+    name: "clients with inspector",
+    open: async (page) => {
+      await openInspector(page);
+    },
+  },
+  {
+    name: "invoices with portal",
+    open: async (page) => {
+      await selectTable(page, "Invoices");
+      await openInspector(page);
+      await expect(page.getByTestId("portal-scroll")).toBeVisible();
+      await page.locator(".record-scroll").evaluate((node) => {
+        node.scrollTop = node.scrollHeight;
+      });
+    },
+  },
+  {
+    name: "form studio",
+    open: async (page) => {
+      await page.getByRole("tab", { name: "Form" }).click();
+      await expect(page.locator(".studio")).toBeVisible();
+    },
+  },
+  {
+    name: "relations and schema",
+    open: async (page) => {
+      await selectSidebarItem(page, "Relations & Schema");
+      await expect(page.locator(".schema-view")).toBeVisible();
+    },
+  },
+  {
+    name: "audit log",
+    open: async (page) => {
+      await selectSidebarItem(page, "Audit Log");
+      await expect(page.getByTestId("audit-drawer")).toBeVisible();
+    },
+  },
+  {
+    name: "command palette",
+    open: async (page) => {
+      await page.getByTestId("search-trigger").click();
+      await expect(page.getByTestId("command-palette")).toBeVisible();
+    },
+  },
+  {
+    name: "appearance popover",
+    open: async (page) => {
+      await page.getByTestId("appearance-button").click();
+      await expect(page.getByTestId("appearance-popover")).toBeVisible();
+    },
+  },
+];
+
+function rounded(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+async function assertViewport(page: Page): Promise<void> {
+  const metrics = await page.evaluate(() => {
+    const root = document.getElementById("root");
+    return {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      docWidth: document.documentElement.scrollWidth,
+      docHeight: document.documentElement.scrollHeight,
+      bodyWidth: document.body.scrollWidth,
+      bodyHeight: document.body.scrollHeight,
+      rootWidth: root?.scrollWidth ?? 0,
+      rootHeight: root?.scrollHeight ?? 0,
+    };
+  });
+  expect(metrics.docWidth).toBeLessThanOrEqual(metrics.innerWidth);
+  expect(metrics.docHeight).toBeLessThanOrEqual(metrics.innerHeight);
+  expect(metrics.bodyWidth).toBeLessThanOrEqual(metrics.innerWidth);
+  expect(metrics.bodyHeight).toBeLessThanOrEqual(metrics.innerHeight);
+  expect(metrics.rootWidth).toBeLessThanOrEqual(metrics.innerWidth);
+  expect(metrics.rootHeight).toBeLessThanOrEqual(metrics.innerHeight);
+}
+
+interface ContainerInfo {
+  rect: { left: number; right: number; top: number; bottom: number; width: number; height: number };
+  scrollWidth: number;
+  clientWidth: number;
+  children: Array<{
+    left: number;
+    right: number;
+    width: number;
+    tag: string;
+    className: string;
+  }>;
+}
+
+async function assertChromeContainment(page: Page): Promise<void> {
+  const selectors = [
+    '[data-testid="sidebar"]',
+    '[data-testid="toolbar"]',
+    '[data-testid="sub-toolbar"]',
+    '[data-testid="inspector"]',
+    '[data-testid="status-bar"]',
+    '[data-testid="command-palette"]',
+    '[data-testid="audit-drawer"]',
+    '[data-testid="appearance-popover"]',
+    '[data-testid="schema-dialog"]',
+    '[data-testid="import-dialog"]',
+    '[data-testid="print-dialog"]',
+  ];
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if ((await locator.count()) === 0) continue;
+    if (!(await locator.isVisible())) continue;
+    const info = await locator.evaluate<ContainerInfo | null>((element) => {
+      const rect = element.getBoundingClientRect();
+      if (rect.right <= 0 || rect.left >= window.innerWidth || rect.width === 0) return null;
+      const children = Array.from(element.querySelectorAll<HTMLElement>("*"))
+        .filter((node) => !node.closest('[data-testid="portal-scroll"]'))
+        .map((node) => {
+          const child = node.getBoundingClientRect();
+          const className =
+            typeof node.className === "string" ? node.className : String(node.className.baseVal);
+          return {
+            left: child.left,
+            right: child.right,
+            width: child.width,
+            tag: node.tagName,
+            className,
+          };
+        })
+        .filter((child) => child.width > 0);
+      return {
+        rect: {
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          width: rect.width,
+          height: rect.height,
+        },
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth,
+        children,
+      };
+    });
+    if (!info) continue;
+    expect(info.scrollWidth, `${selector} scrollWidth`).toBeLessThanOrEqual(
+      info.clientWidth + 1,
+    );
+    for (const child of info.children) {
+      expect(
+        child.left,
+        `${selector} child ${child.tag}.${child.className} left`,
+      ).toBeGreaterThanOrEqual(info.rect.left - 1);
+      expect(
+        child.right,
+        `${selector} child ${child.tag}.${child.className} right`,
+      ).toBeLessThanOrEqual(info.rect.right + 1);
+    }
+  }
+}
+
+async function assertTextNotClipped(page: Page): Promise<void> {
+  const selectors = [
+    ".toolbar button",
+    ".workspace-switcher .workspace-name",
+    ".view-switcher button",
+    ".table-toolbar button",
+    ".source-row",
+    ".source-heading",
+    ".source-name",
+    ".source-count",
+    ".grid-head-cell .column-name",
+    ".portal-header .portal-title",
+    ".portal-header .text-button",
+    ".portal-grid-head .portal-column-name",
+    ".statusbar span",
+    ".record-heading h2",
+    ".record-header .eyebrow",
+    ".field-label",
+    ".appearance-head span",
+    ".appearance-label",
+    ".appearance-segment button",
+    ".palette-row > span",
+  ];
+
+  for (const selector of selectors) {
+    const elements = page.locator(selector);
+    const count = await elements.count();
+    for (let index = 0; index < count; index += 1) {
+      const element = elements.nth(index);
+      if (!(await element.isVisible())) continue;
+      const info = await element.evaluate((node) => ({
+        text: (node.textContent ?? "").trim(),
+        scrollWidth: node.scrollWidth,
+        clientWidth: node.clientWidth,
+        scrollHeight: node.scrollHeight,
+        clientHeight: node.clientHeight,
+      }));
+      if (!info.text || info.clientWidth === 0) continue;
+      expect(info.scrollWidth, `${selector} text "${info.text}" width`).toBeLessThanOrEqual(
+        info.clientWidth + 1,
+      );
+      expect(info.scrollHeight, `${selector} text "${info.text}" height`).toBeLessThanOrEqual(
+        info.clientHeight + 1,
+      );
+    }
+  }
+}
+
+async function assertNoOverlap(page: Page): Promise<void> {
+  const groups = await page.evaluate(() => {
+    const toolbar = document.querySelector<HTMLElement>('[data-testid="toolbar"]');
+    const sub = document.querySelector<HTMLElement>('[data-testid="sub-toolbar"]');
+    const status = document.querySelector<HTMLElement>('[data-testid="status-bar"]');
+    const inspector = document.querySelector<HTMLElement>('[data-testid="inspector"]');
+    const portal = document.querySelector<HTMLElement>(".portal-header");
+
+    const collect = (root: HTMLElement | null, selector: string) => {
+      if (!root) return [];
+      return Array.from(root.querySelectorAll<HTMLElement>(selector))
+        .filter((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden";
+        })
+        .map((element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            selector,
+            className: element.className,
+            left: rect.left,
+            right: rect.right,
+            top: rect.top,
+            bottom: rect.bottom,
+          };
+        })
+        .sort((left, right) => left.left - right.left);
+    };
+
+    return {
+      toolbar: collect(
+        toolbar,
+        ':scope > .toolbar-left > button, :scope > .toolbar-left > .workspace-anchor, :scope > .toolbar-center > .view-switcher, :scope > .toolbar-center > .search-trigger, :scope > .toolbar-right > .toolbar-group > *, :scope > .toolbar-right > .toolbar-divider',
+      ),
+      sub: collect(sub, ":scope > *"),
+      status: collect(status, ".status-left > *, .status-right > *"),
+      inspector: collect(inspector, ".record-header > *"),
+      portal: collect(portal, ":scope > *"),
+    };
+  });
+
+  for (const [name, controls] of Object.entries(groups)) {
+    for (let index = 1; index < controls.length; index += 1) {
+      const previous = controls[index - 1];
+      const current = controls[index];
+      if (!previous || !current) continue;
+      if (Math.abs(previous.top - current.top) > 4) continue;
+      expect(
+        current.left,
+        `${name} overlap: ${previous.className} -> ${current.className}`,
+      ).toBeGreaterThanOrEqual(previous.right + 4);
+    }
+  }
+}
+
+async function assertLayout(page: Page): Promise<void> {
+  await assertViewport(page);
+  await assertChromeContainment(page);
+  await assertTextNotClipped(page);
+  await assertNoOverlap(page);
+}
+
+async function getRect(page: Page, selector: string) {
+  return page.locator(selector).first().evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return {
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+    };
+  });
+}
+
+async function computedColor(page: Page, selector: string): Promise<string> {
+  return page.locator(selector).first().evaluate((element) => getComputedStyle(element).backgroundColor);
+}
+
+function alphaOf(color: string): number {
+  const rgba = color.match(/rgba?\([^)]*?,\s*([\d.]+)\)/);
+  if (rgba?.[1]) return Number(rgba[1]);
+  const slash = color.match(/\/\s*([\d.]+)\s*\)/);
+  if (slash?.[1]) return Number(slash[1]);
+  return 1;
+}
+
+function channel(value: number): number {
+  const normalized = value / 255;
+  return normalized <= 0.04045
+    ? normalized / 12.92
+    : Math.pow((normalized + 0.055) / 1.055, 2.4);
+}
+
+
+function hexLuminance(hex: string): number {
+  const normalized = hex.trim().replace("#", "");
+  const value =
+    normalized.length === 3
+      ? normalized
+          .split("")
+          .map((part) => `${part}${part}`)
+          .join("")
+      : normalized;
+  const r = Number.parseInt(value.slice(0, 2), 16);
+  const g = Number.parseInt(value.slice(2, 4), 16);
+  const b = Number.parseInt(value.slice(4, 6), 16);
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+
+function contrastHex(left: string, right: string): number {
+  const a = hexLuminance(left);
+  const b = hexLuminance(right);
+  const lighter = Math.max(a, b);
+  const darker = Math.min(a, b);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function luminance(color: string): number {
+  const match = color.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/);
+  if (!match) return 0;
+  return (
+    0.2126 * channel(Number(match[1])) +
+    0.7152 * channel(Number(match[2])) +
+    0.0722 * channel(Number(match[3]))
+  );
+}
+
+for (const theme of ["light", "dark"] as const) {
+  test.describe(`views (${theme})`, () => {
+    for (const view of VIEWS) {
+      test(view.name, async ({ page }) => {
+        const errors = await boot(page, {
+          theme,
+          fixture: view.fixture,
+        });
+        await view.open(page);
+        await assertLayout(page);
+        expect(errors, "console errors and warnings").toEqual([]);
+      });
+    }
+  });
+}
+
+test.describe("geometry", () => {
+  test("shell rhythm matches the contract", async ({ page }) => {
+    const errors = await boot(page);
+    await ensureSidebar(page);
+
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error("missing viewport");
+    const toolbar = await getRect(page, '[data-testid="toolbar"]');
+    const sub = await getRect(page, '[data-testid="sub-toolbar"]');
+    const status = await getRect(page, '[data-testid="status-bar"]');
+    const sidebar = await getRect(page, '[data-testid="sidebar"]');
+    const row = await getRect(page, ".source-row");
+    const filter = await getRect(page, ".table-filter");
+    const select = await getRect(page, ".toolbar-select");
+    const search = await getRect(page, ".search-trigger");
+    const switcher = await getRect(page, '[data-testid="workspace-switcher"]');
+
+    expect(toolbar.height).toBe(48);
+    expect(sub.height).toBe(44);
+    expect(status.height).toBe(26);
+    expect(sidebar.width).toBe(240);
+    expect(sidebar.top).toBe(0);
+    expect(sidebar.bottom).toBe(viewport.height);
+    expect(row.height).toBe(30);
+    expect(row.left - sidebar.left).toBeGreaterThanOrEqual(10);
+    expect(filter.height).toBe(28);
+    expect(select.height).toBe(28);
+    expect(search.height).toBe(28);
+    expect(search.top - toolbar.top).toBeGreaterThanOrEqual(8);
+    expect(toolbar.bottom - search.bottom).toBeGreaterThanOrEqual(8);
+
+    const firstStatus = await getRect(page, ".status-left > *");
+    expect(firstStatus.left - status.left).toBeGreaterThanOrEqual(16);
+
+    const sections = await page.locator(".source-section").evaluateAll((elements) =>
+      elements.map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom };
+      }),
+    );
+    for (let index = 1; index < sections.length; index += 1) {
+      const previous = sections[index - 1];
+      const current = sections[index];
+      if (!previous || !current) continue;
+      expect(current.top - previous.bottom).toBeGreaterThanOrEqual(16);
+    }
+
+    const axes = await page.evaluate(() =>
+      Array.from(document.querySelectorAll(".source-section"))
+        .map((section) => {
+          const plus = section
+            .querySelector(".source-heading .icon-control svg")
+            ?.getBoundingClientRect();
+          const count = section.querySelector(".source-count")?.getBoundingClientRect();
+          return plus && count ? { plus: plus.right, count: count.right } : null;
+        })
+        .filter((value): value is { plus: number; count: number } => value !== null),
+    );
+    expect(axes.length).toBeGreaterThan(0);
+    for (const axis of axes) {
+      expect(Math.abs(axis.plus - axis.count)).toBeLessThanOrEqual(2);
+    }
+
+    if (viewport.width >= 1080) {
+      expect(switcher.left).toBeGreaterThanOrEqual(sidebar.right + 12);
+    } else {
+      await page.keyboard.press("Escape");
+    }
+    await page.locator('[data-testid="grid-row"]').first().click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    const inspector = await getRect(page, '[data-testid="inspector"]');
+    expect(inspector.width).toBe(viewport.width < 1200 ? 420 : 360);
+    const firstField = await getRect(page, ".record-form .form-item");
+    expect(firstField.left - inspector.left).toBeGreaterThanOrEqual(14);
+    expect(errors).toEqual([]);
+  });
+
+  test("numeric headers share the cell axis", async ({ page }) => {
+    const errors = await boot(page);
+    await selectTable(page, "Projects");
+    await expect(page.locator('.grid-cell[data-column="Budget"]').first()).toBeVisible();
+    const axis = await page.evaluate(() => {
+      const idHeader = document.querySelector<HTMLElement>(".id-header span:last-child");
+      const idCell = document.querySelector<HTMLElement>(".id-cell .cell-text");
+      const budgetHeader = document.querySelector<HTMLElement>(
+        '.grid-head-cell[data-column="Budget"] .column-name',
+      );
+      const budgetCell = document.querySelector<HTMLElement>(
+        '.grid-cell[data-column="Budget"] .cell-text',
+      );
+      return {
+        idHeader: idHeader?.getBoundingClientRect().right ?? 0,
+        idCell: idCell?.getBoundingClientRect().right ?? 0,
+        budgetHeader: budgetHeader?.getBoundingClientRect().right ?? 0,
+        budgetCell: budgetCell?.getBoundingClientRect().right ?? 0,
+      };
+    });
+    expect(Math.abs(axis.idHeader - axis.idCell)).toBeLessThanOrEqual(1);
+    expect(Math.abs(axis.budgetHeader - axis.budgetCell)).toBeLessThanOrEqual(1);
+    expect(errors).toEqual([]);
+  });
+
+  test("density keeps virtual rows aligned", async ({ page }) => {
+    const errors = await boot(page);
+    await selectTable(page, "Invoices");
+    await openInspector(page);
+    await expect(page.getByTestId("portal-scroll")).toBeVisible();
+    await page.locator(".record-scroll").evaluate((node) => {
+      node.scrollTop = node.scrollHeight;
+    });
+
+    for (const density of ["compact", "default", "comfortable"] as const) {
+      const expected = DENSITY_HEIGHT[density];
+      await page.getByTestId("appearance-button").click();
+      await page.getByTestId("appearance-popover").getByRole("button", {
+        name: DENSITY_LABEL[density],
+        exact: true,
+      }).click();
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("appearance-popover")).toBeHidden();
+
+      const geometry = await page.evaluate(() => {
+        const cssRow = getComputedStyle(document.documentElement).getPropertyValue("--row-h");
+        const rows = Array.from(document.querySelectorAll<HTMLElement>(".grid-row")).map((row) => {
+          const rect = row.getBoundingClientRect();
+          const transform = getComputedStyle(row).transform;
+          return { height: rect.height, transform };
+        });
+        const portalRows = Array.from(
+          document.querySelectorAll<HTMLElement>(".portal-grid-row"),
+        ).map((row) => {
+          const rect = row.getBoundingClientRect();
+          return { height: rect.height };
+        });
+        const portalSpacer = document.querySelector<HTMLElement>(".portal-spacer");
+        return {
+          cssRow: cssRow.trim(),
+          rows,
+          portalRows,
+          portalSpacer: portalSpacer?.getBoundingClientRect().height ?? 0,
+          portalRowsTotal: document.querySelectorAll(".portal-grid-row").length,
+        };
+      });
+
+      expect(geometry.cssRow).toBe(`${expected}px`);
+      for (const row of geometry.rows) {
+        expect(row.height).toBe(expected);
+        if (row.transform !== "none") {
+          const values = row.transform.match(/matrix\(1, 0, 0, 1, 0, ([\d.-]+)\)/);
+          if (values?.[1]) {
+            expect(Math.abs(Number(values[1]) % expected)).toBeLessThanOrEqual(0.01);
+          }
+        }
+      }
+      for (const row of geometry.portalRows) {
+        expect(row.height).toBe(expected);
+      }
+      expect(geometry.portalSpacer).toBeGreaterThanOrEqual(
+        geometry.portalRowsTotal * expected - 1,
+      );
+    }
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe("interaction polish", () => {
+  test("focus rings follow keyboard intent", async ({ page }) => {
+    const errors = await boot(page);
+    await page.getByRole("tab", { name: "Table" }).click();
+    const pointerFocus = await page.evaluate(() => {
+      const active = document.activeElement as HTMLElement;
+      return {
+        outlineStyle: getComputedStyle(active).outlineStyle,
+        outlineWidth: getComputedStyle(active).outlineWidth,
+      };
+    });
+    expect(pointerFocus.outlineStyle).toBe("none");
+
+    await page.keyboard.press("Tab");
+    const keyboardFocus = await page.evaluate(() => {
+      const active = document.activeElement as HTMLElement;
+      return {
+        visible: active.matches(":focus-visible"),
+        outlineWidth: getComputedStyle(active).outlineWidth,
+      };
+    });
+    expect(keyboardFocus.visible).toBe(true);
+    expect(keyboardFocus.outlineWidth).toBe("2px");
+
+    const trigger = page.getByTestId("search-trigger");
+    await trigger.click();
+    await expect(page.getByTestId("command-palette")).toBeVisible();
+    for (let index = 0; index < 20; index += 1) {
+      await page.keyboard.press("Tab");
+      const inside = await page.evaluate(() =>
+        document
+          .querySelector('[data-testid="command-palette"]')
+          ?.contains(document.activeElement),
+      );
+      expect(inside).toBe(true);
+    }
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("command-palette")).toBeHidden();
+    expect(await trigger.evaluate((node) => node === document.activeElement)).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  test("window blur neutralizes active tints", async ({ page }) => {
+    const errors = await boot(page);
+    const row = page.locator(".source-row.active");
+    await expect(row).toBeVisible();
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    expect(
+      await page.locator("html").getAttribute("data-window-focused"),
+    ).toBe("false");
+    await expect
+      .poll(() => row.evaluate((element) => getComputedStyle(element).backgroundColor))
+      .toBe("rgba(128, 128, 128, 0.16)");
+    const inactive = await row.evaluate((element) => getComputedStyle(element).backgroundColor);
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    expect(
+      await page.locator("html").getAttribute("data-window-focused"),
+    ).toBe("true");
+    await expect
+      .poll(() => row.evaluate((element) => getComputedStyle(element).backgroundColor))
+      .not.toBe(inactive);
+    expect(errors).toEqual([]);
+  });
+
+  test("context menu clamps and dismisses", async ({ page }) => {
+    const errors = await boot(page);
+    await page.setViewportSize({ width: 1280, height: 360 });
+    await page.waitForFunction(() => {
+      const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+      return Boolean(node && node.getBoundingClientRect().x >= 0);
+    });
+    await selectTable(page, "Line Items");
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error("missing viewport");
+    await page.mouse.click(viewport.width - 12, 140, { button: "right" });
+    const menu = page.getByTestId("context-menu");
+    await expect(menu).toBeVisible();
+    const box = await menu.boundingBox();
+    if (!box) throw new Error("missing context menu box");
+    expect(box.x).toBeGreaterThanOrEqual(8);
+    expect(box.y).toBeGreaterThanOrEqual(8);
+    expect(box.x + box.width).toBeLessThanOrEqual(viewport.width - 8);
+    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height - 8);
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+
+    await page.mouse.click(viewport.width - 12, 140, { button: "right" });
+    await expect(menu).toBeVisible();
+    await page.mouse.move(400, 220);
+    await page.mouse.wheel(0, 120);
+    await expect(menu).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+
+  test("reduced motion collapses surfaces", async ({ page }) => {
+    const errors = await boot(page);
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await page.getByTestId("search-trigger").click();
+    await expect(page.getByTestId("command-palette")).toBeVisible();
+    const normalPalette = await page
+      .getByTestId("command-palette")
+      .evaluate((element) => getComputedStyle(element).animationDuration);
+    expect(Number.parseFloat(normalPalette)).toBeGreaterThanOrEqual(0.1);
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("command-palette")).toBeHidden();
+
+    await selectSidebarItem(page, "Audit Log");
+    const drawer = page.getByTestId("audit-drawer");
+    await expect(drawer).toBeVisible();
+    const normalSheet = await drawer.evaluate(
+      (element) => getComputedStyle(element).animationDuration,
+    );
+    expect(Number.parseFloat(normalSheet)).toBeGreaterThanOrEqual(0.14);
+    await page.keyboard.press("Escape");
+    await expect(drawer).toBeHidden();
+
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.getByTestId("search-trigger").click();
+    await expect(page.getByTestId("command-palette")).toBeVisible();
+    const reduced = await page.evaluate(() => {
+      const element = document.querySelector<HTMLElement>('[data-testid="command-palette"]');
+      if (!element) return null;
+      const style = getComputedStyle(element);
+      return { duration: style.animationDuration, transform: style.transform };
+    });
+    expect(reduced).not.toBeNull();
+    expect(Number.parseFloat(reduced?.duration ?? "1s")).toBeLessThanOrEqual(0.06);
+    expect(reduced?.transform).toBe("none");
+    expect(errors).toEqual([]);
+  });
+
+  test("dark surfaces step and bevel", async ({ page }) => {
+    const errors = await boot(page, { theme: "dark" });
+    await page.getByTestId("appearance-button").click();
+    await expect(page.getByTestId("appearance-popover")).toBeVisible();
+    const values = await page.evaluate(() => {
+      const color = (selector: string) => {
+        const element = document.querySelector<HTMLElement>(selector);
+        return element ? getComputedStyle(element).backgroundColor : "";
+      };
+      const popover = document.querySelector<HTMLElement>('[data-testid="appearance-popover"]');
+      const style = popover ? getComputedStyle(popover) : null;
+      return {
+        grid: color('[data-testid="grid-pane"]'),
+        sidebar: color('[data-testid="sidebar"]'),
+        toolbar: color('[data-testid="toolbar"]'),
+        elevated: color('[data-testid="appearance-popover"]'),
+        borderWidth: style?.borderTopWidth ?? "",
+        boxShadow: style?.boxShadow ?? "",
+      };
+    });
+    const grid = luminance(values.grid);
+    const sidebar = luminance(values.sidebar);
+    const toolbar = luminance(values.toolbar);
+    const elevated = luminance(values.elevated);
+    expect(grid).toBeLessThan(sidebar);
+    expect(sidebar).toBeLessThanOrEqual(toolbar);
+    expect(toolbar).toBeLessThan(elevated);
+    expect(values.borderWidth).toBe("1px");
+    expect(values.boxShadow).toContain("inset");
+    expect(errors).toEqual([]);
+  });
+
+  test("glass keeps chrome translucent and grids opaque", async ({ page }) => {
+    const errors = await boot(page, {
+      theme: "dark",
+      surface: "glass",
+      accent: "teal",
+    });
+    const glass = await page.evaluate(() => {
+      const sidebar = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+      const grid = document.querySelector<HTMLElement>('[data-testid="grid-pane"]');
+      const header = document.querySelector<HTMLElement>('[data-testid="grid-header"]');
+      return {
+        sidebarFilter: sidebar ? getComputedStyle(sidebar).backdropFilter : "",
+        sidebarBg: sidebar ? getComputedStyle(sidebar).backgroundColor : "",
+        gridBg: grid ? getComputedStyle(grid).backgroundColor : "",
+        headerBg: header ? getComputedStyle(header).backgroundColor : "",
+      };
+    });
+    expect(glass.sidebarFilter).toContain("blur(22px)");
+    expect(alphaOf(glass.sidebarBg)).toBeLessThan(1);
+    expect(alphaOf(glass.gridBg)).toBeGreaterThanOrEqual(0.96);
+    expect(alphaOf(glass.headerBg)).toBeGreaterThanOrEqual(0.96);
+
+    await page.getByTestId("appearance-button").click();
+    await page.getByTestId("appearance-popover").locator('[data-accent-option="rose"]').click();
+    expect(await page.locator("html").getAttribute("data-accent")).toBe("rose");
+    await assertViewport(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("appearance controls persist", async ({ page }) => {
+    const errors = await boot(page, { seed: false, theme: "system" });
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.emulateMedia({ colorScheme: "light" });
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+    await page.getByTestId("appearance-button").click();
+    const popover = page.getByTestId("appearance-popover");
+    for (const id of ["blue", "graphite", "indigo", "teal", "green", "orange", "rose"]) {
+      await popover.locator(`[data-accent-option="${id}"]`).click();
+      const pair = await page.evaluate(() => {
+        const style = getComputedStyle(document.documentElement);
+        return {
+          accent: style.getPropertyValue("--accent").trim(),
+          foreground: style.getPropertyValue("--accent-on-solid").trim(),
+        };
+      });
+      expect(contrastHex(pair.accent, pair.foreground), `${id} contrast`).toBeGreaterThanOrEqual(
+        4.5,
+      );
+    }
+    await popover.getByRole("button", { name: "Dark", exact: true }).click();
+    await popover.getByRole("button", { name: "Glass", exact: true }).click();
+    await popover.locator('[data-accent-option="rose"]').click();
+    const hex = page.getByTestId("accent-hex");
+    await hex.fill("#123456");
+    await hex.press("Enter");
+    await popover.getByRole("button", { name: "Comfortable", exact: true }).click();
+    await page.keyboard.press("Escape");
+
+    const root = page.locator("html");
+    await expect(root).toHaveAttribute("data-theme", "dark");
+    await expect(root).toHaveAttribute("data-surface", "glass");
+    await expect(root).toHaveAttribute("data-accent", "custom");
+    await expect(root).toHaveAttribute("data-density", "comfortable");
+    const pair = await page.evaluate(() => {
+      const style = getComputedStyle(document.documentElement);
+      return {
+        accent: style.getPropertyValue("--accent").trim(),
+        foreground: style.getPropertyValue("--accent-on-solid").trim(),
+      };
+    });
+    expect(pair.accent.toLowerCase()).toBe("#123456");
+    expect(contrastHex(pair.accent, pair.foreground)).toBeGreaterThanOrEqual(4.5);
+
+    await page.reload();
+    await expect(page.getByTestId("grid-pane")).toBeVisible();
+    await expect(root).toHaveAttribute("data-theme", "dark");
+    await expect(root).toHaveAttribute("data-surface", "glass");
+    await expect(root).toHaveAttribute("data-accent", "custom");
+    await expect(root).toHaveAttribute("data-density", "comfortable");
+    const stored = await page.evaluate(() =>
+      window.localStorage.getItem("slabbase.appearance.v1"),
+    );
+    expect(stored).toContain('"version":1');
+    expect(errors).toEqual([]);
+  });
+
+  test("native chrome reserves traffic lights", async ({ page }) => {
+    const errors = await boot(page, { tauri: true });
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error("missing viewport");
+    await expect(page.locator("html")).toHaveAttribute("data-native", "true");
+    const sidebarHeaderPadding = await page
+      .locator(".sidebar-header")
+      .evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingLeft));
+    expect(sidebarHeaderPadding).toBeGreaterThanOrEqual(70);
+
+    if (viewport.width >= 1080) {
+      await page.getByTestId("sidebar-header-toggle").click();
+      await expect(page.getByTestId("toolbar")).toHaveClass(/traffic-space/);
+      await expect
+        .poll(() =>
+          page
+            .getByTestId("toolbar")
+            .evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingLeft)),
+        )
+        .toBeGreaterThanOrEqual(70);
+      const switcher = await getRect(page, '[data-testid="workspace-switcher"]');
+      expect(switcher.left).toBeGreaterThanOrEqual(12);
+    } else {
+      const toolbarPadding = await page
+        .getByTestId("toolbar")
+        .evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingLeft));
+      expect(toolbarPadding).toBeGreaterThanOrEqual(70);
+      await page.getByTestId("sidebar-toggle").click();
+      const headerPadding = await page
+        .locator(".sidebar-header")
+        .evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingLeft));
+      expect(headerPadding).toBeGreaterThanOrEqual(70);
+    }
+    expect(errors).toEqual([]);
+  });
+
+  test("overlay behavior follows viewport budgets", async ({ page }) => {
+    const errors = await boot(page);
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error("missing viewport");
+
+    if (viewport.width < 1080) {
+      const sidebar = page.getByTestId("sidebar");
+      const closed = await sidebar.boundingBox();
+      expect(closed?.x ?? 0).toBeLessThan(0);
+      await page.getByTestId("sidebar-toggle").click();
+      await page.waitForFunction(() => {
+        const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+        return node ? node.getBoundingClientRect().x >= 0 : false;
+      });
+      const open = await sidebar.boundingBox();
+      expect(open?.x).toBe(0);
+      expect(open?.width).toBe(240);
+      await assertViewport(page);
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => {
+        const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+        return node ? node.getBoundingClientRect().x < 0 : true;
+      });
+    }
+
+    await page.locator('[data-testid="grid-row"]').first().click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    const inspector = await page.evaluate(() => {
+      const element = document.querySelector<HTMLElement>('[data-testid="inspector"]');
+      const grid = document.querySelector<HTMLElement>('[data-testid="grid-pane"]');
+      if (!element || !grid) return null;
+      const style = getComputedStyle(element);
+      const gridRect = grid.getBoundingClientRect();
+      return {
+        position: style.position,
+        top: element.getBoundingClientRect().top,
+        bottom: element.getBoundingClientRect().bottom,
+        width: element.getBoundingClientRect().width,
+        gridWidth: gridRect.width,
+      };
+    });
+    expect(inspector).not.toBeNull();
+    expect(inspector?.gridWidth ?? 0).toBeGreaterThanOrEqual(480);
+    if (viewport.width < 1200) {
+      expect(inspector?.position).toBe("fixed");
+      expect(inspector?.top).toBe(48);
+      expect(inspector?.bottom).toBe(viewport.height - 26);
+      expect(inspector?.width ?? 0).toBeLessThanOrEqual(420);
+    } else {
+      expect(inspector?.position).toBe("static");
+      expect(inspector?.width).toBe(360);
+    }
+    expect(errors).toEqual([]);
+  });
+
+  test("scroll edges and overscroll stay contained", async ({ page }) => {
+    const errors = await boot(page);
+    await page.setViewportSize({ width: 1280, height: 360 });
+    await page.waitForFunction(() => {
+      const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
+      return Boolean(node && node.getBoundingClientRect().x >= 0);
+    });
+    await selectTable(page, "Line Items");
+    const scroll = page.getByTestId("grid-scroll");
+    const header = page.getByTestId("grid-header");
+    expect(await header.evaluate((element) => getComputedStyle(element).boxShadow)).toBe(
+      "none",
+    );
+    await scroll.evaluate((element) => {
+      element.scrollTop = 60;
+    });
+    await expect
+      .poll(() => header.evaluate((element) => getComputedStyle(element).boxShadow))
+      .not.toBe("none");
+    await scroll.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await expect
+      .poll(() => header.evaluate((element) => getComputedStyle(element).boxShadow))
+      .toBe("none");
+    const overscroll = await scroll.evaluate(
+      (element) => getComputedStyle(element).overscrollBehaviorY,
+    );
+    expect(overscroll).toBe("contain");
+    expect(errors).toEqual([]);
+  });
+});
