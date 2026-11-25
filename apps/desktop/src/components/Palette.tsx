@@ -165,6 +165,7 @@ export function Palette() {
           <input
             autoFocus
             value={query}
+            aria-label="Search records and commands"
             placeholder="Search records or run a command…"
             onChange={(event) => {
               setQuery(event.target.value);

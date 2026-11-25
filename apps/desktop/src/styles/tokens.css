@@ -69,11 +69,11 @@
   --border-paper: rgba(0, 0, 0, 0.11);
 
   --text-primary: #1d1d1f;
-  --text-secondary: #6e6e73;
-  --text-tertiary: #86868b;
+  --text-secondary: #646469;
+  --text-tertiary: #6b6b70;
   --text-on-accent: #ffffff;
   --text-on-danger: #ffffff;
-  --text-on-accent-muted: rgba(255, 255, 255, 0.78);
+  --text-on-accent-muted: rgba(255, 255, 255, 0.92);
 
   --accent: #0066cc;
   --accent-hover: color-mix(in srgb, var(--accent) 82%, #000000);
@@ -154,9 +154,9 @@
   --border-paper: rgba(255, 255, 255, 0.14);
 
   --text-primary: #f2f2f7;
-  --text-secondary: #98989f;
-  --text-tertiary: #63636a;
-  --text-on-accent-muted: rgba(0, 0, 0, 0.72);
+  --text-secondary: #b0b0b7;
+  --text-tertiary: #9a9aa1;
+  --text-on-accent-muted: rgba(0, 0, 0, 0.9);
 
   --accent: #0a84ff;
   --accent-hover: color-mix(in srgb, var(--accent) 82%, #ffffff);
@@ -264,4 +264,47 @@
 
 :root[data-native="true"] {
   --traffic-light-inset: 78px;
+}
+
+/* High-contrast preference: strengthen hairlines, controls, and secondary
+   text beyond the default WCAG AA floor. Text tokens below keep at least
+   4.5:1 against their owning surfaces; control borders keep at least 3:1. */
+@media (prefers-contrast: more) {
+  :root {
+    --border-hairline: rgba(0, 0, 0, 0.32);
+    --border-control: rgba(0, 0, 0, 0.62);
+    --border-grid: rgba(0, 0, 0, 0.2);
+    --border-elevated-solid: rgba(0, 0, 0, 0.35);
+    --border-elevated: var(--border-elevated-solid);
+    --border-paper: rgba(0, 0, 0, 0.4);
+    --glass-edge: var(--border-hairline);
+    --text-primary: #000000;
+    --text-secondary: #45454b;
+    --text-tertiary: #56565c;
+    --bg-field-solid: #ffffff;
+    --bg-hover-solid: #e7e7ea;
+    --bg-search-solid: rgba(0, 0, 0, 0.1);
+    --bg-segmented-solid: rgba(0, 0, 0, 0.12);
+    --scrollbar-thumb: rgba(0, 0, 0, 0.55);
+    --scrollbar-thumb-hover: rgba(0, 0, 0, 0.75);
+  }
+
+  :root[data-theme="dark"] {
+    --border-hairline: rgba(255, 255, 255, 0.3);
+    --border-control: rgba(255, 255, 255, 0.62);
+    --border-grid: rgba(255, 255, 255, 0.2);
+    --border-elevated-solid: rgba(255, 255, 255, 0.38);
+    --border-elevated: var(--border-elevated-solid);
+    --border-paper: rgba(255, 255, 255, 0.44);
+    --glass-edge: var(--border-hairline);
+    --text-primary: #ffffff;
+    --text-secondary: #d7d7dc;
+    --text-tertiary: #c2c2c8;
+    --bg-field-solid: #101012;
+    --bg-hover-solid: #303036;
+    --bg-search-solid: rgba(255, 255, 255, 0.13);
+    --bg-segmented-solid: rgba(255, 255, 255, 0.16);
+    --scrollbar-thumb: rgba(255, 255, 255, 0.55);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.75);
+  }
 }

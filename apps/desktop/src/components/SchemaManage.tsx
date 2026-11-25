@@ -25,6 +25,7 @@ export function SchemaManage({ schema, activeTable, onTableSelected }: SchemaMan
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [indexes, setIndexes] = useState<IndexSpec[]>([]);
   const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
 
@@ -60,8 +61,12 @@ export function SchemaManage({ schema, activeTable, onTableSelected }: SchemaMan
 
   const run = async (action: () => Promise<boolean>) => {
     setBusy(true);
+    setProblem(null);
     const ok = await action();
     setBusy(false);
+    if (!ok) {
+      setProblem(useStore.getState().toast?.message ?? "Schema operation failed");
+    }
     return ok;
   };
 
@@ -108,6 +113,11 @@ export function SchemaManage({ schema, activeTable, onTableSelected }: SchemaMan
 
   return (
     <div className="manage">
+      {problem && (
+        <div className="manage-error" role="alert" data-testid="schema-error">
+          {problem}
+        </div>
+      )}
       <div className="manage-header">
         <select
           className="select manage-table-select"

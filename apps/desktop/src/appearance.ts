@@ -32,7 +32,7 @@ interface AccentPreset {
 }
 
 export const ACCENTS: Record<Exclude<AccentId, "custom">, AccentPreset> = {
-  blue: { label: "Blue", light: "#0066cc", dark: "#0a84ff" },
+  blue: { label: "Blue", light: "#0066cc", dark: "#148aff" },
   graphite: { label: "Graphite", light: "#636366", dark: "#aeaeb2" },
   indigo: { label: "Indigo", light: "#4f46e5", dark: "#7c7cff" },
   teal: { label: "Teal", light: "#007c89", dark: "#40c8e0" },

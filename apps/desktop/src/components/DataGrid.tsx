@@ -11,7 +11,7 @@ import { FieldInput } from "./FieldInput";
 import { Icon } from "./Icons";
 
 const HEADER_HEIGHT = 28;
-const MIN_COLUMN_WIDTH = 150;
+const MIN_COLUMN_WIDTH = 200;
 
 export function DataGrid() {
   const schema = useStore((state) => state.schema);
@@ -44,6 +44,7 @@ export function DataGrid() {
   );
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const selectTimer = useRef<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState(600);
   const [editing, setEditing] = useState<{ id: number; column: string } | null>(null);
@@ -63,6 +64,24 @@ export function DataGrid() {
     setFilterDraft(filterText);
     scrollRef.current?.scrollTo({ top: 0 });
   }, [activeTable, filterText]);
+
+  useEffect(
+    () => () => {
+      if (selectTimer.current !== null) window.clearTimeout(selectTimer.current);
+    },
+    [],
+  );
+
+  const selectSoon = (id: number) => {
+    if (selectTimer.current !== null) window.clearTimeout(selectTimer.current);
+    // A double-click must reach the cell before the inspector opens and
+    // narrows the grid, otherwise horizontally scrolled columns move between
+    // the two clicks and the edit never starts.
+    selectTimer.current = window.setTimeout(() => {
+      selectTimer.current = null;
+      void selectRow(id);
+    }, 180);
+  };
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -258,6 +277,12 @@ export function DataGrid() {
         className="grid-viewport"
         data-testid="grid-scroll"
         tabIndex={0}
+        onFocus={() => {
+          if (!active && rows.length > 0) {
+            setActive({ row: 0, column: 0 });
+            void selectRow(rows[0]!.id);
+          }
+        }}
         onKeyDown={handleKeyDown}
         onScroll={(event) => {
           const element = event.currentTarget;
@@ -326,7 +351,7 @@ export function DataGrid() {
                   onMouseDown={() =>
                     setActive({ row: index, column: active?.column ?? 0 })
                   }
-                  onClick={() => void selectRow(record.id)}
+                  onClick={() => selectSoon(record.id)}
                   onContextMenu={(event) => {
                     event.preventDefault();
                     setContextMenu({ x: event.clientX, y: event.clientY, id: record.id });
@@ -352,9 +377,13 @@ export function DataGrid() {
                         data-column={column.name}
                         data-numeric={isNumericColumn(column) ? "true" : "false"}
                         onDoubleClick={() => {
-                          if (!isComputedColumn(column)) {
-                            setEditing({ id: record.id, column: column.name });
+                          if (isComputedColumn(column)) return;
+                          if (selectTimer.current !== null) {
+                            window.clearTimeout(selectTimer.current);
+                            selectTimer.current = null;
                           }
+                          useStore.setState({ selectedId: record.id });
+                          setEditing({ id: record.id, column: column.name });
                         }}
                       >
                         {isEditing ? (
@@ -377,7 +406,11 @@ export function DataGrid() {
                         ) : isNull(value) ? (
                           <span className="cell-null">NULL</span>
                         ) : (
-                          <span className="cell-text" title={cellText(value)}>
+                          <span
+                            className="cell-text"
+                            dir="auto"
+                            title={cellText(value)}
+                          >
                             {cellText(value)}
                           </span>
                         )}

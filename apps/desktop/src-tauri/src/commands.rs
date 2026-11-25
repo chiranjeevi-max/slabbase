@@ -446,8 +446,16 @@ struct WorkspaceSink<'a> {
 impl ImportSink for WorkspaceSink<'_> {
     fn insert_row(&mut self, table: &str, values: &RowData) -> Result<RowId, ImportError> {
         self.workspace
-            .insert_row(table, values)
-            .map(|record| record.id)
+            .insert_import_rows(table, std::slice::from_ref(values))
+            .map_err(|error| ImportError::Sink(format!("{}: {error}", error.code_str())))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ImportError::Sink("insert returned no row id".into()))
+    }
+
+    fn insert_batch(&mut self, table: &str, rows: &[RowData]) -> Result<Vec<RowId>, ImportError> {
+        self.workspace
+            .insert_import_rows(table, rows)
             .map_err(|error| ImportError::Sink(format!("{}: {error}", error.code_str())))
     }
 }
@@ -490,16 +498,29 @@ pub async fn apply_import(
         }
         let mut reader = open_file(&path)?;
         let mut adapter = adapter_for(&format)?;
-        let mut sink = WorkspaceSink { workspace };
-        let summary = slab_import::apply(
-            adapter.as_mut(),
-            &mut reader,
-            &options,
-            &table,
-            &mapping,
-            &mut sink,
-        )?;
-        Ok(ImportSummaryDto::from(summary))
+        workspace.begin_import()?;
+        let outcome = {
+            let mut sink = WorkspaceSink { workspace };
+            slab_import::apply(
+                adapter.as_mut(),
+                &mut reader,
+                &options,
+                &table,
+                &mapping,
+                &mut sink,
+            )
+            .map_err(ApiError::from)
+        };
+        match outcome {
+            Ok(summary) => {
+                workspace.commit_import()?;
+                Ok(ImportSummaryDto::from(summary))
+            }
+            Err(error) => {
+                let _ = workspace.rollback_import();
+                Err(error)
+            }
+        }
     })
     .await
 }

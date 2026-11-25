@@ -6,7 +6,7 @@ export function Toasts() {
   const clear = useStore((state) => state.clearToast);
   if (!toast) return null;
   return (
-    <div className={`toast ${toast.tone}`} role="status">
+    <div className={`toast ${toast.tone}`} role="status" data-testid="toast">
       <span className="toast-dot" />
       <div>
         {toast.code && <span className="toast-code">{toast.code}</span>}

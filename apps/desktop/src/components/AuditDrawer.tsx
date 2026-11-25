@@ -34,7 +34,12 @@ export function AuditDrawer() {
             <span className="eyebrow">Local history</span>
             <h2>Audit log</h2>
           </div>
-          <button type="button" className="icon-button" onClick={close}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Close audit log"
+            onClick={close}
+          >
             <Icon name="x" size={15} />
           </button>
         </header>

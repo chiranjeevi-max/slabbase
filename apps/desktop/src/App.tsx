@@ -27,6 +27,12 @@ const INSPECTOR_DEFAULT = 360;
 const INSPECTOR_MIN = 320;
 const INSPECTOR_MAX = 480;
 const WORKSPACE_MIN = 540;
+const ZOOM_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
+
+function readZoom(): number {
+  const stored = Number(window.localStorage.getItem("slabbase.zoom.v1"));
+  return ZOOM_STEPS.includes(stored as (typeof ZOOM_STEPS)[number]) ? stored : 1;
+}
 
 export function App() {
   const booting = useStore((state) => state.booting);
@@ -34,8 +40,6 @@ export function App() {
   const view = useStore((state) => state.view);
   const inspectorOpen = useStore((state) => state.inspectorOpen);
   const tables = useStore((state) => state.schema?.tables.length ?? 0);
-  const isNarrowSidebar = useMediaQuery("(max-width: 1079px)");
-  const isInspectorOverlay = useMediaQuery("(max-width: 1199px)");
   const native = isTauri();
 
   const [sidebarWidth, setSidebarWidth] = useState(() =>
@@ -52,6 +56,12 @@ export function App() {
   const [sidebarDocked, setSidebarDocked] = useState(true);
   const [sidebarOverlay, setSidebarOverlay] = useState(false);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const [zoom, setZoom] = useState(readZoom);
+  const narrowQuery = useMediaQuery("(max-width: 1079px)");
+  const inspectorQuery = useMediaQuery("(max-width: 1199px)");
+  const effectiveWidth = viewportWidth / zoom;
+  const isNarrowSidebar = narrowQuery || effectiveWidth < 1080;
+  const isInspectorOverlay = inspectorQuery || effectiveWidth < 1200;
   const inspectorPresence = usePresence(view === "table" && inspectorOpen, 110);
   const sidebarToggleRef = useRef<() => void>(() => {});
   const lastMenuUndoRef = useRef(0);
@@ -69,6 +79,13 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem("slabbase.sidebarWidth", String(sidebarWidth));
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--app-zoom", String(zoom));
+    document.documentElement.dataset["zoom"] = String(Math.round(zoom * 100));
+    document.documentElement.dataset["zoomTier"] = zoom >= 1.75 ? "tight" : zoom > 1 ? "compact" : "normal";
+    window.localStorage.setItem("slabbase.zoom.v1", String(zoom));
+  }, [zoom]);
 
   useEffect(() => {
     window.localStorage.setItem("slabbase.inspectorWidth", String(inspectorWidth));
@@ -98,10 +115,25 @@ export function App() {
     const handler = (event: KeyboardEvent) => {
       const state = useStore.getState();
       const meta = event.metaKey || event.ctrlKey;
+      const alt = event.altKey;
       const key = event.key.toLowerCase();
       const editing = isTextEntry(event.target);
 
-      if (meta && key === "k") {
+      if (meta && alt && event.code === "KeyS") {
+        event.preventDefault();
+        toggleSidebar();
+      } else if (meta && alt && event.code === "KeyI") {
+        if (!state.info || state.view === "schema") return;
+        event.preventDefault();
+        state.toggleInspector();
+      } else if (meta && ["1", "2", "3", "4"].includes(key)) {
+        if (!state.info) return;
+        event.preventDefault();
+        if (key === "1") state.setView("table");
+        else if (key === "2") state.setView("form");
+        else if (key === "3") state.setView("schema");
+        else void state.openAudit();
+      } else if (meta && key === "k") {
         if (!state.info) return;
         event.preventDefault();
         state.setPaletteOpen(true);
@@ -111,6 +143,19 @@ export function App() {
         event.preventDefault();
         if (event.shiftKey) void state.redo();
         else void state.undo();
+      } else if (meta && (key === "=" || key === "+")) {
+        event.preventDefault();
+        const index = ZOOM_STEPS.indexOf(zoom as (typeof ZOOM_STEPS)[number]);
+        const next = ZOOM_STEPS[Math.min(ZOOM_STEPS.length - 1, index + 1)] ?? 1;
+        setZoom(next);
+      } else if (meta && key === "-") {
+        event.preventDefault();
+        const index = ZOOM_STEPS.indexOf(zoom as (typeof ZOOM_STEPS)[number]);
+        const next = index <= 0 ? 1 : (ZOOM_STEPS[index - 1] ?? 1);
+        setZoom(next);
+      } else if (meta && key === "0") {
+        event.preventDefault();
+        setZoom(1);
       } else if (meta && key === ",") {
         event.preventDefault();
         state.setAppearanceOpen(true);
@@ -141,7 +186,7 @@ export function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isNarrowSidebar, sidebarOverlay]);
+  }, [isNarrowSidebar, sidebarOverlay, zoom]);
 
   const sidebarVisible = isNarrowSidebar ? sidebarOverlay : sidebarDocked;
   const showSidebar = Boolean(info) && (isNarrowSidebar || sidebarDocked);
@@ -736,8 +781,9 @@ function Sidebar({
               className="source-row"
               data-testid="source-row"
               onClick={() => {
+                // Keep the navigation drawer mounted beneath the audit sheet so
+                // dismissal can return focus to this exact row.
                 void openAudit();
-                closeOverlay();
               }}
             >
               <Icon name="history" size={14} strokeWidth={1.5} />

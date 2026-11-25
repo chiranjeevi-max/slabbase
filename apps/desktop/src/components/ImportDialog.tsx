@@ -159,7 +159,12 @@ export function ImportDialog() {
             <span className="eyebrow">Import</span>
             <h2>Stream in records</h2>
           </div>
-          <button type="button" className="icon-button" onClick={() => setOpen(false)}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Close import dialog"
+            onClick={() => setOpen(false)}
+          >
             <Icon name="x" size={15} />
           </button>
         </header>

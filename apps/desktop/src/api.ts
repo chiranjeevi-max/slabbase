@@ -73,6 +73,7 @@ function requestedFixture(): FixtureMode | null {
   const value = new URLSearchParams(window.location.search).get("fixture");
   if (value === "design-studio") return "full";
   if (value === "empty") return "empty";
+  if (value === "stress") return "stress";
   return null;
 }
 
@@ -81,7 +82,11 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
     const mode = requestedFixture();
     if (mode) {
       const { fixtureCall } = await import("./fixture");
-      return fixtureCall<T>(command, args, mode);
+      try {
+        return await fixtureCall<T>(command, args, mode);
+      } catch (error) {
+        throw normalizeError(error);
+      }
     }
   }
   try {

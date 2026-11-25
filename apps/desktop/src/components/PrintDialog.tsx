@@ -138,7 +138,12 @@ export function PrintDialog() {
             <span className="eyebrow">Print</span>
             <h2>{table?.name ?? "Report"}</h2>
           </div>
-          <button type="button" className="icon-button" onClick={() => setOpen(false)}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Close print dialog"
+            onClick={() => setOpen(false)}
+          >
             <Icon name="x" size={15} />
           </button>
         </header>

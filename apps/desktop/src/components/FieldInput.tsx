@@ -68,6 +68,10 @@ export function FieldInput({
   };
 
   const handleKeyDown = (event: React.KeyboardEvent) => {
+    // IME composition owns Enter until compositionend. Committing here would
+    // close the editor mid-word for Japanese, Chinese, Korean, and Vietnamese
+    // input methods.
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
       event.preventDefault();
       void commit();
@@ -133,6 +137,7 @@ export function FieldInput({
       <label className={`field-check ${compact ? "compact" : ""} ${pulse ? "pulse" : ""}`}>
         <input
           type="checkbox"
+          aria-label={column.name}
           checked={checked}
           onChange={(event) => {
             void onCommit({ Boolean: event.target.checked });
@@ -152,6 +157,7 @@ export function FieldInput({
         value={text}
         autoFocus={autoFocus}
         aria-label={column.name}
+        dir="auto"
         spellCheck={false}
         onChange={(event) => setText(event.target.value)}
         onBlur={() => void commit()}
@@ -184,6 +190,7 @@ export function FieldInput({
         value={text}
         autoFocus={autoFocus}
         aria-label={column.name}
+        dir="auto"
         placeholder={
           column.ty.kind === "timestamp"
             ? "YYYY-MM-DDTHH:MM:SSZ"

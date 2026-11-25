@@ -315,6 +315,7 @@ export function SchemaDialog() {
                         type="button"
                         className="icon-button tiny"
                         title="Remove column"
+                        aria-label="Remove column"
                         onClick={() =>
                           setTableColumns((current) =>
                             current.filter((_, position) => position !== index),
