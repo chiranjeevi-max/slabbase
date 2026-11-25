@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slab_core::{
@@ -644,11 +645,66 @@ fn collect_rows_bounded(
     Ok((rows, truncated))
 }
 
+/// A temporary sibling that removes itself unless it was published.
+///
+/// Exports write here first and rename on success, so a validation error, a
+/// cancelled page, or a full disk cannot truncate an existing export.
+struct ExportTemp {
+    path: PathBuf,
+    published: bool,
+}
+
+impl ExportTemp {
+    fn create(target: &str) -> Result<(Self, File), ApiError> {
+        let target = Path::new(target);
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for serial in 0..64 {
+            let path = parent.join(format!(
+                ".slabbase-export-{}-{serial}.tmp",
+                std::process::id()
+            ));
+            match File::create_new(&path) {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path,
+                            published: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(ApiError::internal(
+            "could not allocate an export scratch file",
+        ))
+    }
+
+    fn publish(mut self, target: &str) -> Result<(), ApiError> {
+        std::fs::rename(&self.path, target)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExportTemp {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Renders one exported value.
 ///
-/// A spreadsheet evaluates a leading `=`, `+`, `-`, `@`, tab, or carriage
-/// return even when the field is CSV-quoted. Imported data is untrusted, so
-/// text that would be treated as a formula is prefixed with a single quote.
+/// A spreadsheet evaluates a leading `=`, `+`, `-`, `@`, tab, carriage return,
+/// or line feed even when the field is CSV-quoted. Imported data is untrusted,
+/// so text that would be treated as a formula is prefixed with a single quote.
 /// Numeric values are never prefixed: a negative amount is data.
 fn csv_cell(value: &Value) -> String {
     let text = value.display_string();
@@ -659,7 +715,7 @@ fn csv_cell(value: &Value) -> String {
     let formula_like = text
         .chars()
         .next()
-        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'));
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r' | '\n'));
     if text_like && formula_like {
         format!("'{text}")
     } else {
@@ -692,7 +748,7 @@ pub async fn export_csv(
             .iter()
             .map(|column| column.name.clone())
             .collect();
-        let file = File::create(&path)?;
+        let (temporary, file) = ExportTemp::create(&path)?;
         let mut writer = csv::WriterBuilder::new()
             .has_headers(false)
             .from_writer(BufWriter::new(file));
@@ -712,7 +768,8 @@ pub async fn export_csv(
             }
         }
         writer.flush()?;
-        Ok(())
+        drop(writer);
+        temporary.publish(&path)
     })
     .await
 }
@@ -736,7 +793,7 @@ fn export_json_to(workspace: &Workspace, path: &str, mut query: PageQuery) -> Re
     if schema.table(&query.table).is_none() {
         return Err(ApiError::new("SLAB_E_NOT_FOUND", "table is missing"));
     }
-    let file = File::create(path)?;
+    let (temporary, file) = ExportTemp::create(path)?;
     let mut out = BufWriter::new(file);
     out.write_all(b"[\n")?;
     let mut first = true;
@@ -762,7 +819,8 @@ fn export_json_to(workspace: &Workspace, path: &str, mut query: PageQuery) -> Re
     }
     out.write_all(b"\n]\n")?;
     out.flush()?;
-    Ok(())
+    drop(out);
+    temporary.publish(path)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -946,7 +1004,7 @@ pub async fn export_table_pdf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slab_core::{ColumnDraft, ColumnType, TableDraft};
+    use slab_core::{ColumnDraft, ColumnType, SortDirection, SortSpec, TableDraft};
     use slab_sync::HybridLogicalClock;
     use std::fs;
 
@@ -972,6 +1030,7 @@ mod tests {
                 ("Amount".to_owned(), Value::Integer(-5)),
                 ("Plus".to_owned(), Value::from("+1+1")),
                 ("At".to_owned(), Value::from("@SUM(A1)")),
+                ("Newline".to_owned(), Value::from("\n=SUM(A1)")),
             ]),
         };
         let columns = vec![
@@ -979,6 +1038,7 @@ mod tests {
             "Amount".to_owned(),
             "Plus".to_owned(),
             "At".to_owned(),
+            "Newline".to_owned(),
         ];
         let row = csv_record(&record, &columns);
         assert_eq!(row[0], "7");
@@ -986,6 +1046,7 @@ mod tests {
         assert_eq!(row[2], "-5", "a negative numeric value is data");
         assert_eq!(row[3], "'+1+1");
         assert_eq!(row[4], "'@SUM(A1)");
+        assert_eq!(row[5], "'\n=SUM(A1)");
     }
 
     #[test]
@@ -1018,6 +1079,28 @@ mod tests {
             fs::read_to_string(&path).expect("read export"),
             "keep me",
             "a failed export truncated the previous file"
+        );
+
+        // A valid table with an invalid sort or filter reaches page()
+        // validation after the destination used to be truncated.
+        let invalid_sort = export_json_to(
+            &workspace,
+            path.to_str().expect("path"),
+            PageQuery {
+                table: "Notes".into(),
+                sort: vec![SortSpec {
+                    column: "Missing".into(),
+                    direction: SortDirection::Asc,
+                }],
+                ..PageQuery::default()
+            },
+        )
+        .expect_err("an unknown sort column must fail");
+        assert_eq!(invalid_sort.code, "SLAB_E_QUERY");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read export"),
+            "keep me",
+            "a failed page validation truncated the previous file"
         );
     }
 }

@@ -6,7 +6,7 @@
 //! rebuild commits between those two steps, the prepared SQL can name a column
 //! that no longer exists. Schema writes therefore exclude read leases.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -58,11 +58,13 @@ fn readers_survive_concurrent_schema_churn() {
     .expect("seed");
 
     let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(17));
     let mut readers = Vec::new();
     for _ in 0..16 {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
+        let reads = Arc::clone(&reads);
         let barrier = Arc::clone(&barrier);
         readers.push(std::thread::spawn(move || {
             barrier.wait();
@@ -85,6 +87,7 @@ fn readers_survive_concurrent_schema_churn() {
                         break;
                     }
                 }
+                reads.fetch_add(1, Ordering::Relaxed);
                 std::thread::yield_now();
             }
             errors
@@ -134,6 +137,10 @@ fn readers_survive_concurrent_schema_churn() {
     for reader in readers {
         errors.extend(reader.join().expect("reader join"));
     }
+    assert!(
+        reads.load(Ordering::Relaxed) > 0,
+        "the stress test never completed a read"
+    );
     assert!(
         errors.is_empty(),
         "schema churn produced {} read errors: {:?}",

@@ -80,10 +80,16 @@ fn switching_workspaces_isolates_stale_cancel_handles() {
         "the current query was not interrupted"
     );
 
+    let before_close = db.cancel_handle();
     db.close().expect("close");
+    let after_close = db.cancel_handle();
+    assert!(
+        !Arc::ptr_eq(&before_close, &after_close),
+        "close reused the previous cancellation generation"
+    );
     assert!(
         !db.cancel_query(),
-        "closing the workspace left a live cancellation registration"
+        "the fresh generation after close must start idle"
     );
 }
 
