@@ -1763,6 +1763,49 @@ for (const timezoneId of [
   });
 }
 
+test.describe("systems upgrades", () => {
+  test("record time-travel drawer shows diffs and restores a revision", async ({ page }) => {
+    const errors = await boot(page, { fixture: "design-studio" });
+    await openInspector(page);
+    const toggle = page.getByTestId("record-history-toggle");
+    await expect(toggle).toBeVisible();
+    await toggle.click();
+    const history = page.getByTestId("record-history");
+    await expect(history).toBeVisible();
+    await expect(history.locator(".revision").first()).toBeVisible();
+    await expect(history.locator(".revision-diff").first()).toBeVisible();
+    await expect(history.locator(".revision-arrow").first()).toHaveText("→");
+    await history.getByRole("button", { name: "Restore" }).first().click();
+    await expect(history).toBeVisible();
+    await assertChromeContainment(page);
+    await assertViewport(page);
+    const results = await new AxeBuilder({ page })
+      .include('[data-testid="inspector"]')
+      .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+      .analyze();
+    const serious = results.violations.filter(
+      (violation) => violation.impact === "critical" || violation.impact === "serious",
+    );
+    expect(serious, JSON.stringify(serious, null, 2)).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test("index advisor pill creates an index and refreshes quietly", async ({ page }) => {
+    const errors = await openWideStress(page);
+    await page.locator('.grid-head-cell.column-header[data-column="Column 01"]').click();
+    const pill = page.getByTestId("index-hint");
+    await expect(pill).toBeVisible();
+    await expect(pill).toContainText("Full scan");
+    await expect(pill).toContainText('Index "Column 01"');
+    await assertChromeContainment(page);
+    await assertViewport(page);
+    await pill.getByRole("button", { name: /Full scan/ }).click();
+    await expect(page.getByTestId("index-hint")).toHaveCount(0);
+    await assertViewport(page);
+    expect(errors).toEqual([]);
+  });
+});
+
 test.describe("accessibility", () => {
   test("axe WCAG 2.2 AA scan finds no serious violations", async ({ page }) => {
     test.setTimeout(120_000);
