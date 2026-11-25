@@ -545,3 +545,130 @@ fn committed_sample_workspace_opens_with_live_rollups() {
     let schema = workspace.schema().expect("schema");
     assert_eq!(schema.layouts.len(), 3);
 }
+
+#[test]
+fn portals_paginate_one_thousand_two_hundred_children_without_truncation() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Invoices".into(),
+            columns: vec![required_text("Number")],
+        })
+        .expect("invoices");
+    workspace
+        .create_table(&TableDraft {
+            name: "Line Items".into(),
+            columns: vec![
+                required_text("Description"),
+                required_integer("Quantity"),
+                ColumnDraft {
+                    name: "Unit Price".into(),
+                    ty: ColumnType::Currency {
+                        currency: slab_core::CurrencyCode::from_static(*b"USD"),
+                    },
+                    required: false,
+                    unique: false,
+                    default: None,
+                },
+                required_integer("Invoice"),
+                ColumnDraft {
+                    name: "Amount".into(),
+                    ty: ColumnType::Formula {
+                        expression: "ROUND([Quantity] * [Unit Price], 2)".into(),
+                    },
+                    required: false,
+                    unique: false,
+                    default: None,
+                },
+            ],
+        })
+        .expect("lines");
+    workspace
+        .create_relation(&RelationDraft {
+            name: "Invoice Lines".into(),
+            parent_table: "Invoices".into(),
+            child_table: "Line Items".into(),
+            child_column: "Invoice".into(),
+            on_delete: DeleteAction::Cascade,
+        })
+        .expect("relation");
+    workspace
+        .add_column(
+            "Invoices",
+            &ColumnDraft {
+                name: "Subtotal".into(),
+                ty: ColumnType::Formula {
+                    expression: "SUM([Invoice Lines].[Amount])".into(),
+                },
+                required: false,
+                unique: false,
+                default: None,
+            },
+        )
+        .expect("rollup");
+    let invoice = workspace
+        .insert_row(
+            "Invoices",
+            &row(&[("Number", Value::Text("INV-1200".into()))]),
+        )
+        .expect("invoice");
+    let mut children = Vec::with_capacity(1_200);
+    for index in 0..1_200 {
+        children.push(row(&[
+            ("Description", Value::Text(format!("Line {index}"))),
+            ("Quantity", Value::Integer(1)),
+            (
+                "Unit Price",
+                Value::Currency(
+                    slab_core::Money::from_minor(
+                        slab_core::CurrencyCode::from_static(*b"USD"),
+                        100,
+                    )
+                    .expect("money"),
+                ),
+            ),
+            ("Invoice", Value::Integer(invoice.id)),
+        ]));
+    }
+    let inserted = workspace
+        .insert_rows("Line Items", &children)
+        .expect("batch insert");
+    assert_eq!(inserted.len(), 1_200);
+
+    let mut cursor = None;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut pages = 0_u32;
+    loop {
+        let page = workspace
+            .page_portal(&slab_core::PortalQuery {
+                relation: "Invoice Lines".into(),
+                parent_id: invoice.id,
+                limit: 100,
+                cursor,
+            })
+            .expect("portal page");
+        assert_eq!(page.total_rows, 1_200);
+        assert!(page.rows.len() <= 100);
+        for child in &page.rows {
+            assert!(ids.insert(child.id));
+        }
+        pages += 1;
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(pages < 20, "portal pagination did not terminate");
+    }
+    assert_eq!(pages, 12);
+    assert_eq!(ids.len(), 1_200);
+    let parent = workspace
+        .read_record("Invoices", invoice.id)
+        .expect("parent");
+    assert_eq!(
+        parent.get("Subtotal"),
+        Some(&Value::Currency(
+            slab_core::Money::from_minor(slab_core::CurrencyCode::from_static(*b"USD"), 120_000,)
+                .expect("subtotal")
+        ))
+    );
+}
