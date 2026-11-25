@@ -210,3 +210,33 @@ fn nested_parentheses_within_limit_evaluate() {
     assert!(eval("1e10", &Context::new(Vec::new())).is_err());
     let _ = BinaryOp::Add;
 }
+
+#[test]
+fn renaming_to_a_non_bare_name_brackets_the_reference() {
+    let rewritten = slab_formula::rewrite_column_source("Qty * Price", None, "Price", "Unit Price")
+        .expect("rewrite");
+    assert_eq!(rewritten, "Qty * [Unit Price]");
+    assert!(
+        slab_formula::parse(&rewritten).is_ok(),
+        "rewritten formula no longer parses"
+    );
+
+    let already_bracketed =
+        slab_formula::rewrite_column_source("[Qty] * [Price]", None, "Price", "Unit Price")
+            .expect("rewrite");
+    assert_eq!(already_bracketed, "[Qty] * [Unit Price]");
+
+    let keyword =
+        slab_formula::rewrite_column_source("Qty * Price", None, "Price", "And").expect("rewrite");
+    assert_eq!(keyword, "Qty * [And]");
+    assert!(slab_formula::parse(&keyword).is_ok());
+
+    let qualified = slab_formula::rewrite_column_source(
+        "[Items].[Price]",
+        Some("Items"),
+        "Price",
+        "Unit Price",
+    )
+    .expect("rewrite");
+    assert_eq!(qualified, "[Items].[Unit Price]");
+}

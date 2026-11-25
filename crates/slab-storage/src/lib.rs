@@ -20,7 +20,8 @@ mod workspace;
 
 pub use error::StorageError;
 pub use workspace::{
-    IntegrityReport, QueryCancel, SnapshotKind, SnapshotReport, Workspace, WorkspaceInfo,
+    CancelRegistration, IntegrityReport, QueryCancel, SnapshotKind, SnapshotReport, Workspace,
+    WorkspaceInfo,
 };
 
 /// The crate version exposed to the shell.

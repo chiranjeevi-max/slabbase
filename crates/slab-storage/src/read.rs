@@ -711,21 +711,26 @@ struct AggregateTarget<'a> {
     aggregate: Aggregate,
 }
 
-/// Registers the active query handle and clears it on every exit path.
+/// Registers the active query handle and retires exactly that registration on
+/// every exit path.
 struct ActiveQuery<'a> {
     cancel: &'a crate::workspace::QueryCancel,
+    registration: crate::workspace::CancelRegistration,
 }
 
 impl<'a> ActiveQuery<'a> {
     fn begin(cancel: &'a crate::workspace::QueryCancel, handle: rusqlite::InterruptHandle) -> Self {
-        cancel.register(handle);
-        Self { cancel }
+        let registration = cancel.register(handle);
+        Self {
+            cancel,
+            registration,
+        }
     }
 }
 
 impl Drop for ActiveQuery<'_> {
     fn drop(&mut self) {
-        self.cancel.clear();
+        self.cancel.clear_registration(self.registration);
     }
 }
 
