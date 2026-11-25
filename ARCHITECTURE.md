@@ -98,7 +98,7 @@ a five-second busy timeout serialize writers without ever holding a read
 behind them. WAL permits readers to observe the last committed snapshot while
 the writer holds its transaction, so a 20,000-row import and sustained
 pagination/search both complete with zero `SQLITE_BUSY` failures. The release
-stress run completed 26 page/search batches during one 20,000-row write
+stress runs complete 26–27 page/search batches during one 20,000-row write
 transaction with zero busy errors.
 
 Clean close drops the readers first, runs `PRAGMA optimize`, then
@@ -127,7 +127,9 @@ record is read, so an affected parent's formulas use the refreshed rollup inputs
 without rescanning unrelated tables. Schema changes invalidate the cache once;
 the next read rebuilds only the parents it touches. The reference measurement
 for one child edit plus the parent read on a 10,000-child parent is 0.81 ms
-median and 1.26 ms p95.
+median and 1.0–1.3 ms p95. A cold full recomputation of the same parent is
+0.77 ms on this hardware; the incremental path removes the per-child scan so
+it stays flat as the relation grows.
 
 ### `slab-import`
 
@@ -184,11 +186,11 @@ The extra row determines `next_cursor` without a count query. `NULL` values sort
 
 Child portals use the same keyset path through `PortalQuery` and `PortalPage`, filtered by the parent foreign key. The storage layer returns an exact child count; the desktop portal grid loads pages as the user scrolls and keeps only the loaded rows in memory.
 
-The 100,000-row pagination benchmark runs in release mode against an indexed sort column. The 15 ms p95 budget is a measurement of indexed keyset pagination, not a promise that an unindexed arbitrary sort will meet the same bound. The current reference measurement is a 1.44 ms median and 2.64 ms p95 over 1,000 pages. Users can add a single-column index from the schema management screen or from the status-bar advisor.
+The 100,000-row pagination benchmark runs in release mode against an indexed sort column. The 15 ms p95 budget is a measurement of indexed keyset pagination, not a promise that an unindexed arbitrary sort will meet the same bound. Reference runs land at 1.1–1.4 ms median and 2.1–2.6 ms p95 over 1,000 pages. Users can add a single-column index from the schema management screen or from the status-bar advisor.
 
 ## Index advisor
 
-When a page takes longer than 20 ms, or when an unindexed sort/filter column has at least 1,000 rows, storage runs `EXPLAIN QUERY PLAN` on a reader connection. If the plan reports a `SCAN` of the table and no usable index begins with the active column, the page carries an optional `IndexHint { table, column, suggestedIndex, elapsedMs, scannedRows, detail }`. The shell renders a quiet, dismissible pill in the status bar: `Full scan (38 ms) · Index "Due Date"`. One click calls `create_index`, reopens the reader pool, and reloads the page. The reference measurement on a 100,000-row table moves the first page from 2.51 ms to 0.10 ms after the index is created.
+When a page takes longer than 20 ms, or when an unindexed sort/filter column has at least 1,000 rows, storage runs `EXPLAIN QUERY PLAN` on a reader connection. If the plan reports a `SCAN` of the table and no usable index begins with the active column, the page carries an optional `IndexHint { table, column, suggestedIndex, elapsedMs, scannedRows, detail }`. The shell renders a quiet, dismissible pill in the status bar: `Full scan (38 ms) · Index "Due Date"`. One click calls `create_index`, reopens the reader pool, and reloads the page. The reference measurement on a 100,000-row table moves the first page from 2.3–2.5 ms to 0.07–0.10 ms after the index is created.
 
 ## Tuple-array IPC framing
 
@@ -208,7 +210,7 @@ entry_hash = BLAKE3(prev_hash || hlc || table || row_id || diff_json)
 
 ## Snapshots
 
-`snapshot_to` checkpoints the WAL and, on macOS, attempts an atomic APFS copy-on-write `clonefile` under the writer lock. A cross-device (`EXDEV`), non-APFS (`ENOTSUP`), or non-macOS target transparently falls back to transactional `VACUUM INTO`. The reference measurement is 0.70 ms for a 4.4 MB APFS clone versus 5.24 ms for `VACUUM INTO`. Both paths pass external `sqlite3` integrity and foreign-key checks and preserve the audit chain. Snapshots reject an existing target and never leave WAL or SHM sidecars beside the copy.
+`snapshot_to` checkpoints the WAL and, on macOS, attempts an atomic APFS copy-on-write `clonefile` under the writer lock. A cross-device (`EXDEV`), non-APFS (`ENOTSUP`), or non-macOS target transparently falls back to transactional `VACUUM INTO`. The reference measurement is 0.58–0.70 ms for a 4.4 MB APFS clone versus 4.5–5.2 ms for `VACUUM INTO`. Both paths pass external `sqlite3` integrity and foreign-key checks and preserve the audit chain. Snapshots reject an existing target and never leave WAL or SHM sidecars beside the copy.
 
 ## Formula DAG
 
