@@ -9,7 +9,7 @@ export default defineConfig({
   testDir: ".",
   outputDir: path.join(os.tmpdir(), "slabbase-playwright"),
   fullyParallel: true,
-  workers: 2,
+  workers: process.env.CI ? 1 : undefined,
   timeout: 30_000,
   expect: { timeout: 6_000 },
   reporter: [["list"]],

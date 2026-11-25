@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
+import type { CDPSession } from "playwright-core";
 
 type Theme = "light" | "dark";
 type Surface = "solid" | "glass";
@@ -91,6 +92,31 @@ async function boot(page: Page, options: BootOptions = {}): Promise<string[]> {
   }
   await page.evaluate(() => document.fonts.ready);
   return errors;
+}
+
+const transparencySessions = new WeakMap<Page, CDPSession>();
+
+async function setReducedTransparency(
+  page: Page,
+  value: "reduce" | "no-preference",
+): Promise<void> {
+  let cdp = transparencySessions.get(page);
+  if (!cdp) {
+    cdp = await page.context().newCDPSession(page);
+    transparencySessions.set(page, cdp);
+  }
+  await cdp.send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-transparency", value }],
+  });
+}
+
+async function settleLayout(page: Page): Promise<void> {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }),
+  );
 }
 
 async function ensureSidebar(page: Page): Promise<void> {
@@ -220,36 +246,46 @@ function rounded(value: number): number {
 async function assertViewport(page: Page): Promise<void> {
   const metrics = await page.evaluate(() => {
     const root = document.getElementById("root");
+    const html = document.documentElement;
+    const bodyRect = document.body.getBoundingClientRect();
     return {
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
-      docWidth: document.documentElement.scrollWidth,
-      docHeight: document.documentElement.scrollHeight,
+      clientWidth: html.clientWidth,
+      clientHeight: html.clientHeight,
+      docWidth: html.scrollWidth,
+      docHeight: html.scrollHeight,
       bodyWidth: document.body.scrollWidth,
       bodyHeight: document.body.scrollHeight,
+      bodyLeft: bodyRect.left,
+      bodyTop: bodyRect.top,
       rootWidth: root?.scrollWidth ?? 0,
       rootHeight: root?.scrollHeight ?? 0,
     };
   });
+  const detail = JSON.stringify(metrics);
+  expect(metrics.bodyLeft, `body must start at the viewport origin: ${detail}`).toBe(0);
+  expect(metrics.bodyTop, `body must start at the viewport origin: ${detail}`).toBe(0);
+  expect(metrics.docWidth, `document overflows horizontally: ${detail}`).toBeLessThanOrEqual(
+    metrics.clientWidth,
+  );
+  expect(metrics.docHeight, `document overflows vertically: ${detail}`).toBeLessThanOrEqual(
+    metrics.clientHeight,
+  );
+  expect(metrics.bodyWidth, `body overflows horizontally: ${detail}`).toBeLessThanOrEqual(
+    metrics.clientWidth,
+  );
+  expect(metrics.bodyHeight, `body overflows vertically: ${detail}`).toBeLessThanOrEqual(
+    metrics.clientHeight,
+  );
+  expect(metrics.rootWidth, `#root overflows horizontally: ${detail}`).toBeLessThanOrEqual(
+    metrics.clientWidth,
+  );
+  expect(metrics.rootHeight, `#root overflows vertically: ${detail}`).toBeLessThanOrEqual(
+    metrics.clientHeight,
+  );
   expect(metrics.docWidth).toBeLessThanOrEqual(metrics.innerWidth);
   expect(metrics.docHeight).toBeLessThanOrEqual(metrics.innerHeight);
-  expect(metrics.bodyWidth).toBeLessThanOrEqual(metrics.innerWidth);
-  expect(metrics.bodyHeight).toBeLessThanOrEqual(metrics.innerHeight);
-  expect(metrics.rootWidth).toBeLessThanOrEqual(metrics.innerWidth);
-  expect(metrics.rootHeight).toBeLessThanOrEqual(metrics.innerHeight);
-}
-
-interface ContainerInfo {
-  rect: { left: number; right: number; top: number; bottom: number; width: number; height: number };
-  scrollWidth: number;
-  clientWidth: number;
-  children: Array<{
-    left: number;
-    right: number;
-    width: number;
-    tag: string;
-    className: string;
-  }>;
 }
 
 async function assertChromeContainment(page: Page): Promise<void> {
@@ -267,13 +303,20 @@ async function assertChromeContainment(page: Page): Promise<void> {
     '[data-testid="print-dialog"]',
   ];
 
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    if ((await locator.count()) === 0) continue;
-    if (!(await locator.isVisible())) continue;
-    const info = await locator.evaluate<ContainerInfo | null>((element) => {
+  const entries = await page.evaluate((selectors: string[]) => {
+    return selectors.map((selector) => {
+      const element = document.querySelector<HTMLElement>(selector);
+      if (!element) return { selector, info: null };
       const rect = element.getBoundingClientRect();
-      if (rect.right <= 0 || rect.left >= window.innerWidth || rect.width === 0) return null;
+      const style = getComputedStyle(element);
+      if (
+        style.visibility === "hidden" ||
+        rect.right <= 0 ||
+        rect.left >= window.innerWidth ||
+        rect.width === 0
+      ) {
+        return { selector, info: null };
+      }
       const children = Array.from(element.querySelectorAll<HTMLElement>("*"))
         .filter((node) => !node.closest('[data-testid="portal-scroll"]'))
         .map((node) => {
@@ -290,19 +333,25 @@ async function assertChromeContainment(page: Page): Promise<void> {
         })
         .filter((child) => child.width > 0);
       return {
-        rect: {
-          left: rect.left,
-          right: rect.right,
-          top: rect.top,
-          bottom: rect.bottom,
-          width: rect.width,
-          height: rect.height,
+        selector,
+        info: {
+          rect: {
+            left: rect.left,
+            right: rect.right,
+            top: rect.top,
+            bottom: rect.bottom,
+            width: rect.width,
+            height: rect.height,
+          },
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+          children,
         },
-        scrollWidth: element.scrollWidth,
-        clientWidth: element.clientWidth,
-        children,
       };
     });
+  }, selectors);
+
+  for (const { selector, info } of entries) {
     if (!info) continue;
     expect(info.scrollWidth, `${selector} scrollWidth`).toBeLessThanOrEqual(
       info.clientWidth + 1,
@@ -344,28 +393,30 @@ async function assertTextNotClipped(page: Page): Promise<void> {
     ".palette-row > span",
   ];
 
-  for (const selector of selectors) {
-    const elements = page.locator(selector);
-    const count = await elements.count();
-    for (let index = 0; index < count; index += 1) {
-      const element = elements.nth(index);
-      if (!(await element.isVisible())) continue;
-      const info = await element.evaluate((node) => ({
-        text: (node.textContent ?? "").trim(),
-        scrollWidth: node.scrollWidth,
-        clientWidth: node.clientWidth,
-        scrollHeight: node.scrollHeight,
-        clientHeight: node.clientHeight,
-      }));
-      if (!info.text || info.clientWidth === 0) continue;
-      expect(info.scrollWidth, `${selector} text "${info.text}" width`).toBeLessThanOrEqual(
-        info.clientWidth + 1,
-      );
-      expect(info.scrollHeight, `${selector} text "${info.text}" height`).toBeLessThanOrEqual(
-        info.clientHeight + 1,
-      );
+  const failures = await page.evaluate((selectors: string[]) => {
+    const issues: string[] = [];
+    for (const selector of selectors) {
+      for (const node of document.querySelectorAll<HTMLElement>(selector)) {
+        const rect = node.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (getComputedStyle(node).visibility === "hidden") continue;
+        const text = (node.textContent ?? "").trim();
+        if (!text || node.clientWidth === 0) continue;
+        if (node.scrollWidth > node.clientWidth + 1) {
+          issues.push(
+            `${selector} text "${text}" width ${node.scrollWidth} > ${node.clientWidth}`,
+          );
+        }
+        if (node.scrollHeight > node.clientHeight + 1) {
+          issues.push(
+            `${selector} text "${text}" height ${node.scrollHeight} > ${node.clientHeight}`,
+          );
+        }
+      }
     }
-  }
+    return issues;
+  }, selectors);
+  expect(failures, failures.join("\n")).toEqual([]);
 }
 
 async function assertNoOverlap(page: Page): Promise<void> {
@@ -900,6 +951,7 @@ test.describe("interaction polish", () => {
       surface: "glass",
       accent: "teal",
     });
+    await setReducedTransparency(page, "no-preference");
     const readGlass = () =>
       page.evaluate(() => {
         const sidebar = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
@@ -973,6 +1025,12 @@ test.describe("interaction polish", () => {
     expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
     expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
     expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
+
+    await setReducedTransparency(page, "reduce");
+    await expect.poll(async () => (await readGlass()).sidebarFilter).toBe("none");
+    await setReducedTransparency(page, "no-preference");
+    await expect.poll(async () => (await readGlass()).sidebarFilter).toContain("blur(28px)");
+
     await assertViewport(page);
     expect(errors).toEqual([]);
   });
@@ -1686,12 +1744,15 @@ test.describe("v1 torture", () => {
     const errors = await boot(page);
     await page.keyboard.press("Meta+=");
     await expect(page.locator("html")).toHaveAttribute("data-zoom", "125");
+    await settleLayout(page);
     await assertLayout(page);
     await page.keyboard.press("Meta+=");
     await expect(page.locator("html")).toHaveAttribute("data-zoom", "150");
+    await settleLayout(page);
     await assertLayout(page);
     await page.keyboard.press("Meta+0");
     await expect(page.locator("html")).toHaveAttribute("data-zoom", "100");
+    await settleLayout(page);
     await assertLayout(page);
     expect(errors).toEqual([]);
   });

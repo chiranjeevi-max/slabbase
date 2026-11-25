@@ -25,6 +25,10 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 
 - Version 1.0.0 is locked across `Cargo.toml`, `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`.
 
+### Fixed
+
+- Keep the desktop shell inside the viewport when macOS classic scrollbars are active, and stabilize the macOS release timing and UI audit CI gates.
+
 ### Security
 
 - Exact integer minor-unit arithmetic for currency and fixed-precision decimals.

@@ -16,6 +16,7 @@ body,
   max-height: 100vh;
   margin: 0;
   overflow: hidden;
+  overflow: clip;
 }
 
 body {
@@ -169,13 +170,14 @@ html:root[data-native="true"][data-surface="glass"] .toolbar {
 }
 
 .app {
-  /* App-level zoom: shrink the layout viewport by the same factor so the
-     scaled result still fills exactly 100vw x 100vh. */
+  /* App-level zoom scales this 100% box to fill #root exactly. Percentages
+     resolve in the zoomed coordinate space, so no divide is needed; this also
+     avoids the classic-scrollbar overshoot of 100vw/100vh. */
   zoom: var(--app-zoom, 1);
-  width: calc(100vw / var(--app-zoom, 1));
-  max-width: calc(100vw / var(--app-zoom, 1));
-  height: calc(100vh / var(--app-zoom, 1));
-  max-height: calc(100vh / var(--app-zoom, 1));
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  max-height: 100%;
   display: flex;
   flex-direction: row;
   overflow: hidden;
