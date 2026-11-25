@@ -7,14 +7,17 @@ The application is built in Rust with a thin Tauri shell and a React front end. 
 ## What it does
 
 - **Relational tables.** Typed columns, foreign keys, indexes, and an interactive schema map.
-- **Formula columns.** A small expression language for derived values and parent-level rollups over child rows.
+- **Concurrent reads.** A serialized writer plus a bounded read-only pool keeps pagination, search, and PDF reads responsive during imports.
+- **Formula columns.** A small expression language for derived values and parent-level rollups over child rows. `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` rollups are maintained incrementally, not rescanned on every read.
 - **Visual forms.** Snap-to-grid form layouts bound to a table, with embedded child portals edited inline.
-- **Virtualized grid.** Keyboard-first browsing and editing over keyset-paginated queries.
-- **Search.** SQLite FTS5 across all text columns, opened with `Cmd+K`.
-- **Audit and undo.** Every write appends a before/after delta to `_slab_audit_log` in the same transaction, and can be undone or redone.
-- **Import and export.** Streaming CSV and array/NDJSON JSON import with bounded inference and batched commits; CSV, JSON, and SQL export. SQL exports include user tables and SlabBase metadata but omit the audit log and search index; use the backup command for a byte-for-byte snapshot.
+- **Virtualized grid.** Keyboard-first browsing and editing over keyset-paginated queries. Page payloads use positional tuples with column metadata sent once.
+- **Search.** SQLite FTS5 across all text columns, opened with `Cmd+K`. A newer search interrupts the superseded one without an error toast.
+- **Audit and undo.** Every write appends a before/after delta to `_slab_audit_log` in the same transaction, and can be undone or redone. The log is a BLAKE3 hash chain; `Integrity Check` detects external edits and deleted entries.
+- **Record time travel.** The Record Inspector lists field-level revisions and restores any earlier revision as a new, audited, undoable write.
+- **Index advisor.** An unindexed sort or filter on a large table surfaces a quiet status-bar suggestion; one click creates the index and reloads.
+- **Import and export.** Streaming CSV and array/NDJSON JSON import with bounded inference and batched commits; CSV, JSON, and SQL export. SQL exports include user tables and SlabBase metadata but omit the audit log and search index; use the backup command for a self-contained snapshot.
 - **Print and PDF.** Paginated HTML preview and vector PDF export for records, portals, and filtered tables. Table exports stream keyset pages and stop at an explicit 25,000-row ceiling with a warning in the report and the UI.
-- **Backup.** One-click `VACUUM INTO` snapshots that are consistent while the workspace is open.
+- **Backup.** One-click APFS copy-on-write snapshots on macOS with a transactional `VACUUM INTO` fallback, consistent while the workspace is open.
 
 ## Design commitments
 
@@ -22,8 +25,8 @@ The application is built in Rust with a thin Tauri shell and a React front end. 
 2. **Exact arithmetic.** Currency and fixed-precision decimals are stored as integer minor units with an explicit scale. Floating point is never used for money.
 3. **Bounded memory.** Grids and portals use keyset pagination and virtualized rendering. Full tables are never loaded.
 4. **Acyclic formulas.** Formula dependencies form a DAG. Schema changes that would introduce a cycle are rejected before any mutation.
-5. **Transactional audit.** Data and schema writes run in one SQLite transaction that also records the audit delta and the inverse command.
-6. **No panics in shipping code.** Library crates deny `unwrap`, `expect`, and `panic`; errors carry stable codes such as `SLAB_E_CYCLE` and `SLAB_E_FK_VIOLATION`.
+5. **Transactional audit.** Data and schema writes run in one SQLite transaction that also records the audit delta, its BLAKE3 chain hash, and the inverse command.
+6. **No panics in shipping code.** Library crates deny `unwrap`, `expect`, and `panic`; errors carry stable codes such as `SLAB_E_CYCLE`, `SLAB_E_FK_VIOLATION`, and the benign `SLAB_E_CANCELLED`.
 
 ## Build from source
 
@@ -70,13 +73,16 @@ npm --prefix apps/desktop run tauri dev
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo test -p slab-storage --test pagination --release
+cargo test --release -p slab-storage --test pagination
+cargo test --release -p slab-storage --test systems
+cargo run --release -p slab-storage --example systems_bench
 cargo deny check
 npm --prefix apps/desktop run typecheck
 npm --prefix apps/desktop run build
+npm --prefix apps/desktop run test:ui
 ```
 
-The test suite includes property tests for the formula language, randomized integer currency sums, a 100,000-row keyset pagination benchmark, an external `sqlite3` integrity check of a generated workspace, and undo/redo parity across portal edits. The benchmark asserts a 15 ms p95 in release builds and a looser bound in debug builds.
+The test suite includes property tests for the formula language, randomized integer currency sums, a 100,000-row keyset pagination benchmark, randomized incremental-rollup parity against full SQL recomputation, BLAKE3 audit tamper detection through external `sqlite3`, Index Advisor and APFS snapshot checks, an external `sqlite3` integrity check of a generated workspace, and undo/redo parity across portal edits. The benchmark asserts a 15 ms p95 in release builds and a looser bound in debug builds.
 
 ## Workspace format
 
@@ -88,7 +94,7 @@ sqlite3 studio.slab 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
 sqlite3 studio.slab 'SELECT * FROM _slab_tables;'
 ```
 
-SlabBase sets `foreign_keys = ON`, `journal_mode = WAL`, and `synchronous = NORMAL` on every connection. Closing the application checkpoints the WAL; the database remains valid if the process exits without doing so.
+SlabBase sets `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = NORMAL`, a 64 MB page cache, and a 256 MB mmap window on the writer; readers open read-only with `query_only = ON` and the same cache and mmap settings. Closing the application drops the readers, runs `PRAGMA optimize`, and truncates the WAL so the `.slab` file remains one self-contained database. The database remains valid if the process exits without doing so.
 
 ## Crates
 
@@ -96,7 +102,7 @@ SlabBase sets `foreign_keys = ON`, `journal_mode = WAL`, and `synchronous = NORM
 | --- | --- | --- |
 | `slab-core` | Domain types: values, exact decimals, schema, layouts, commands, queries | — |
 | `slab-formula` | Parser, typechecker, evaluator, dependency DAG | `slab-core` |
-| `slab-storage` | SQLite engine, DDL, pagination, search, audit, undo | `slab-core`, `slab-formula` |
+| `slab-storage` | SQLite engine, reader/writer pool, DDL, pagination, search, rollups, audit chain, undo | `slab-core`, `slab-formula` |
 | `slab-import` | Streaming CSV and JSON adapters with inference and preview | `slab-core` |
 | `slab-print` | Layout to paginated HTML and PDF | `slab-core` |
 | `slab-sync` | Hybrid logical clock, change sets, transport trait | `slab-core` |
