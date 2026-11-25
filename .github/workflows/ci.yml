@@ -166,8 +166,10 @@ jobs:
       - name: Build macOS application bundle
         run: npm --prefix apps/desktop run tauri build
 
-  # Single required check. GitHub treats a skipped job as passing, so this
-  # job fails explicitly when a PR lacks ok-to-test or any gated job failed.
+  # Required check for this workflow's jobs. GitHub treats a skipped job as
+  # passing, so this job fails explicitly when a PR lacks ok-to-test or any
+  # job in ci.yml did not succeed. Rust CodeQL lives in codeql.yml and is
+  # enforced by its own required check, `Analyze (rust)`.
   ci-gate:
     name: CI gate
     if: always()

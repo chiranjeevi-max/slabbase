@@ -5,7 +5,7 @@ name: CodeQL
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   schedule:
     - cron: "24 5 * * 1"
   workflow_dispatch:
