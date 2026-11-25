@@ -110,6 +110,8 @@ jobs:
         run: cargo test --workspace
       - name: Audit dependencies
         run: cargo deny check
+      - name: Install Playwright Chromium
+        run: npm --prefix apps/desktop exec -- playwright install chromium
       - name: Run UI audit
         run: npm --prefix apps/desktop run test:ui -- --output=test-results
 
