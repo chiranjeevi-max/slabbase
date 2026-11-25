@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import type { Column, Value } from "../bindings";
 import { useStore } from "../store";
-import { inputText, isComputedColumn, isNumericColumn, parseInput, valueText } from "../types";
+import {
+  cellText,
+  inputText,
+  isComputedColumn,
+  isNumericColumn,
+  parseInput,
+  valueText,
+} from "../types";
 
 interface FieldInputProps {
   column: Column;
@@ -10,6 +17,7 @@ interface FieldInputProps {
   onCancel?: () => void;
   compact?: boolean;
   autoFocus?: boolean;
+  multiline?: boolean;
   pulse?: boolean;
 }
 
@@ -20,18 +28,19 @@ export function FieldInput({
   onCancel,
   compact = false,
   autoFocus = false,
+  multiline = false,
   pulse = false,
 }: FieldInputProps) {
   const [text, setText] = useState(() => inputText(column, value));
   const committed = useRef(false);
-  const inputRef = useRef<HTMLInputElement | HTMLSelectElement>(null);
+  const inputRef = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(null);
 
   useEffect(() => {
     setText(inputText(column, value));
   }, [column, value]);
 
   if (isComputedColumn(column)) {
-    const display = valueText(value);
+    const display = compact ? cellText(value) : valueText(value);
     return (
       <div className={`field-value readonly ${pulse ? "pulse" : ""}`} title={columnHint(column)}>
         <span className="computed-mark">ƒ</span>
@@ -71,13 +80,29 @@ export function FieldInput({
     }
   };
 
+  const handleTextareaKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setText(inputText(column, value));
+      onCancel?.();
+      inputRef.current?.blur();
+    } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      void commit();
+      inputRef.current?.blur();
+    }
+  };
+
   if (column.ty.kind === "select") {
     return (
       <select
         ref={inputRef as React.RefObject<HTMLSelectElement>}
-        className={`field-input ${compact ? "compact" : ""} ${pulse ? "pulse" : ""}`}
+        className={`field-input field-select ${compact ? "compact" : ""} ${
+          text === "" ? "is-empty" : ""
+        } ${pulse ? "pulse" : ""}`}
         value={text}
         autoFocus={autoFocus}
+        aria-label={column.name}
         onChange={(event) => {
           const next = event.target.value;
           setText(next);
@@ -118,16 +143,35 @@ export function FieldInput({
     );
   }
 
+  if (multiline && column.ty.kind === "text") {
+    return (
+      <textarea
+        ref={inputRef as React.RefObject<HTMLTextAreaElement>}
+        className={`field-input field-textarea ${pulse ? "pulse" : ""}`}
+        rows={3}
+        value={text}
+        autoFocus={autoFocus}
+        aria-label={column.name}
+        spellCheck={false}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={handleTextareaKeyDown}
+      />
+    );
+  }
+
   const type =
     column.ty.kind === "date"
-      ? "date"
+      ? compact
+        ? "text"
+        : "date"
       : column.ty.kind === "integer"
         ? "number"
         : "text";
   return (
     <span
       className={`field-shell ${compact ? "compact" : ""} ${
-        column.ty.kind === "currency" ? "has-suffix" : ""
+        column.ty.kind === "currency" && !compact ? "has-suffix" : ""
       }`}
     >
       <input
@@ -139,6 +183,7 @@ export function FieldInput({
         inputMode={isNumericColumn(column) ? "decimal" : undefined}
         value={text}
         autoFocus={autoFocus}
+        aria-label={column.name}
         placeholder={
           column.ty.kind === "timestamp"
             ? "YYYY-MM-DDTHH:MM:SSZ"

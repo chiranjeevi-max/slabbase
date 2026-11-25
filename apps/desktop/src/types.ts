@@ -63,7 +63,28 @@ export function isComputedColumn(column: Column): boolean {
   return kind === "formula" || kind === "lookup";
 }
 
-export function columnTypeLabel(ty: ColumnType): string {  switch (ty.kind) {
+const LONG_TEXT_FIELD = /(e-?mail|url|uri|website|address|notes?|description|brief|summary|bio|comment|message|details)/i;
+const MULTILINE_TEXT_FIELD = /(notes?|description|brief|summary|bio|address|comment|message|details)/i;
+
+/**
+ * True when a text-like field should take the full inspector width instead of
+ * being paired in the two-column inspector grid.
+ */
+export function isLongField(column: Column): boolean {
+  const kind = column.ty.kind;
+  if (kind !== "text" && kind !== "attachmentRef") return false;
+  return LONG_TEXT_FIELD.test(column.name);
+}
+
+/**
+ * True when the value reads as a paragraph and should use a wrapping textarea.
+ */
+export function isMultilineField(column: Column): boolean {
+  return column.ty.kind === "text" && MULTILINE_TEXT_FIELD.test(column.name);
+}
+
+export function columnTypeLabel(ty: ColumnType): string {
+  switch (ty.kind) {
     case "text":
       return "Text";
     case "integer":
@@ -96,6 +117,15 @@ export function columnTypeGlyph(ty: ColumnType): string {
     case "integer":
     case "decimal":
       return "#";
+    case "select":
+      return "▾";
+    case "date":
+    case "timestamp":
+      return "◷";
+    case "boolean":
+      return "✓";
+    case "attachmentRef":
+      return "↗";
     case "formula":
       return "fx";
     case "lookup":
@@ -177,7 +207,9 @@ export function inputText(column: Column, value: Value | null | undefined): stri
     case "timestamp":
       return "Timestamp" in value ? value.Timestamp : "";
     case "select":
-      return "Select" in value ? value.Select : "";
+      if ("Select" in value) return value.Select;
+      if ("Text" in value) return value.Text;
+      return "";
     default:
       return valueText(value);
   }

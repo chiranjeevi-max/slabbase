@@ -885,6 +885,27 @@ kbd {
   cursor: default;
 }
 
+.field-select {
+  appearance: none;
+  padding-right: 22px;
+  background-image: var(--select-chevron);
+  background-position: right 7px center;
+  background-repeat: no-repeat;
+  cursor: default;
+}
+
+.field-select.is-empty {
+  color: var(--text-3);
+}
+
+.field-textarea {
+  height: auto;
+  min-height: 64px;
+  padding: 5px 7px;
+  line-height: 18px;
+  resize: vertical;
+}
+
 .toolbar-select {
   width: auto;
   min-width: 118px;
@@ -1790,20 +1811,52 @@ kbd {
 
 .record-form {
   display: grid;
-  grid-template-columns: repeat(12, minmax(0, 1fr));
-  gap: 10px 10px;
-  padding: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 10px;
+  padding: 10px;
+}
+
+.record-form.narrow {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .form-item {
   min-width: 0;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
+.form-item.long-field,
+.form-section,
+.label-item,
+.form-portal {
+  grid-column: 1 / -1;
+}
+
+.record-form.narrow .form-item,
+.record-form.narrow .form-section,
+.record-form.narrow .label-item,
+.record-form.narrow .form-portal {
+  grid-column: 1 / -1;
+}
+
+.form-item.no-label {
+  gap: 0;
+}
+
+.form-item > .field-shell,
+.form-item > .field-input,
+.form-item > .field-textarea,
+.form-item > .field-value,
+.form-item > .field-check {
+  width: 100%;
+  min-width: 0;
+}
+
 .form-section {
-  grid-column: span 12;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1838,16 +1891,35 @@ kbd {
 
 .draft-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 10px;
-  padding: 12px;
+  padding: 10px;
+}
+
+.draft-grid.narrow {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .draft-field {
   min-width: 0;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.draft-field.long-field,
+.draft-grid.narrow .draft-field {
+  grid-column: 1 / -1;
+}
+
+.draft-field > .field-shell,
+.draft-field > .field-input,
+.draft-field > .field-textarea,
+.draft-field > .field-check {
+  width: 100%;
+  min-width: 0;
 }
 
 .draft-check {
@@ -1886,7 +1958,6 @@ kbd {
 --------------------------------------------------------------------------- */
 
 .form-portal {
-  grid-column: span 12;
   min-width: 0;
   margin-top: 2px;
   border: 1px solid var(--hairline);
@@ -1946,8 +2017,8 @@ kbd {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 8px;
+  gap: 3px;
+  padding: 0 6px;
   border-right: 1px solid var(--hairline);
   color: var(--text-2);
   font-size: 11px;
@@ -2022,18 +2093,27 @@ kbd {
   height: 23px;
   padding: 0 5px;
   border-color: transparent;
-  background: transparent;
+  background-color: transparent;
   font-size: 12px;
+}
+
+.portal-grid-cell .field-select {
+  padding: 0 16px 0 5px;
+  background-position: right 3px center;
+}
+
+.portal-grid-cell .field-select.is-empty {
+  color: var(--text-3);
 }
 
 .portal-grid-cell .field-input:hover {
   border-color: var(--hairline);
-  background: var(--field-bg);
+  background-color: var(--field-bg);
 }
 
 .portal-grid-cell .field-input:focus {
   border-color: var(--accent);
-  background: var(--field-bg);
+  background-color: var(--field-bg);
   box-shadow: none;
 }
 

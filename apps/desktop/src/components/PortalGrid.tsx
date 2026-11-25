@@ -169,6 +169,7 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
     ROW_HEIGHT,
     Math.min(rows.length * ROW_HEIGHT + (rows.length > 0 ? 2 : 0), PORTAL_HEIGHT),
   );
+  const addLabel = addRowLabel(child.name);
 
   return (
     <div className="form-portal">
@@ -180,7 +181,7 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
           </small>
         </span>
         <button type="button" className="text-button" onClick={() => void addRow()}>
-          <Icon name="plus" size={11} strokeWidth={1.5} /> Add Line
+          {addLabel}
         </button>
       </div>
       <div
@@ -235,13 +236,13 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
                   <button
                     type="button"
                     className="icon-control micro"
-                    title="Delete line"
-                    aria-label="Delete line"
+                    title="Delete row"
+                    aria-label="Delete row"
                     onClick={() => {
                       void (async () => {
                         const ok = await confirmDestructive(
-                          "Delete this line? Undo can restore it.",
-                          "Delete Line",
+                          "Delete this row? Undo can restore it.",
+                          "Delete Row",
                           "Delete",
                         );
                         if (!ok) return;
@@ -283,17 +284,34 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
 }
 
 function gridColumns(columns: Column[]): string {
-  if (columns.length === 0) return "1fr 26px";
+  if (columns.length === 0) return "1fr 24px";
   return `${columns
     .map((column, index) => {
       const kind = column.ty.kind;
-      if (index === 0) return "minmax(96px, 1.4fr)";
-      if (kind === "date" || kind === "timestamp") return "minmax(104px, 1.1fr)";
-      if (kind === "select") return "minmax(76px, 0.9fr)";
-      if (kind === "currency" || kind === "decimal" || kind === "integer") return "minmax(88px, 1fr)";
+      const priority = index === 0 || /name|title/i.test(column.name);
+      if (kind === "select") return "minmax(72px, 0.8fr)";
+      if (kind === "date" || kind === "timestamp") return "minmax(96px, 1fr)";
+      if (kind === "currency" || kind === "decimal" || kind === "integer") {
+        return "minmax(76px, 0.9fr)";
+      }
+      if (kind === "formula" || kind === "lookup") return "minmax(82px, 1fr)";
+      if (priority) return "minmax(120px, 1.6fr)";
       return "minmax(88px, 1fr)";
     })
-    .join(" ")} 26px`;
+    .join(" ")} 24px`;
+}
+
+function addRowLabel(tableName: string): string {
+  const target = singularize(tableName.trim());
+  return target ? `+ Add ${target}` : "+ Add Row";
+}
+
+function singularize(name: string): string {
+  if (!name) return "";
+  if (/ies$/i.test(name)) return name.replace(/ies$/i, "y");
+  if (/ses$/i.test(name)) return name.replace(/es$/i, "");
+  if (/s$/i.test(name) && !/ss$/i.test(name)) return name.replace(/s$/i, "");
+  return name;
 }
 
 function errorText(error: unknown): string {

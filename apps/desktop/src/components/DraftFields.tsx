@@ -4,6 +4,7 @@ import {
   columnTypeLabel,
   defaultValue,
   isComputedColumn,
+  isMultilineField,
   isNumericColumn,
   parseInput,
 } from "../types";
@@ -78,8 +79,9 @@ export function DraftField({ column, value, onChange }: DraftFieldProps) {
       value !== null && typeof value === "object" && "Select" in value ? value.Select : "";
     return (
       <select
-        className="field-input"
+        className={`field-input field-select ${current === "" ? "is-empty" : ""}`}
         value={current}
+        aria-label={column.name}
         onChange={(event) =>
           onChange(event.target.value === "" ? "Null" : { Select: event.target.value })
         }
@@ -93,6 +95,24 @@ export function DraftField({ column, value, onChange }: DraftFieldProps) {
       </select>
     );
   }
+  if (isMultilineField(column)) {
+    return (
+      <textarea
+        className="field-input field-textarea"
+        rows={3}
+        value={text}
+        aria-label={column.name}
+        spellCheck={false}
+        onChange={(event) => {
+          const next = event.target.value;
+          setText(next);
+          const parsed = parseInput(column, next);
+          if (parsed !== null) onChange(parsed);
+        }}
+        onBlur={() => setText(textFor(column, value))}
+      />
+    );
+  }
   const type = column.ty.kind === "date" ? "date" : column.ty.kind === "integer" ? "number" : "text";
   return (
     <span className={`field-shell ${column.ty.kind === "currency" ? "has-suffix" : ""}`}>
@@ -101,6 +121,7 @@ export function DraftField({ column, value, onChange }: DraftFieldProps) {
         type={type}
         inputMode={isNumericColumn(column) ? "decimal" : undefined}
         value={text}
+        aria-label={column.name}
         placeholder={column.ty.kind === "timestamp" ? "YYYY-MM-DDTHH:MM:SSZ" : undefined}
         onChange={(event) => {
           const next = event.target.value;

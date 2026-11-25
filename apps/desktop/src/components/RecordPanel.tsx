@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
-import type { LayoutItem, Table, Value } from "../bindings";
+import type { Column, LayoutItem, Table, Value } from "../bindings";
 import { useStore } from "../store";
-import { isComputedColumn, recordTitle } from "../types";
+import {
+  isComputedColumn,
+  isLongField,
+  isMultilineField,
+  recordTitle,
+} from "../types";
 import { confirmDestructive } from "../native";
 import { FieldInput } from "./FieldInput";
 import { PortalGrid } from "./PortalGrid";
@@ -82,6 +87,8 @@ export function RecordPanel({ width }: { width: number }) {
     schema?.layouts.find((candidate) => candidate.table === table.name) ??
     null;
   const items = layout ? orderedItems(layout.items) : defaultItems(table);
+  const inspector = inspectorLayout(items, table);
+  const narrow = width < 340;
 
   const commit = async (column: string, value: Value): Promise<boolean> => {
     const ok = await useStore
@@ -133,7 +140,7 @@ export function RecordPanel({ width }: { width: number }) {
       </header>
 
       <div className="record-scroll">
-        <div className="record-form">
+        <div className={`record-form ${narrow ? "narrow" : ""}`}>
           {items.map((item) => {
             if (item.kind.kind === "section") {
               return (
@@ -145,11 +152,7 @@ export function RecordPanel({ width }: { width: number }) {
             }
             if (item.kind.kind === "label") {
               return (
-                <div
-                  className="form-item label-item"
-                  key={item.id}
-                  style={{ gridColumn: `span ${Math.max(1, item.w)}` }}
-                >
+                <div className="form-item label-item" key={item.id}>
                   {item.kind.text}
                 </div>
               );
@@ -161,19 +164,26 @@ export function RecordPanel({ width }: { width: number }) {
               );
               if (!column) return null;
               const value = bundle.record.values[column.name] ?? "Null";
+              const hideLabel = inspector.hiddenLabels.has(item.id);
               return (
                 <div
-                  className="form-item"
+                  className={`form-item ${
+                    inspector.fullWidth.has(item.id) ? "long-field" : ""
+                  } ${hideLabel ? "no-label" : ""}`}
                   key={item.id}
-                  style={{ gridColumn: `span ${Math.max(1, item.w)}` }}
                 >
-                  <span className="field-label">
-                    {column.name}
-                    {isComputedColumn(column) && <span className="field-type">computed</span>}
-                  </span>
+                  {!hideLabel && (
+                    <span className="field-label">
+                      {column.name}
+                      {isComputedColumn(column) && (
+                        <span className="field-type">computed</span>
+                      )}
+                    </span>
+                  )}
                   <FieldInput
                     column={column}
                     value={value}
+                    multiline={isMultilineField(column)}
                     pulse={pulse === column.name}
                     onCommit={(next) => commit(column.name, next)}
                   />
@@ -207,6 +217,9 @@ function DraftRecord({ table, width }: { table: Table; width: number }) {
     return initial;
   });
   const [saving, setSaving] = useState(false);
+  const columns = table.columns.filter((column) => !isComputedColumn(column));
+  const fullWidth = draftFullWidth(columns);
+  const narrow = width < 340;
   const missing = table.columns.filter(
     (column) =>
       column.required &&
@@ -238,21 +251,22 @@ function DraftRecord({ table, width }: { table: Table; width: number }) {
         </button>
       </header>
       <div className="record-scroll">
-        <div className="draft-grid">
-          {table.columns
-            .filter((column) => !isComputedColumn(column))
-            .map((column) => (
-              <label className="draft-field" key={column.name}>
-                <DraftFieldLabel column={column} />
-                <DraftField
-                  column={column}
-                  value={values[column.name] ?? null}
-                  onChange={(value) =>
-                    setValues((current) => ({ ...current, [column.name]: value }))
-                  }
-                />
-              </label>
-            ))}
+        <div className={`draft-grid ${narrow ? "narrow" : ""}`}>
+          {columns.map((column) => (
+            <label
+              className={`draft-field ${fullWidth.has(column.id) ? "long-field" : ""}`}
+              key={column.name}
+            >
+              <DraftFieldLabel column={column} />
+              <DraftField
+                column={column}
+                value={values[column.name] ?? null}
+                onChange={(value) =>
+                  setValues((current) => ({ ...current, [column.name]: value }))
+                }
+              />
+            </label>
+          ))}
         </div>
       </div>
       <footer className="record-footer">
@@ -294,6 +308,86 @@ function orderedItems(items: LayoutItem[]): LayoutItem[] {
   return [...items].sort((left, right) =>
     left.y === right.y ? left.x - right.x : left.y - right.y,
   );
+}
+
+function inspectorLayout(
+  items: LayoutItem[],
+  table: Table,
+): { fullWidth: Set<string>; hiddenLabels: Set<string> } {
+  const fullWidth = new Set<string>();
+  const hiddenLabels = new Set<string>();
+  let section: LayoutItem | null = null;
+  let fieldItems: LayoutItem[] = [];
+  let shortRun: LayoutItem[] = [];
+
+  const flushRun = () => {
+    if (shortRun.length % 2 === 1) {
+      const last = shortRun[shortRun.length - 1];
+      if (last) fullWidth.add(last.id);
+    }
+    shortRun = [];
+  };
+
+  const closeSection = () => {
+    if (section?.kind.kind === "section" && fieldItems.length === 1) {
+      const field = fieldItems[0];
+      if (
+        field?.kind.kind === "field" &&
+        field.kind.column.trim().toLowerCase() ===
+          section.kind.title.trim().toLowerCase()
+      ) {
+        hiddenLabels.add(field.id);
+      }
+    }
+    flushRun();
+    fieldItems = [];
+  };
+
+  for (const item of items) {
+    if (item.kind.kind === "section") {
+      closeSection();
+      section = item;
+      continue;
+    }
+    if (item.kind.kind === "field") {
+      fieldItems.push(item);
+      const columnName = item.kind.column;
+      const column = table.columns.find((candidate) => candidate.name === columnName);
+      if (!column) continue;
+      if (isLongField(column)) {
+        flushRun();
+        fullWidth.add(item.id);
+      } else {
+        shortRun.push(item);
+      }
+      continue;
+    }
+    flushRun();
+  }
+  closeSection();
+  return { fullWidth, hiddenLabels };
+}
+
+function draftFullWidth(columns: Column[]): Set<string> {
+  const fullWidth = new Set<string>();
+  let shortRun: Column[] = [];
+  const flushRun = () => {
+    if (shortRun.length % 2 === 1) {
+      const last = shortRun[shortRun.length - 1];
+      if (last) fullWidth.add(last.id);
+    }
+    shortRun = [];
+  };
+  for (const column of columns) {
+    if (isLongField(column)) {
+      flushRun();
+      fullWidth.add(column.id);
+    } else {
+      shortRun.push(column);
+    }
+  }
+  flushRun();
+  return fullWidth;
 }
 
 function defaultItems(table: Table): LayoutItem[] {
