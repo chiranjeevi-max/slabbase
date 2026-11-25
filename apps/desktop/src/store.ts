@@ -193,8 +193,6 @@ export interface AppStore {
   setPaletteOpen: (open: boolean) => void;
   setSchemaOpen: (open: boolean) => void;
   openSchema: (tab: "table" | "column" | "relation" | "manage") => void;
-  insertChildRow: (table: string, values: RowValues) => Promise<boolean>;
-  deleteChildRow: (table: string, id: number) => Promise<void>;
   setImportOpen: (open: boolean) => void;
   setPrintOpen: (open: boolean) => void;
 }
@@ -863,32 +861,5 @@ export const useStore = create<AppStore>((set, get) => {
       }
     },
 
-    insertChildRow: async (table, values) => {
-      const state = get();
-      try {
-        await api.insertRow(table, values);
-        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        set({ undoState, info: info ?? state.info, saveTick: state.saveTick + 1 });
-        await get().refreshBundle();
-        if (state.activeTable === table) await get().loadFirstPage();
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    deleteChildRow: async (table, id) => {
-      const state = get();
-      try {
-        await api.deleteRow(table, id);
-        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        set({ undoState, info: info ?? state.info });
-        await get().refreshBundle();
-        if (state.activeTable === table) await get().loadFirstPage();
-      } catch (error) {
-        notifyError(error);
-      }
-    },
   };
 });
