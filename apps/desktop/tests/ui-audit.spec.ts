@@ -1033,7 +1033,7 @@ test.describe("interaction polish", () => {
       expect(alphaOf(nativeLightPopover?.background ?? "")).toBeLessThan(0.75);
       expect(alphaOf(nativeLightPopover?.border ?? "")).toBeGreaterThan(0.4);
       expect(nativeLightPopover?.bevel).toContain("inset");
-    }).toPass();
+    }).toPass({ timeout: 6_000 });
 
     await popover.getByRole("button", { name: "Dark", exact: true }).click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
@@ -1046,7 +1046,7 @@ test.describe("interaction polish", () => {
       expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
       expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
       expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
-    }).toPass();
+    }).toPass({ timeout: 6_000 });
 
     await setReducedTransparency(page, "reduce");
     await expect.poll(async () => (await readGlass()).sidebarBlur).toBe("none");
