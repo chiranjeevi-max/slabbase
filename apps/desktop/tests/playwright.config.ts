@@ -31,16 +31,38 @@ export default defineConfig({
   },
   projects: [
     {
+      name: "820x840",
+      use: { ...devices["Desktop Chrome"], viewport: { width: 820, height: 840 } },
+    },
+    {
       name: "1024x680",
       use: { ...devices["Desktop Chrome"], viewport: { width: 1024, height: 680 } },
     },
     {
-      name: "1280x800",
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 800 } },
-    },
-    {
       name: "1440x900",
       use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } },
+    },
+    {
+      name: "2560x1440",
+      use: { ...devices["Desktop Chrome"], viewport: { width: 2560, height: 1440 } },
+    },
+    {
+      name: "3440x1440",
+      use: { ...devices["Desktop Chrome"], viewport: { width: 3440, height: 1440 } },
+    },
+    {
+      name: "5120x1440",
+      grep: /@superwide/,
+      use: { ...devices["Desktop Chrome"], viewport: { width: 5120, height: 1440 } },
+    },
+    {
+      name: "1440x900-hidpi",
+      grep: /@hidpi/,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1440, height: 900 },
+        deviceScaleFactor: 2,
+      },
     },
   ],
 });

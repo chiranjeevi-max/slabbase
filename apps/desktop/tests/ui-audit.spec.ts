@@ -1,3 +1,4 @@
+import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 
 type Theme = "light" | "dark";
@@ -40,7 +41,7 @@ interface BootOptions {
   accent?: string;
   customAccent?: string;
   density?: Density;
-  fixture?: "design-studio" | "empty";
+  fixture?: "design-studio" | "empty" | "stress";
   seed?: boolean;
   tauri?: boolean;
   colorScheme?: "light" | "dark";
@@ -136,7 +137,7 @@ async function openInspector(page: Page): Promise<void> {
 
 const VIEWS: Array<{
   name: string;
-  fixture?: "design-studio" | "empty";
+  fixture?: "design-studio" | "empty" | "stress";
   status: string;
   open: (page: Page) => Promise<void>;
 }> = [
@@ -840,6 +841,11 @@ test.describe("interaction polish", () => {
     expect(Number.parseFloat(normalSheet)).toBeGreaterThanOrEqual(0.14);
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();
+    const scrim = page.locator(".sidebar-scrim");
+    if (await scrim.isVisible()) {
+      await page.keyboard.press("Escape");
+      await expect(scrim).toBeHidden();
+    }
 
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.getByTestId("search-trigger").click();
@@ -978,7 +984,7 @@ test.describe("interaction polish", () => {
     const hex = page.getByTestId("accent-hex");
     await expect(hex).toHaveValue("#0066cc");
     await popover.getByRole("button", { name: "Dark", exact: true }).click();
-    await expect(hex).toHaveValue("#0a84ff");
+    await expect(hex).toHaveValue("#148aff");
     await popover.getByRole("button", { name: "Light", exact: true }).click();
     await expect(hex).toHaveValue("#0066cc");
     await popover.locator('[data-accent-option="rose"]').click();
@@ -1180,5 +1186,614 @@ test.describe("interaction polish", () => {
     );
     expect(overscroll).toBe("contain");
     expect(errors).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.0 torture audit: wide content, rapid interaction, destructive recovery,
+// keyboard-only operation, internationalization, accessibility, zoom, and
+// air-gapped boot.
+// ---------------------------------------------------------------------------
+
+async function openWideStress(page: Page): Promise<string[]> {
+  const errors = await boot(page, { fixture: "stress" });
+  await expect(page.getByTestId("grid-pane")).toBeVisible();
+  await expect(page.locator(".grid-head-cell.column-header")).toHaveCount(20);
+  return errors;
+}
+
+test.describe("v1 torture", () => {
+  test("wide table and long values stay inside the grid viewport", async ({ page }) => {
+    const errors = await openWideStress(page);
+    const metrics = await page.evaluate(() => {
+      const grid = document.querySelector<HTMLElement>('[data-testid="grid-scroll"]');
+      return {
+        scrollWidth: grid?.scrollWidth ?? 0,
+        clientWidth: grid?.clientWidth ?? 0,
+        docWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+      };
+    });
+    expect(metrics.scrollWidth).toBeGreaterThan(metrics.clientWidth + 500);
+    expect(metrics.docWidth).toBeLessThanOrEqual(metrics.innerWidth);
+
+    const title = await page
+      .locator('.grid-cell[data-column="Column 01"] .cell-text')
+      .first()
+      .getAttribute("title");
+    expect((title ?? "").length).toBeGreaterThan(500);
+    const dir = await page
+      .locator('.grid-cell[data-column="Column 01"] .cell-text')
+      .first()
+      .getAttribute("dir");
+    expect(dir).toBe("auto");
+
+    await assertChromeContainment(page);
+    await assertViewport(page);
+
+    await page.locator('[data-testid="grid-scroll"]').evaluate((node) => {
+      node.scrollTop = 380;
+      node.scrollLeft = 900;
+    });
+    const sticky = await page.evaluate(() => {
+      const viewport = document
+        .querySelector<HTMLElement>('[data-testid="grid-scroll"]')
+        ?.getBoundingClientRect();
+      const header = document.querySelector<HTMLElement>(".grid-header")?.getBoundingClientRect();
+      return { viewportTop: viewport?.top ?? 0, headerTop: header?.top ?? 0 };
+    });
+    expect(Math.abs(sticky.headerTop - sticky.viewportTop)).toBeLessThanOrEqual(1);
+
+    await page.locator('[data-testid="grid-row"]').first().click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    await assertChromeContainment(page);
+    await assertViewport(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("rapid density, surface, theme, and inspector bursts keep scroll stable", async ({ page }) => {
+    const errors = await openWideStress(page);
+    await page.locator('[data-testid="grid-row"]').first().click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    const grid = page.getByTestId("grid-scroll");
+
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      if (await page.getByTestId("appearance-popover").isVisible()) {
+        await page.keyboard.press("Escape");
+        await expect(page.getByTestId("appearance-popover")).toBeHidden();
+      }
+      await page.getByTestId("appearance-button").click();
+      await expect(page.getByTestId("appearance-popover")).toBeVisible();
+      const density = DENSITY_LABEL[(["compact", "default", "comfortable"] as const)[cycle % 3]!];
+      await page
+        .getByTestId("appearance-popover")
+        .getByRole("button", { name: density, exact: true })
+        .click();
+      await page
+        .getByTestId("appearance-popover")
+        .getByRole("group", { name: "Surface" })
+        .getByRole("button", { name: cycle % 2 === 0 ? "Glass" : "Solid", exact: true })
+        .click();
+      await page
+        .getByTestId("appearance-popover")
+        .getByRole("group", { name: "Theme" })
+        .getByRole("button", { name: cycle % 2 === 0 ? "Dark" : "Light", exact: true })
+        .click();
+      await grid.evaluate((node, value) => {
+        node.scrollTop = value;
+      }, 120 + cycle * 40);
+      await page.getByTestId("inspector-toggle").click();
+      await page.getByTestId("inspector-toggle").click();
+      await expect(page.getByTestId("inspector")).toBeVisible();
+    }
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("appearance-popover")).toBeHidden();
+
+    const state = await page.evaluate(() => {
+      const density = document.documentElement.dataset["density"];
+      const rows = Array.from(document.querySelectorAll<HTMLElement>(".grid-row")).map(
+        (row) => row.getBoundingClientRect().height,
+      );
+      const scroll = document.querySelector<HTMLElement>('[data-testid="grid-scroll"]');
+      return {
+        density,
+        rows,
+        scrollTop: scroll?.scrollTop ?? 0,
+      };
+    });
+    const expected = DENSITY_HEIGHT[state.density as Density] ?? 29;
+    expect(state.rows.length).toBeGreaterThan(0);
+    for (const height of state.rows) expect(height).toBe(expected);
+    expect(state.scrollTop).toBeGreaterThan(0);
+    await assertLayout(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("portal rows keep density alignment during rapid appearance changes", async ({ page }) => {
+    const errors = await boot(page);
+    await selectTable(page, "Invoices");
+    await openInspector(page);
+    await expect(page.getByTestId("portal-scroll")).toBeVisible();
+    await page.locator(".record-scroll").evaluate((node) => {
+      node.scrollTop = node.scrollHeight;
+    });
+    for (const density of ["compact", "comfortable", "default"] as const) {
+      if (await page.getByTestId("appearance-popover").isVisible()) {
+        await page.keyboard.press("Escape");
+        await expect(page.getByTestId("appearance-popover")).toBeHidden();
+      }
+      await page.getByTestId("appearance-button").click();
+      await page.getByTestId("appearance-popover").getByRole("button", {
+        name: DENSITY_LABEL[density],
+        exact: true,
+      }).click();
+      await page.waitForFunction(
+        (expected) =>
+          Array.from(document.querySelectorAll<HTMLElement>(".portal-grid-row")).every(
+            (row) => Math.abs(row.getBoundingClientRect().height - expected) < 0.5,
+          ),
+        DENSITY_HEIGHT[density],
+      );
+      const geometry = await page.evaluate(() => ({
+        css: getComputedStyle(document.documentElement).getPropertyValue("--row-h").trim(),
+        rows: Array.from(document.querySelectorAll<HTMLElement>(".portal-grid-row")).map(
+          (row) => row.getBoundingClientRect().height,
+        ),
+        spacer: document.querySelector<HTMLElement>(".portal-spacer")?.getBoundingClientRect()
+          .height ?? 0,
+      }));
+      expect(geometry.css).toBe(`${DENSITY_HEIGHT[density]}px`);
+      for (const height of geometry.rows) expect(height).toBe(DENSITY_HEIGHT[density]);
+      expect(geometry.spacer).toBeGreaterThanOrEqual(
+        geometry.rows.length * DENSITY_HEIGHT[density] - 1,
+      );
+    }
+    await page.keyboard.press("Escape");
+    expect(errors).toEqual([]);
+  });
+
+  test("dropping a formula column reports an inline error and keeps state", async ({ page }) => {
+    const errors = await boot(page);
+    await selectSidebarItem(page, "Relations & Schema");
+    await expect(page.locator(".schema-view")).toBeVisible();
+    await page.getByLabel("Managed table").selectOption("Invoices");
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByRole("button", { name: "Drop Tax Rate" }).click();
+    const problem = page.getByTestId("schema-error");
+    await expect(problem).toBeVisible();
+    await expect(problem).toContainText("referenced by formula");
+    await expect(page.getByLabel("Rename Tax Rate")).toBeVisible();
+    await expect(page.locator(".manage-row")).toHaveCount(
+      await page.locator(".manage-row").count(),
+    );
+    await expect(page.getByTestId("status-bar")).toContainText("4 tables");
+    expect(errors).toEqual([]);
+  });
+
+  test("relation-protected table drop, relation drop, and undo restore everything", async ({ page }) => {
+    const errors = await boot(page);
+    await selectSidebarItem(page, "Relations & Schema");
+    await page.getByLabel("Managed table").selectOption("Line Items");
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByRole("button", { name: "Drop Table" }).click();
+    await expect(page.getByTestId("schema-error")).toContainText("used by relation");
+    await expect(page.locator(".manage-row").first()).toBeVisible();
+
+    const relationRow = page.locator(".manage-relation-row").filter({ hasText: "Invoice Lines" });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await relationRow.getByRole("button", { name: "Drop" }).click();
+    await expect(page.getByTestId("schema-error")).toBeHidden();
+
+    // The relation is now gone; dropping the table succeeds.
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByRole("button", { name: "Drop Table" }).click();
+    await expect(page.getByLabel("Managed table")).not.toContainText("Line Items");
+
+    await page.keyboard.press("Meta+z");
+    await expect(page.getByTestId("toast")).toContainText(/Undid change|Undone/);
+    await expect(page.getByLabel("Managed table")).toContainText("Line Items");
+    await page.keyboard.press("Meta+z");
+    await expect(page.locator(".manage-relation-row").filter({ hasText: "Invoice Lines" })).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
+  test("every overlay returns focus to its opener after Escape", async ({ page }) => {
+    const errors = await boot(page);
+
+    const schemaOpener = page.getByRole("button", { name: "+ Column" });
+    await schemaOpener.click();
+    await expect(page.getByTestId("schema-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("schema-dialog")).toBeHidden();
+    await expect
+      .poll(() => schemaOpener.evaluate((node) => node === document.activeElement))
+      .toBe(true);
+
+    const importOpener = page.getByRole("button", { name: "Import" });
+    await importOpener.click();
+    await expect(page.getByTestId("import-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("import-dialog")).toBeHidden();
+    await expect
+      .poll(() => importOpener.evaluate((node) => node === document.activeElement))
+      .toBe(true);
+
+    const printOpener = page.getByRole("button", { name: "Print or Export PDF" });
+    await printOpener.click();
+    await expect(page.getByTestId("print-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("print-dialog")).toBeHidden();
+    await expect
+      .poll(() => printOpener.evaluate((node) => node === document.activeElement))
+      .toBe(true);
+
+    const appearanceOpener = page.getByTestId("appearance-button");
+    await appearanceOpener.click();
+    await expect(page.getByTestId("appearance-popover")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("appearance-popover")).toBeHidden();
+    await expect
+      .poll(() => appearanceOpener.evaluate((node) => node === document.activeElement))
+      .toBe(true);
+
+    const searchOpener = page.getByTestId("search-trigger");
+    await searchOpener.click();
+    await expect(page.getByTestId("command-palette")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("command-palette")).toBeHidden();
+    await expect
+      .poll(() => searchOpener.evaluate((node) => node === document.activeElement))
+      .toBe(true);
+
+    await ensureSidebar(page);
+    const auditOpener = page
+      .getByTestId("sidebar")
+      .getByRole("button", { name: /Audit Log/ });
+    await auditOpener.click();
+    await expect(page.getByTestId("audit-drawer")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("audit-drawer")).toBeHidden();
+    await expect
+      .poll(() => auditOpener.evaluate((node) => node === document.activeElement))
+      .toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  test("keyboard-only navigation, hostile search, and undo routing", async ({ page }) => {
+    const errors = await boot(page);
+    await page.keyboard.press("Meta+2");
+    await expect(page.getByRole("tab", { name: "Form" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await page.keyboard.press("Meta+3");
+    await expect(page.locator(".schema-view")).toBeVisible();
+    await page.keyboard.press("Meta+4");
+    await expect(page.getByTestId("audit-drawer")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Meta+1");
+    await expect(page.getByTestId("grid-pane")).toBeVisible();
+
+    await page.keyboard.press("Meta+k");
+    const search = page.getByLabel("Search records and commands");
+    await expect(search).toBeFocused();
+    await search.fill('northlight* "unclosed OR AND NOT col:value ^start ()[]{}');
+    await page.waitForTimeout(120);
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("command-palette")).toBeHidden();
+
+    await page.getByTestId("grid-scroll").focus();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Enter");
+    const active = page.locator(".grid-cell .field-input").first();
+    await expect(active).toBeVisible();
+    const before = await active.inputValue();
+    await page.keyboard.type("zz");
+    await expect(active).not.toHaveValue(before);
+    await page.keyboard.press("Meta+z");
+    await expect(active).toHaveValue(before);
+    await page.keyboard.press("Escape");
+    await expect(active).toBeHidden();
+    await page.keyboard.press("Meta+z");
+    await expect(page.getByTestId("toast")).toContainText(/Undid change|Undone/);
+
+    if ((page.viewportSize()?.width ?? 0) >= 1080) {
+      await page.keyboard.press("Meta+Alt+s");
+      await expect(page.getByTestId("sidebar")).toBeHidden();
+      await page.keyboard.press("Meta+Alt+s");
+      await expect(page.getByTestId("sidebar")).toBeVisible();
+    }
+    const inspector = page.getByTestId("inspector");
+    if (await inspector.isVisible()) {
+      await page.keyboard.press("Meta+Alt+i");
+      await expect(inspector).toBeHidden();
+    }
+    await page.keyboard.press("Meta+Alt+i");
+    await expect(inspector).toBeVisible();
+    await page.keyboard.press("Meta+Alt+i");
+    await expect(inspector).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+
+  test("IME composition Enter does not commit inline or inspector editors", async ({ page }) => {
+    const errors = await boot(page);
+    const cell = page.locator('.grid-cell[data-column="Name"]').first();
+    await cell.dblclick();
+    const input = cell.locator("input.field-input");
+    await expect(input).toBeVisible();
+    await input.evaluate((node) => {
+      node.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      node.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          code: "Enter",
+          bubbles: true,
+          isComposing: true,
+        }),
+      );
+    });
+    await page.waitForTimeout(120);
+    await expect(input).toBeVisible();
+    await input.evaluate((node) => {
+      node.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    });
+    await page.keyboard.press("Escape");
+    await expect(input).toBeHidden();
+
+    await cell.click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    const formInput = page.getByTestId("inspector").getByLabel("Name").first();
+    await formInput.click();
+    await formInput.evaluate((node) => {
+      node.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      node.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          code: "Enter",
+          bubbles: true,
+          isComposing: true,
+        }),
+      );
+    });
+    await page.waitForTimeout(120);
+    await expect(formInput).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
+  test("mixed RTL and LTR text round-trips without clipping", async ({ page }) => {
+    const errors = await boot(page);
+    const cell = page.locator('.grid-cell[data-column="Name"]').first();
+    await cell.dblclick();
+    const input = cell.locator("input.field-input");
+    await expect(input).toHaveAttribute("dir", "auto");
+    const value = "مرحبا Northlight +1 415 555 0134";
+    await input.fill(value);
+    await page.keyboard.press("Enter");
+    await expect(cell.locator(".cell-text")).toHaveText(value);
+    await expect(cell.locator(".cell-text")).toHaveAttribute("dir", "auto");
+    await assertLayout(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("ultra-wide forms stay readable while grids use full width (@superwide)", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width < 2560, "wide breakpoint only");
+    const errors = await boot(page, { fixture: "stress" });
+    await selectSidebarItem(page, "Relations & Schema");
+    await expect(page.locator(".schema-view")).toBeVisible();
+    const manage = await getRect(page, ".manage");
+    expect(manage.width).toBeLessThanOrEqual(962);
+    const graph = await getRect(page, ".schema-graph-pane");
+    expect(graph.width).toBeGreaterThan(700);
+    await page.getByRole("button", { name: "+ Table" }).click();
+    const dialog = await getRect(page, '[data-testid="schema-dialog"]');
+    expect(dialog.width).toBeLessThanOrEqual(722);
+    await page.keyboard.press("Escape");
+    if (width >= 3400) {
+      await page.keyboard.press("Meta+1");
+      const grid = await getRect(page, '[data-testid="grid-pane"]');
+      expect(grid.width).toBeGreaterThan(width * 0.6);
+    }
+    await assertViewport(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("live resize across ultrawide and split-screen keeps panes and scrims sane", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "live resize matrix runs once");
+    const errors = await boot(page);
+    await openInspector(page);
+    await page.getByRole("button", { name: "+ Column" }).click();
+    await expect(page.getByTestId("schema-dialog")).toBeVisible();
+
+    for (const target of [3440, 1440, 1150, 820, 3440]) {
+      await page.setViewportSize({ width: target, height: 1440 });
+      await page.waitForTimeout(120);
+      await assertViewport(page);
+      await assertChromeContainment(page);
+      await page.keyboard.press("Meta+Alt+i");
+      await page.keyboard.press("Meta+Alt+s");
+      await page.waitForTimeout(120);
+      await assertViewport(page);
+    }
+
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("schema-dialog")).toBeHidden();
+    const overlays = page.locator(".sidebar-scrim, .drawer-backdrop, .modal-backdrop");
+    for (let index = 0; index < await overlays.count(); index += 1) {
+      const overlay = overlays.nth(index);
+      if (await overlay.isVisible()) {
+        await page.keyboard.press("Escape");
+      }
+    }
+    await expect(page.locator(".sidebar-scrim, .drawer-backdrop, .modal-backdrop")).toHaveCount(0);
+
+    if (!(await page.getByTestId("inspector").isVisible())) {
+      await page.getByTestId("inspector-toggle").click();
+    }
+    const inspector = await getRect(page, '[data-testid="inspector"]');
+    expect(inspector.width).toBeGreaterThanOrEqual(320);
+    expect(inspector.width).toBeLessThanOrEqual(480);
+    expect(inspector.right).toBeLessThanOrEqual(3441);
+    expect(errors).toEqual([]);
+  });
+
+  test("currency minor units render and edit without /100 assumptions", async ({ page }) => {
+    const errors = await openWideStress(page);
+    await selectTable(page, "Currencies");
+    await expect(
+      page.locator('.grid-cell[data-column="JPY"] .cell-text').first(),
+    ).toHaveText("1500");
+    await expect(
+      page.locator('.grid-cell[data-column="USD"] .cell-text').first(),
+    ).toHaveText("19.99");
+    const kwd = page.locator('.grid-cell[data-column="KWD"]').first();
+    await expect(kwd.locator(".cell-text")).toHaveText("1.234");
+    await kwd.dblclick();
+    const input = kwd.locator("input.field-input");
+    await expect(input).toHaveValue("1.234");
+    await input.fill("2.345");
+    await page.keyboard.press("Enter");
+    await expect(kwd.locator(".cell-text")).toHaveText("2.345");
+    expect(errors).toEqual([]);
+  });
+
+  test("high contrast preference strengthens borders and text contrast", async ({ page }) => {
+    const errors = await boot(page);
+    await page.emulateMedia({ contrast: "more" });
+    const tokens = await page.evaluate(() => {
+      const style = getComputedStyle(document.documentElement);
+      return {
+        primary: style.getPropertyValue("--text-primary").trim(),
+        secondary: style.getPropertyValue("--text-secondary").trim(),
+        tertiary: style.getPropertyValue("--text-tertiary").trim(),
+        control: style.getPropertyValue("--border-control").trim(),
+        grid: style.getPropertyValue("--bg-grid-solid").trim(),
+        sidebar: style.getPropertyValue("--bg-sidebar-solid").trim(),
+      };
+    });
+    expect(contrastHex(tokens.secondary, tokens.grid)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastHex(tokens.tertiary, tokens.sidebar)).toBeGreaterThanOrEqual(4.5);
+    const alpha = alphaOf(tokens.control);
+    expect(alpha).toBeGreaterThanOrEqual(0.5);
+    expect(errors).toEqual([]);
+  });
+
+  test("125% and 150% app zoom keep every chrome surface contained", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "zoom matrix runs once at the standard laptop size");
+    const errors = await boot(page);
+    await page.keyboard.press("Meta+=");
+    await expect(page.locator("html")).toHaveAttribute("data-zoom", "125");
+    await assertLayout(page);
+    await page.keyboard.press("Meta+=");
+    await expect(page.locator("html")).toHaveAttribute("data-zoom", "150");
+    await assertLayout(page);
+    await page.keyboard.press("Meta+0");
+    await expect(page.locator("html")).toHaveAttribute("data-zoom", "100");
+    await assertLayout(page);
+    expect(errors).toEqual([]);
+  });
+
+  test("air-gapped boot makes zero external http(s) requests", async ({ page }) => {
+    const external: string[] = [];
+    page.on("request", (request) => {
+      const url = request.url();
+      if (!url.startsWith("http://") && !url.startsWith("https://")) return;
+      if (!url.startsWith("http://127.0.0.1:5199")) external.push(url);
+    });
+    const errors = await boot(page);
+    await selectTable(page, "Invoices");
+    await openInspector(page);
+    await page.getByTestId("search-trigger").click();
+    await page.keyboard.press("Escape");
+    await selectSidebarItem(page, "Relations & Schema");
+    expect(external).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test("hidpi borders stay crisp and layout does not drift (@hidpi)", async ({ page }) => {
+    const dpr = await page.evaluate(() => window.devicePixelRatio);
+    test.skip(dpr !== 2, "HiDPI project only");
+    const errors = await boot(page);
+    const geometry = await page.evaluate(() => {
+      const toolbar = document.querySelector<HTMLElement>('[data-testid="toolbar"]');
+      const header = document.querySelector<HTMLElement>(".grid-header");
+      const cell = document.querySelector<HTMLElement>(".grid-cell");
+      return {
+        toolbar: toolbar?.getBoundingClientRect().height ?? 0,
+        header: header?.getBoundingClientRect().height ?? 0,
+        border: cell ? getComputedStyle(cell).borderRightWidth : "",
+        dpr: window.devicePixelRatio,
+      };
+    });
+    expect(geometry.dpr).toBe(2);
+    expect(geometry.toolbar).toBe(48);
+    expect(geometry.header).toBe(28);
+    expect(geometry.border).toBe("1px");
+    await assertLayout(page);
+    expect(errors).toEqual([]);
+  });
+});
+
+for (const timezoneId of [
+  "America/Los_Angeles",
+  "UTC",
+  "Asia/Kolkata",
+  "Pacific/Auckland",
+]) {
+  test.describe(`date-only timezone ${timezoneId}`, () => {
+    test.use({ timezoneId });
+    test("calendar dates never shift on display or edit", async ({ page }) => {
+      const width = page.viewportSize()?.width ?? 0;
+      test.skip(width !== 1440, "timezone matrix runs once at the standard laptop size");
+      const errors = await boot(page);
+      await selectTable(page, "Projects");
+      const cell = page.locator('.grid-cell[data-column="Start Date"]').first();
+      const expected = await cell.locator(".cell-text").innerText();
+      expect(expected).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      await cell.dblclick();
+      const input = cell.locator("input.field-input");
+      await expect(input).toHaveValue(expected);
+      await page.keyboard.press("Escape");
+      await expect(cell.locator(".cell-text")).toHaveText(expected);
+      expect(errors).toEqual([]);
+    });
+  });
+}
+
+test.describe("accessibility", () => {
+  test("axe WCAG 2.2 AA scan finds no serious violations", async ({ page }) => {
+    test.setTimeout(120_000);
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "axe matrix runs once at the standard laptop size");
+    for (const theme of ["light", "dark"] as const) {
+      const errors = await boot(page, { theme });
+      const scan = async () => {
+        await page.waitForTimeout(220);
+        const results = await new AxeBuilder({ page })
+          .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+          .analyze();
+        const serious = results.violations.filter(
+          (violation) => violation.impact === "critical" || violation.impact === "serious",
+        );
+        expect(serious, JSON.stringify(serious, null, 2)).toEqual([]);
+      };
+      await scan();
+      await openInspector(page);
+      await scan();
+      await page.getByRole("tab", { name: "Form" }).click();
+      await scan();
+      await selectSidebarItem(page, "Relations & Schema");
+      await scan();
+      await page.getByTestId("search-trigger").click();
+      await scan();
+      await page.keyboard.press("Escape");
+      await page.getByTestId("appearance-button").click();
+      await scan();
+      await page.keyboard.press("Escape");
+      expect(errors).toEqual([]);
+    }
   });
 });
