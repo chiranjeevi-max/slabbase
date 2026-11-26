@@ -5,8 +5,7 @@ name: CI
     branches: [main]
   pull_request:
     branches: [main]
-    # labeled/unlabeled re-evaluate the ok-to-test gate. Any label change
-    # restarts the run; label churn is rare enough not to filter by name.
+    # Label changes re-run CI so ok-to-test is re-evaluated on the same commit.
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
@@ -49,8 +48,7 @@ jobs:
       - name: Typecheck frontend
         run: npm --prefix apps/desktop run typecheck
 
-  # The macOS jobs below run on PRs only when the ok-to-test label is present.
-  # They always run on pushes to main and manual dispatch.
+  # macOS jobs run on PRs only with the ok-to-test label.
   rust:
     name: Rust gate
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
@@ -168,9 +166,7 @@ jobs:
       - name: Build macOS application bundle
         run: npm --prefix apps/desktop run tauri build
 
-  # Rust CodeQL lives here rather than in codeql.yml so CI gate can depend on
-  # it; codeql.yml keeps only the weekly scheduled Rust analysis. The name
-  # matches the `Analyze (rust)` required check in the main ruleset.
+  # Here, not in codeql.yml, so CI gate can depend on it.
   codeql-rust:
     name: Analyze (rust)
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
@@ -200,10 +196,8 @@ jobs:
         with:
           category: /language:rust
 
-  # The only required check for gated work. GitHub treats a skipped job as
-  # passing, and removing the label re-runs the workflow on the same commit,
-  # so individual job checks can be overwritten by skips. This job fails
-  # explicitly when a PR lacks ok-to-test or any job it needs did not succeed.
+  # The required check. Skipped jobs count as passing on GitHub, so this job
+  # fails when any gated job was skipped (no ok-to-test), failed or cancelled.
   ci-gate:
     name: CI gate
     if: always()
@@ -212,20 +206,8 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Check gate results
-        env:
-          IS_PR: ${{ github.event_name == 'pull_request' }}
-          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') }}
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+      - name: Require ok-to-test and passing jobs
+        if: contains(needs.*.result, 'skipped') || contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: |
-          set -euo pipefail
-          if [[ "$IS_PR" == "true" && "$HAS_LABEL" != "true" ]]; then
-            echo "::error::Add the ok-to-test label to run the macOS gates."
-            exit 1
-          fi
-          for result in $RESULTS; do
-            if [[ "$result" != "success" ]]; then
-              echo "::error::A gated job finished with '$result'."
-              exit 1
-            fi
-          done
+          echo "::error::Add the ok-to-test label, or fix the failed job."
+          exit 1

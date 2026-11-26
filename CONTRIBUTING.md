@@ -58,7 +58,7 @@ The generated files live in `apps/desktop/src/bindings` and are committed. Do no
 
 ### CI on pull requests
 
-Every push to a pull request runs a quick Ubuntu check (`cargo fmt --check` and the frontend typecheck) and the JavaScript CodeQL analysis. The macOS gates (Rust gate, desktop UI audit shards, bundle check, and Rust CodeQL) run only when the pull request has the `ok-to-test` label, so review-driven pushes do not each start a full macOS run. Add the label when the branch is ready for full verification; every later push re-runs the macOS gates while the label stays on. `CI gate` is the required check: it fails until the label is present and Quick check, Rust gate, every desktop shard, Bundle check, and Rust CodeQL have passed. Removing the label re-runs CI on the same commit, so `CI gate` fails again rather than letting skipped jobs stand in for earlier results.
+Every push to a pull request runs a quick Ubuntu check (`cargo fmt --check` and the frontend typecheck) and JavaScript CodeQL. The macOS jobs (Rust gate, desktop UI audit, bundle check, Rust CodeQL) run only while the pull request has the `ok-to-test` label; add it when the branch is ready for full verification. `CI gate` is the required check and fails until the label is on and every gated job has passed.
 
 ## Commit style
 

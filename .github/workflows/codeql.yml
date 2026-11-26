@@ -13,7 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  analyze-javascript:
+  # Rust CodeQL runs in ci.yml under CI gate.
+  analyze:
     name: Analyze (javascript-typescript)
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -36,35 +37,3 @@ jobs:
         uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
         with:
           category: /language:javascript-typescript
-
-  # PR and main-push Rust analysis runs as `Analyze (rust)` in ci.yml under
-  # CI gate. This job keeps the weekly scan current with new CodeQL queries;
-  # its distinct name keeps its PR skip from shadowing that required check.
-  analyze-rust:
-    name: Analyze (rust, scheduled)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-26
-    timeout-minutes: 60
-    permissions:
-      security-events: write
-      packages: read
-      contents: read
-      actions: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Rust for CodeQL
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          toolchain: stable
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
-        with:
-          languages: rust
-          build-mode: none
-      - name: Analyze
-        uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
-        with:
-          category: /language:rust
