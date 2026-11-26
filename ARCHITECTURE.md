@@ -46,7 +46,7 @@ A relation or column rebuild uses the drop-and-rename dance, so foreign-key enfo
 
 A hand-written lexer and recursive-descent parser produce an expression AST. The typechecker assigns one of the core value types and rejects invalid operator or function combinations. The evaluator walks the AST against an `EvalContext`, which supplies column values and aggregate results. The dependency graph orders formula columns and rejects cycles with a deterministic, sorted cycle path.
 
-Formula text is user data. It is never evaluated as code, never shelled out, and never allowed to recurse without a depth limit. Table and column renames rewrite formula references by token span rather than substring replacement, preserving string literals and the user's exact formatting through undo. A bare reference is bracketed when the new name is not a legal bare identifier, so renaming `Price` to `Unit Price` produces `[Unit Price]` rather than a formula that no longer parses.
+Formula text is user data. It is never evaluated as code, never shelled out, and never allowed to recurse without a depth limit. Formula source is capped at 16 KiB and an expression tree at 128 nodes; a stored formula outside those bounds is rejected at open before any migration, leaving the file byte-for-byte unchanged. Table and column renames rewrite formula references by token span rather than substring replacement, preserving string literals and the user's exact formatting through undo. A bare reference is bracketed when the new name is not a legal bare identifier, so renaming `Price` to `Unit Price` produces `[Unit Price]` rather than a formula that no longer parses.
 
 ### `slab-storage`
 
@@ -121,7 +121,7 @@ A lookup column (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) keeps a compact `(count, s
 
 Moving a child to another parent removes it from the old parent and adds it to the new one in the same transaction. Cascade deletes remove every contribution before deleting any deleted row's own parent state, so a grandchild cannot recreate a cache row for a parent that no longer exists. `SUM` and `AVG` replacements compute `total - old + new` in `i128` and narrow once, so a valid final total is not rejected because an intermediate step fell outside `i64`. `MIN` and `MAX` also adjust the cached non-NULL count across a NULL transition even when the extremum itself does not move. Formula columns remain virtual: they are evaluated in the Kahn order from `FormulaDag` when the record is read, so an affected parent's formulas use the refreshed rollup inputs without rescanning unrelated tables.
 
-Rollup state is a derived cache and the file can be edited by an external SQLite client between sessions, so opening a workspace clears `_slab_rollups`; the next read rebuilds only the parents it touches. Schema changes invalidate the cache the same way.
+Rollup state is a derived cache and the file can be edited by an external SQLite client between sessions, so opening a workspace clears `_slab_rollups`; the next read rebuilds only the parents it touches. Schema changes invalidate the cache the same way. Read-only replicas compute a cold lookup live and never write the cache, so a read-only session pays full child scans until the writer handles a mutation for that parent.
 
 The apples-to-apples release benchmark compares the cached rollup against a cold full-table `SUM` over the same rows. At 10,000 children the cached read is 0.021 ms versus 0.303 ms for the cold scan, and the end-to-end child edit plus parent read is 0.169 ms versus 0.692 ms. At 100,000 children the cached read is 0.018 ms versus 3.701 ms, and the end-to-end edit is 0.199 ms versus 3.654 ms. The incremental path removes the per-child scan, so its cost stays flat as the relation grows.
 
@@ -140,9 +140,9 @@ System tables, all namespaced:
 | `_slab_rollups` | Incremental parent aggregate state used by lookup columns |
 | `_slab_fts` | FTS5 index over text values, keyed by table and row id |
 
-User tables are created with quoted identifiers and an `id INTEGER PRIMARY KEY AUTOINCREMENT` column. Foreign keys are real SQLite constraints with `ON DELETE CASCADE`, `SET NULL`, or `RESTRICT`. Decimal and currency values are stored as `INTEGER` minor units; the scale and currency live in the column definition. Dates are ISO-8601 text; timestamps are Unix milliseconds.
+User tables are created with quoted identifiers and an `id INTEGER PRIMARY KEY AUTOINCREMENT` column. Foreign keys are real SQLite constraints with `ON DELETE CASCADE` or `RESTRICT`; `SET NULL` is reserved and rejected in v1.0. Decimal and currency values are stored as `INTEGER` minor units; the scale and currency live in the column definition. Dates are ISO-8601 text; timestamps are Unix milliseconds.
 
-Identifier policy is intentionally narrower than SQLite: names start with an ASCII letter, use ASCII letters, digits, spaces, and underscores, and are at most 64 bytes. Reserved SQLite keywords are ordinary names because every generated statement quotes identifiers. Punctuation, quotes, semicolons, control characters, Unicode, and leading/trailing whitespace are rejected by the typed `SLAB_E_NAME` path before any SQL runs, so hostile input cannot reach DDL.
+Identifier policy is intentionally narrower than SQLite: names start with an ASCII letter, use ASCII letters, digits, spaces, and underscores, and are at most 64 bytes. Reserved SQLite keywords are ordinary names because every generated statement quotes identifiers. Punctuation, quotes, semicolons, control characters, Unicode, and leading/trailing whitespace are rejected by the typed `SLAB_E_NAME` path before any SQL runs, so malformed input cannot reach DDL.
 
 Formula and lookup columns are virtual: they have metadata rows but no physical column. They are computed when a record is read, in dependency order.
 
@@ -174,13 +174,15 @@ Table and portal pages cross the Tauri boundary as compact positional frames. Co
 
 ## Audit hash chain and record time travel
 
-Each `_slab_audit_log` row carries `prev_hash` and `entry_hash`:
+Each `_slab_audit_log` row carries `prev_hash`, `entry_hash`, and `hash_version`:
 
 ```text
-entry_hash = BLAKE3(prev_hash || hlc || table || row_id || diff_json)
+scheme 1 (legacy): BLAKE3(prev_hash || hlc || table || row_id || diff_json)
+scheme 2 (current): BLAKE3(length-prefixed(prev_hash, hlc, timestamp_ms, actor,
+                                           transaction_id, table, row_id, diff_json))
 ```
 
-`diff_json` includes the operation, summary, schema flag, and both before and after JSON strings, so changing any hashed field invalidates the chain. The first entry links to 64 zeroes. `_slab_meta.audit_head_hash` and `_slab_meta.audit_head_id` anchor the tail, which detects a deleted final row. Existing v1.0 files migrate in one transaction: the two columns are added and the chain is backfilled in id order. Only a wholly unhashed log is treated as a legacy file. If some entries are hashed and others are not, the missing hashes are left in place so `Integrity Check` reports the altered entry instead of rewriting a fresh chain over it. `Integrity Check` verifies `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, and the full chain, returning an explicit tamper diagnostic naming the first broken entry.
+`diff_json` includes the operation, summary, schema flag, and both before and after JSON strings. Length prefixes make the scheme-2 preimage unambiguous even if a field contains the old separator. The first entry links to 64 zeroes. `_slab_meta.audit_head_hash` and `_slab_meta.audit_head_id` anchor the tail, which detects a deleted final row; a modern log with a missing head is reported as tampered, not re-anchored. New entries use scheme 2. When the hash columns are absent from the table itself, the file predates them: the columns are added and the chain is backfilled with scheme 2 in one transaction. A valid scheme-1 chain is verified first and then rewritten to scheme 2 atomically; scheme 1 authenticated content but not the actor, so the migration trusts the actor values stored in those rows. A log whose hash columns exist but whose hashes were NULLed is never backfilled, so deleting the hashes and the head cannot launder altered history. If some entries are hashed and others are not, the missing hashes are left in place so `Integrity Check` reports the altered entry. `Integrity Check` verifies `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, and the full chain, returning an explicit tamper diagnostic naming the first broken entry.
 
 `record_history(table, row_id)` returns the chronological field-level diffs for one record. `restore_record_revision(table, row_id, audit_id)` rebuilds the stored row from that revision, validates foreign keys and the formula DAG, applies the normal update or insert path so rollups stay exact, appends a new `restore` entry to the hash chain, and pushes the inverse onto the undo stack. Restoring is therefore itself undoable with `⌘Z`. The Record Inspector exposes this as a quiet History clock button and an inline revision sheet with before → after values and a `Restore` action.
 

@@ -24,12 +24,28 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 ### Changed
 
 - The UI audit runs on the Chromium build pinned by `@playwright/test` instead of the runner's system Chrome, and macOS CI and release jobs run on `macos-26`.
+- Bump the workspace format to 2 for audit hash scheme 2; an older build refuses the file instead of verifying scheme-2 entries with the scheme-1 algorithm and reporting false tampering.
 - Version 1.0.0 is locked across `Cargo.toml`, `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`.
 - Pull request macOS CI and Rust CodeQL run only with the `ok-to-test` label; every push gets a quick Ubuntu check and a single `CI gate` status.
 
 ### Fixed
 
 - Keep the desktop shell inside the viewport when macOS classic scrollbars are active, and stabilize the macOS release timing and UI audit CI gates.
+- Round money multiplication and division once at the currency scale, widen decimal remainders before aligning, and compare mixed-scale decimals exactly; `₹`/`$` totals no longer lose a cent to double rounding.
+- Reject a formula deeper than 128 nodes or larger than 16 KiB before recursive consumers see it, drop the expression tree iteratively, and reject an over-limit stored formula at open before any migration so the file is left untouched.
+- Parse timestamps with multibyte garbage as a typed error instead of a panic, accept an omitted trailing `Z`, and keep `SlabDate` inside the supported 1..=9999 era.
+- Preserve select and attachment values on read, so editing another field, importing an attachment column, and the Form Studio select control no longer treat them as plain text.
+- Evaluate the record returned by a write inside its transaction; a formula error now rolls the row, audit entry, FTS update, and rollup change back together instead of reporting failure after a commit.
+- Capture each cascaded child once when two relations reach it, and keep lookup counts exact through that delete and its undo.
+- Reject a foreign SQLite file before changing its journal mode or creating metadata tables.
+- Match text filters against the displayed decimal, currency, boolean, and ISO timestamp text, and parse typed equality values instead of silently returning no rows.
+- Exclude computed columns from import auto-mapping and skip them when a source column happens to share their name.
+- Preserve empty and whitespace-only text through JSON import (CSV empty fields remain NULL), plus tagged values, currency codes, guarded select options, attachment paths, and a UTF-8 BOM.
+- Publish SQL exports through the same scratch-file contract as CSV and JSON, and keep the already-open scratch handle so the dump cannot be redirected through a predictable path.
+- Cover the actor, transaction id, and timestamp in the audit hash, migrate a valid scheme-1 chain atomically, and stop backfilling a modern log whose hashes or head anchor were deleted.
+- Keep a failed workspace create from closing the workspace already on screen.
+- Keep a form's `updated_at` stable across a column rename and its undo, and name the assigned row in an insert's audit summary.
+- Draw a portal that shares a grid row with a field, size fallback glyphs correctly, and keep the PDF stream length, HTML subtitle, and truncation notice well-formed.
 - Suspend foreign-key enforcement while rebuilding a relation or column, so `DROP TABLE` cannot fire `ON DELETE CASCADE` and silently delete child rows.
 - Invalidate derived rollup state on workspace open, use `i128` intermediates for `SUM`/`AVG` replacements, and keep the `MIN`/`MAX` cached count exact across NULL transitions.
 - Remove rollup contributions before forgetting parent state during a cascade delete, so no cache row survives for a deleted parent.
@@ -59,5 +75,5 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 
 ### Notes
 
-- `v1.0.0` has not been tagged yet. The first public tag is cut only after the release validation gate and an adversarial bug-hunt pass.
+- `v1.0.0` has not been tagged yet. The first public tag is cut only after the release validation gate and a failure-mode bug-hunt pass.
 - Known v1.0 limits and the workspace compatibility policy are documented in [ROADMAP.md](ROADMAP.md). Release operations are documented in [docs/RELEASING.md](docs/RELEASING.md).
