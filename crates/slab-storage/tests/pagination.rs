@@ -478,3 +478,60 @@ fn virtual_columns_never_reach_sort_filter_or_the_index_advisor() {
         assert_eq!(index_error.code_str(), "SLAB_E_COMMAND");
     }
 }
+
+#[test]
+fn decimal_filters_rescale_and_reject_sub_scale_bounds() {
+    let mut workspace =
+        Workspace::open_in_memory("Filters", Box::new(TestClock::new())).expect("workspace");
+    workspace
+        .create_table(&TableDraft {
+            name: "Invoices".into(),
+            columns: vec![ColumnDraft {
+                name: "Amount".into(),
+                ty: ColumnType::Decimal { scale: 2 },
+                required: false,
+                unique: false,
+                default: None,
+            }],
+        })
+        .expect("table");
+    for amount in ["12.30", "1.23"] {
+        workspace
+            .insert_row(
+                "Invoices",
+                &row(&[(
+                    "Amount",
+                    Value::Decimal(slab_core::Decimal::parse(amount).expect("amount")),
+                )]),
+            )
+            .expect("insert");
+    }
+    let exact = workspace
+        .page(&PageQuery {
+            table: "Invoices".into(),
+            limit: 10,
+            filters: vec![Filter {
+                column: "Amount".into(),
+                op: FilterOp::Eq,
+                value: Some(Value::Text("12.3".into())),
+            }],
+            ..PageQuery::default()
+        })
+        .expect("exact filter");
+    assert_eq!(exact.rows.len(), 1);
+    assert!(
+        workspace
+            .page(&PageQuery {
+                table: "Invoices".into(),
+                limit: 10,
+                filters: vec![Filter {
+                    column: "Amount".into(),
+                    op: FilterOp::Lt,
+                    value: Some(Value::Text("12.304".into())),
+                }],
+                ..PageQuery::default()
+            })
+            .is_err(),
+        "a sub-scale bound must not be rounded into a different result set"
+    );
+}

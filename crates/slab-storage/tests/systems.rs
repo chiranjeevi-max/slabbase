@@ -118,6 +118,10 @@ fn committed_fixture_migrates_and_verifies() {
     assert_eq!(report.integrity, "ok");
     assert!(report.audit_chain, "fixture audit chain did not migrate");
     assert!(report.audit_entries > 0);
+    assert_eq!(
+        workspace.info().expect("info").format_version,
+        slab_core::FORMAT_VERSION
+    );
     workspace.close().expect("close");
 }
 
@@ -400,7 +404,7 @@ fn incremental_rollups_match_full_recomputation_over_one_thousand_operations() {
 }
 
 #[test]
-fn rollup_delta_latency_stays_under_two_milliseconds() {
+fn rollup_delta_latency_stays_bounded() {
     let directory = tempfile::TempDir::new().expect("tempdir");
     let (_path, mut workspace) = rollup_workspace(&directory);
     let invoice = workspace
@@ -450,11 +454,11 @@ fn rollup_delta_latency_stays_under_two_milliseconds() {
     durations.sort();
     let median = durations[durations.len() / 2];
     if !cfg!(debug_assertions) {
-        let budget = if std::env::var_os("CI").is_some() {
-            Duration::from_millis(5)
-        } else {
-            Duration::from_millis(2)
-        };
+        // The precise number comes from `systems_bench`; this is a coarse
+        // smoke guard. Five milliseconds matches CI so a loaded workstation
+        // does not turn scheduler noise into a failure while a regression to
+        // a full child scan still trips it.
+        let budget = Duration::from_millis(5);
         assert!(
             median < budget,
             "rollup edit median {median:?} exceeded {budget:?}"

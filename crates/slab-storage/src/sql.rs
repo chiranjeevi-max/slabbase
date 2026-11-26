@@ -151,9 +151,17 @@ pub(crate) fn decode_value(
     column_type: &ColumnType,
 ) -> Result<Value, StorageError> {
     match column_type {
-        ColumnType::Text | ColumnType::Select { .. } | ColumnType::AttachmentRef => {
+        ColumnType::Text => {
             let value: Option<String> = row.get(index)?;
             Ok(value.map_or(Value::Null, Value::Text))
+        }
+        ColumnType::Select { .. } => {
+            let value: Option<String> = row.get(index)?;
+            Ok(value.map_or(Value::Null, Value::Select))
+        }
+        ColumnType::AttachmentRef => {
+            let value: Option<String> = row.get(index)?;
+            Ok(value.map_or(Value::Null, Value::AttachmentRef))
         }
         ColumnType::Integer => {
             let value: Option<i64> = row.get(index)?;

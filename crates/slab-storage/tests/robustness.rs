@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-//! Adversarial regression tests for the storage engine.
+//! Failure-mode regression tests for the storage engine.
 //!
 //! Every test in this file encodes a failure mode that was reproduced before
 //! the matching fix. Keep the assertions behavioral: they must fail on the
@@ -491,7 +491,7 @@ fn cascade_delete_leaves_no_orphan_rollup_rows() {
 /// be rejected or ignored safely. It must never panic and must never surface
 /// frames that were not part of a valid checkpoint.
 #[test]
-fn hostile_wal_page_size_is_handled_without_panic() {
+fn malformed_wal_page_size_is_handled_without_panic() {
     let directory = tempfile::TempDir::new().expect("tempdir");
     let source = directory.path().join("source.slab");
     {
@@ -515,31 +515,31 @@ fn hostile_wal_page_size_is_handled_without_panic() {
         .expect("wal");
     connection
         .execute(
-            "INSERT INTO \"Notes\" (\"Body\") VALUES ('hostile page size')",
+            "INSERT INTO \"Notes\" (\"Body\") VALUES ('malformed page size')",
             [],
         )
         .expect("insert");
     let source_wal = source.with_extension("slab-wal");
     assert!(source_wal.exists(), "WAL was not created");
-    let hostile = directory.path().join("hostile.slab");
-    let hostile_wal = hostile.with_extension("slab-wal");
-    fs::copy(&source, &hostile).expect("copy database");
-    fs::copy(&source_wal, &hostile_wal).expect("copy wal");
+    let malformed = directory.path().join("malformed.slab");
+    let malformed_wal = malformed.with_extension("slab-wal");
+    fs::copy(&source, &malformed).expect("copy database");
+    fs::copy(&source_wal, &malformed_wal).expect("copy wal");
     drop(connection);
 
-    let mut header = fs::read(&hostile_wal).expect("read wal");
+    let mut header = fs::read(&malformed_wal).expect("read wal");
     assert!(header.len() >= 12);
     header[8..12].copy_from_slice(&8192_u32.to_be_bytes());
-    fs::write(&hostile_wal, &header).expect("write wal");
+    fs::write(&malformed_wal, &header).expect("write wal");
 
-    match Workspace::open(&hostile, Box::new(TestClock::new())) {
+    match Workspace::open(&malformed, Box::new(TestClock::new())) {
         Ok(workspace) => {
             let report = workspace.integrity_check().expect("integrity");
             assert_eq!(report.integrity, "ok");
             assert_eq!(
-                raw_count(&hostile, "Notes"),
+                raw_count(&malformed, "Notes"),
                 0,
-                "hostile WAL frames became visible"
+                "malformed WAL frames became visible"
             );
         }
         Err(error) => {
@@ -552,10 +552,10 @@ fn hostile_wal_page_size_is_handled_without_panic() {
     }
 }
 
-/// Snapshots must never follow a hostile link, clobber an existing file, or
+/// Snapshots must never follow an unsafe link, clobber an existing file, or
 /// leave a partial target behind.
 #[test]
-fn snapshots_reject_hostile_targets_without_clobbering() {
+fn snapshots_reject_unsafe_targets_without_clobbering() {
     let directory = tempfile::TempDir::new().expect("tempdir");
     let path = directory.path().join("live.slab");
     let mut workspace =

@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS _slab_audit_log (
     before_json TEXT,
     after_json TEXT,
     prev_hash TEXT,
-    entry_hash TEXT
+    entry_hash TEXT,
+    hash_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS _slab_audit_timestamp ON _slab_audit_log(timestamp_ms);
 CREATE TABLE IF NOT EXISTS _slab_rollups (
@@ -102,6 +103,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS _slab_fts USING fts5(
 const UNDO_LIMIT: usize = 200;
 const READER_POOL_SIZE: usize = 4;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Optional hook run inside a command's transaction before its audit entry is
+/// appended and the transaction commits.
+type PostApply<'a> = Option<&'a mut dyn FnMut(&Connection, &Command) -> Result<(), StorageError>>;
 
 /// Identifies one registered query so it can only retire its own entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,7 +260,7 @@ impl Workspace {
         clock: Box<dyn Clock>,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
-        if let Ok(metadata) = std::fs::metadata(path)
+        if let Ok(metadata) = std::fs::symlink_metadata(path)
             && metadata.len() > 0
         {
             return Err(StorageError::Workspace(format!(
@@ -267,8 +272,9 @@ impl Workspace {
         configure(&conn)?;
         initialize(&conn, name)?;
         migrate(&conn)?;
+        validate_workspace_schema(&conn)?;
         let readers = open_readers(path);
-        let mut workspace = Self {
+        let workspace = Self {
             conn,
             readers,
             reader_cursor: Cell::new(0),
@@ -285,7 +291,6 @@ impl Workspace {
             search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         };
-        workspace.validate_schema()?;
         Ok(workspace)
     }
 
@@ -312,21 +317,28 @@ impl Workspace {
         // Set the timeout before the first read so a concurrent writer cannot
         // turn workspace discovery into an immediate SQLITE_BUSY failure.
         conn.busy_timeout(Duration::from_millis(5_000))?;
-        let has_meta: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_slab_meta')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| workspace_open_error(error, path))?;
-        if !has_meta {
+        if !looks_like_workspace(&conn).map_err(|error| workspace_open_error(error, path))? {
             return Err(StorageError::Workspace(format!(
                 "{} is not a SlabBase workspace",
                 path.display()
             )));
         }
+        let name = read_meta(&conn, "name")?.unwrap_or_else(|| "Workspace".into());
+        let format_version = read_meta(&conn, "format_version")?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if format_version > FORMAT_VERSION {
+            return Err(StorageError::Workspace(format!(
+                "workspace format {format_version} is newer than this build supports ({FORMAT_VERSION})"
+            )));
+        }
+        // Prove the schema and formula graph are valid before changing journal
+        // mode or migrating. A file with an invalid stored formula must be
+        // rejected without being rewritten.
+        validate_workspace_schema(&conn)?;
         // Only mutate connection settings after the file is known to be a
-        // workspace. This keeps foreign or damaged files byte-for-byte intact.
+        // supported workspace. This keeps foreign or newer-format files
+        // byte-for-byte intact.
         configure(&conn).map_err(|error| match error {
             StorageError::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
                 if failure.code == rusqlite::ErrorCode::ReadOnly =>
@@ -338,15 +350,6 @@ impl Workspace {
             }
             other => other,
         })?;
-        let name = read_meta(&conn, "name")?.unwrap_or_else(|| "Workspace".into());
-        let format_version = read_meta(&conn, "format_version")?
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
-        if format_version > FORMAT_VERSION {
-            return Err(StorageError::Workspace(format!(
-                "workspace format {format_version} is newer than this build supports ({FORMAT_VERSION})"
-            )));
-        }
         migrate(&conn)?;
         let readers = open_readers(path);
         let mut workspace = Self {
@@ -366,7 +369,6 @@ impl Workspace {
             search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         };
-        workspace.validate_schema()?;
         // Rollup state is a derived cache. The file can be edited by an
         // external SQLite client between sessions, so a cached total is not
         // trustworthy until a mutation through this engine refreshes it.
@@ -424,14 +426,7 @@ impl Workspace {
         }
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_millis(5_000))?;
-        let has_meta: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_slab_meta')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| workspace_open_error(error, path))?;
-        if !has_meta {
+        if !looks_like_workspace(&conn).map_err(|error| workspace_open_error(error, path))? {
             return Err(StorageError::Workspace(format!(
                 "{} is not a SlabBase workspace",
                 path.display()
@@ -447,7 +442,8 @@ impl Workspace {
                 "workspace format {format_version} is newer than this build supports ({FORMAT_VERSION})"
             )));
         }
-        let mut workspace = Self {
+        validate_workspace_schema(&conn)?;
+        let workspace = Self {
             conn,
             readers: Vec::new(),
             reader_cursor: Cell::new(0),
@@ -464,7 +460,6 @@ impl Workspace {
             search_cancel: Arc::new(QueryCancel::new()),
             read_only: true,
         };
-        workspace.validate_schema()?;
         Ok(workspace)
     }
 
@@ -552,6 +547,12 @@ impl Workspace {
         &self.conn
     }
 
+    /// The connection allowed to store derived rollup state, or `None` for a
+    /// read-only replica.
+    pub(crate) fn cache_conn(&self) -> Option<&Connection> {
+        (!self.read_only).then(|| self.write_conn())
+    }
+
     fn refresh_readers(&mut self) {
         if self.path.is_none() || self.read_only {
             return;
@@ -563,120 +564,9 @@ impl Workspace {
         self.reader_cursor.set(0);
     }
 
-    /// Loads the schema from metadata tables and validates it.
+    /// Loads the schema from metadata tables.
     pub fn schema(&self) -> Result<Schema, StorageError> {
-        let mut tables: Vec<Table> = Vec::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, name, created_at FROM _slab_tables ORDER BY name")?;
-            let rows = stmt.query_map([], |row| {
-                Ok(Table {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    columns: Vec::new(),
-                    created_at: row.get(2)?,
-                })
-            })?;
-            for row in rows {
-                tables.push(row?);
-            }
-        }
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, table_name, name, type_json, required, unique_flag, default_json, position
-                 FROM _slab_columns ORDER BY table_name, position, name",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let type_json: String = row.get(3)?;
-                let default_json: Option<String> = row.get(6)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    type_json,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)? != 0,
-                    default_json,
-                    row.get::<_, i64>(7)?,
-                ))
-            })?;
-            for row in rows {
-                let (id, table_name, name, type_json, required, unique, default_json, position) =
-                    row?;
-                let ty: ColumnType = serde_json::from_str(&type_json)?;
-                let default = default_json
-                    .map(|json| serde_json::from_str::<Value>(&json))
-                    .transpose()?;
-                if let Some(table) = tables.iter_mut().find(|table| table.name == table_name) {
-                    table.columns.push(Column {
-                        id,
-                        table: table_name,
-                        name,
-                        ty,
-                        required,
-                        unique,
-                        default,
-                        position: u32::try_from(position).unwrap_or(0),
-                    });
-                }
-            }
-        }
-        let mut relations: Vec<Relation> = Vec::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, name, parent_table, child_table, child_column, on_delete
-                 FROM _slab_relations ORDER BY name",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let action: String = row.get(5)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    action,
-                ))
-            })?;
-            for row in rows {
-                let (id, name, parent_table, child_table, child_column, action) = row?;
-                relations.push(Relation {
-                    id,
-                    name,
-                    parent_table,
-                    child_table,
-                    child_column,
-                    on_delete: match action.as_str() {
-                        "cascade" => DeleteAction::Cascade,
-                        "setNull" => DeleteAction::SetNull,
-                        _ => DeleteAction::Restrict,
-                    },
-                });
-            }
-        }
-        let mut layouts: Vec<Layout> = Vec::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT spec_json FROM _slab_layouts ORDER BY name")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                layouts.push(serde_json::from_str(&row?)?);
-            }
-        }
-        Ok(Schema {
-            tables,
-            relations,
-            layouts,
-        })
-    }
-
-    fn validate_schema(&mut self) -> Result<(), StorageError> {
-        let schema = self.schema()?;
-        schema.validate()?;
-        FormulaDag::build(&schema)?;
-        Ok(())
+        load_schema(&self.conn)
     }
 
     /// Workspace metadata and row counts.
@@ -735,10 +625,44 @@ impl Workspace {
     /// without an FTS5 build. A pending marker rebuilds the index once on the
     /// next SlabBase open.
     pub fn export_sql(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
+        let path = path.as_ref();
+        self.check_export_policy()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let (temporary, file) = create_temporary_sibling(parent)?;
+        let outcome = self.export_sql_to(file).and_then(|()| {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                std::fs::set_permissions(&temporary, metadata.permissions())?;
+            }
+            std::fs::rename(&temporary, path)?;
+            Ok(())
+        });
+        if outcome.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        outcome
+    }
+
+    fn check_export_policy(&self) -> Result<(), StorageError> {
         let schema = self.schema()?;
-        let file = File::create(path)?;
-        let mut out = BufWriter::new(file);
+        for table in &schema.tables {
+            self.check_policy(&table.name)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the SQL dump to an already-open writer.
+    ///
+    /// The shell opens a private scratch file with `create_new` and passes the
+    /// handle here, so publishing cannot be raced through a predictable path.
+    pub fn export_sql_to<W: Write>(&self, writer: W) -> Result<(), StorageError> {
+        self.check_export_policy()?;
+        let schema = self.schema()?;
+        let mut out = BufWriter::new(writer);
         writeln!(out, "-- SlabBase SQL export (format {FORMAT_VERSION})")?;
+        writeln!(out, "PRAGMA user_version = {FORMAT_VERSION};")?;
         writeln!(out, "PRAGMA foreign_keys = OFF;")?;
         writeln!(out, "BEGIN TRANSACTION;")?;
         let mut table_names: Vec<String> = vec![
@@ -1377,11 +1301,7 @@ impl Workspace {
             },
             children: Vec::new(),
         };
-        let applied = self.apply_command(&command)?;
-        let id = applied.row_id().ok_or_else(|| {
-            StorageError::Internal("insert command did not carry a row id".into())
-        })?;
-        self.read_record(table, id)
+        self.apply_row_command_with_readback(&command, command.operation(), &command.label())
     }
 
     /// Inserts several rows in one transaction. Every row still receives its
@@ -1392,6 +1312,7 @@ impl Workspace {
         rows: &[RowData],
     ) -> Result<Vec<slab_core::Record>, StorageError> {
         self.ensure_writer_available()?;
+        self.check_policy(table)?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1404,10 +1325,12 @@ impl Workspace {
             prepared.push(prepare_row(definition, values, None, true)?);
         }
         let hlc = self.clock.now();
+        let dag = FormulaDag::build(&schema)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut commands = Vec::with_capacity(prepared.len());
+        let mut records = Vec::with_capacity(prepared.len());
         for values in prepared {
             let row = slab_core::Record { id: 0, values };
             let id = insert_record_tx(&tx, definition, &row, false)?;
@@ -1423,17 +1346,16 @@ impl Workspace {
                 children: Vec::new(),
             };
             append_audit(&tx, &command, &hlc, &self.actor, "insert", &command.label())?;
+            let record = read_computed_record(&tx, &schema, &dag, definition, id)?;
             commands.push(command);
+            records.push(record);
         }
         tx.commit()?;
         for command in &commands {
             self.push_undo(command.clone());
         }
-        let mut records = Vec::with_capacity(commands.len());
-        for command in commands {
-            if let Command::InsertRow { row, .. } = command {
-                records.push(self.read_record(table, row.id)?);
-            }
+        for record in &mut records {
+            self.redact_record(definition, record);
         }
         Ok(records)
     }
@@ -1470,6 +1392,7 @@ impl Workspace {
                 "no import transaction is active".into(),
             ));
         }
+        self.check_policy(table)?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1522,6 +1445,33 @@ impl Workspace {
                 "no import transaction is active".into(),
             ));
         };
+        // An import is one all-or-nothing transaction, so the same readback
+        // contract as `insert_row` applies: a row whose formulas cannot be
+        // evaluated must not commit.
+        let validation = (|| -> Result<(), StorageError> {
+            let schema = self.schema()?;
+            let dag = FormulaDag::build(&schema)?;
+            for command in &commands {
+                let Command::InsertRow { table, row, .. } = command else {
+                    continue;
+                };
+                let definition = schema
+                    .table(table)
+                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
+                if definition
+                    .columns
+                    .iter()
+                    .any(|column| column.ty.is_computed())
+                {
+                    read_computed_record(&self.conn, &schema, &dag, definition, row.id)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
         match self.conn.execute_batch("COMMIT") {
             Ok(()) => {
                 for command in commands {
@@ -1570,13 +1520,13 @@ impl Workspace {
             before: before.clone(),
             after,
         };
-        self.apply_command(&command)?;
-        self.read_record(table, id)
+        self.apply_row_command_with_readback(&command, command.operation(), &command.label())
     }
 
     /// Deletes a row and captures cascade-deleted children for undo.
     pub fn delete_row(&mut self, table: &str, id: RowId) -> Result<(), StorageError> {
         self.ensure_writer_available()?;
+        self.check_policy(table)?;
         let schema = self.schema()?;
         let definition = schema
             .table(table)
@@ -1588,7 +1538,8 @@ impl Workspace {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut children = Vec::new();
-        capture_cascades(&tx, &schema, table, id, &mut children)?;
+        let mut seen = BTreeSet::from([(table.to_owned(), id)]);
+        capture_cascades(&tx, &schema, table, id, &mut seen, &mut children)?;
         delete_row_tx(&tx, table, id)?;
         delete_fts(&tx, table, id)?;
         // Remove every contribution before forgetting any parent state. A
@@ -1699,7 +1650,14 @@ impl Workspace {
         )?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(row?);
+            let entry = row?;
+            if entry
+                .table
+                .as_deref()
+                .is_none_or(|table| self.policy.can_read_table(table))
+            {
+                entries.push(entry);
+            }
         }
         Ok(entries)
     }
@@ -1710,6 +1668,7 @@ impl Workspace {
         table: &str,
         row_id: RowId,
     ) -> Result<Vec<slab_core::RecordRevision>, StorageError> {
+        self.check_policy(table)?;
         let sql = "SELECT id, hlc, timestamp_ms, actor, operation, summary, before_json, after_json
                    FROM _slab_audit_log
                    WHERE table_name = ?1 AND row_id = ?2
@@ -1753,6 +1712,7 @@ impl Workspace {
         row_id: RowId,
         audit_id: i64,
     ) -> Result<slab_core::Record, StorageError> {
+        self.check_policy(table)?;
         let schema = self.schema()?;
         FormulaDag::build(&schema)?;
         let definition = schema
@@ -1803,9 +1763,7 @@ impl Workspace {
             }
         };
         let summary = format!("Restore {table} #{row_id} revision {audit_id}");
-        let applied = self.apply_command_with_audit(&command, "restore", &summary)?;
-        self.push_undo(applied);
-        self.read_record(table, row_id)
+        self.apply_row_command_with_readback(&command, "restore", &summary)
     }
 
     fn push_undo(&mut self, command: Command) {
@@ -1845,6 +1803,66 @@ impl Workspace {
         Ok(applied)
     }
 
+    /// Applies a row mutation and returns its fully computed record from the
+    /// same transaction.
+    ///
+    /// Reading the record back after `COMMIT` turned a committed insert into a
+    /// reported failure whenever a formula could not be evaluated (for example
+    /// `[A] / [B]` with `B = 0`). The read now happens before the commit, so a
+    /// failed read rolls the row, its audit entry, and its FTS/rollup updates
+    /// back together.
+    fn apply_row_command_with_readback(
+        &mut self,
+        command: &Command,
+        operation: &str,
+        summary: &str,
+    ) -> Result<slab_core::Record, StorageError> {
+        let table_name = match command {
+            Command::InsertRow { table, .. } | Command::UpdateRow { table, .. } => table,
+            _ => {
+                return Err(StorageError::Internal(
+                    "row readback received a non-row command".into(),
+                ));
+            }
+        };
+        // The record returned by a write is a read. Apply the same table policy
+        // gate before the mutation so a denied table fails without committing.
+        self.check_policy(table_name)?;
+        let schema = self.schema()?;
+        let definition = schema
+            .table(table_name)
+            .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
+        let dag = FormulaDag::build(&schema)?;
+        let mut computed: Option<slab_core::Record> = None;
+        let applied = {
+            let mut readback = |conn: &Connection, applied: &Command| -> Result<(), StorageError> {
+                let (table_name, row_id) = match applied {
+                    Command::InsertRow { table, row, .. } => (table.as_str(), row.id),
+                    Command::UpdateRow { table, after, .. } => (table.as_str(), after.id),
+                    _ => {
+                        return Err(StorageError::Internal(
+                            "row readback received a non-row command".into(),
+                        ));
+                    }
+                };
+                let definition = schema
+                    .table(table_name)
+                    .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
+                computed = Some(read_computed_record(
+                    conn, &schema, &dag, definition, row_id,
+                )?);
+                Ok(())
+            };
+            self.apply_command_tx(command, operation, summary, Some(&mut readback))?
+        };
+        let mut record = computed.ok_or_else(|| {
+            StorageError::Internal("row readback did not produce a record".into())
+        })?;
+        self.push_undo(applied);
+        self.redact_record(definition, &mut record);
+        Ok(record)
+    }
+
     fn apply_command_with_audit(
         &mut self,
         command: &Command,
@@ -1861,9 +1879,9 @@ impl Workspace {
             | Command::DropRelation { .. }
             | Command::DropColumn { .. }
             | Command::RestoreColumn { .. } => self.with_foreign_keys_off(|workspace| {
-                workspace.apply_command_tx(command, operation, summary)
+                workspace.apply_command_tx(command, operation, summary, None)
             }),
-            _ => self.apply_command_tx(command, operation, summary),
+            _ => self.apply_command_tx(command, operation, summary, None),
         }
     }
 
@@ -1886,6 +1904,7 @@ impl Workspace {
         command: &Command,
         operation: &str,
         summary: &str,
+        post_apply: PostApply<'_>,
     ) -> Result<Command, StorageError> {
         self.ensure_writer_available()?;
         let schema = self.schema()?;
@@ -1945,7 +1964,8 @@ impl Workspace {
                     .ok_or_else(|| StorageError::NotFound(table.clone()))?;
                 let mut cascaded = children.clone();
                 if cascaded.is_empty() {
-                    capture_cascades(&tx, &schema, table, row.id, &mut cascaded)?;
+                    let mut seen = BTreeSet::from([(table.to_owned(), row.id)]);
+                    capture_cascades(&tx, &schema, table, row.id, &mut seen, &mut cascaded)?;
                 }
                 delete_row_tx(&tx, table, row.id)?;
                 delete_fts(&tx, table, row.id)?;
@@ -2279,7 +2299,18 @@ impl Workspace {
                 command.clone()
             }
         };
-        append_audit(&tx, &applied, &hlc, &self.actor, operation, summary)?;
+        if let Some(post_apply) = post_apply {
+            post_apply(&tx, &applied)?;
+        }
+        let audit_summary = match (command, &applied) {
+            // A fresh insert enters the transaction without an id; the summary
+            // must name the row SQLite actually assigned, not `#0`.
+            (Command::InsertRow { row, .. }, Command::InsertRow { .. }) if row.id == 0 => {
+                applied.label()
+            }
+            _ => summary.to_owned(),
+        };
+        append_audit(&tx, &applied, &hlc, &self.actor, operation, &audit_summary)?;
         let schema_change = command.is_schema_change();
         if schema_change {
             rollup::clear(&tx)?;
@@ -2340,14 +2371,144 @@ fn open_readers(path: &Path) -> Vec<Connection> {
     readers
 }
 
-fn migrate(conn: &Connection) -> Result<(), StorageError> {
-    conn.execute_batch(SYSTEM_DDL)?;
-    ensure_audit_columns(conn)?;
-    ensure_audit_chain(conn)?;
+fn load_schema(conn: &Connection) -> Result<Schema, StorageError> {
+    let mut tables: Vec<Table> = Vec::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT id, name, created_at FROM _slab_tables ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Table {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                columns: Vec::new(),
+                created_at: row.get(2)?,
+            })
+        })?;
+        for row in rows {
+            tables.push(row?);
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, table_name, name, type_json, required, unique_flag, default_json, position
+                 FROM _slab_columns ORDER BY table_name, position, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let type_json: String = row.get(3)?;
+            let default_json: Option<String> = row.get(6)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                type_json,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)? != 0,
+                default_json,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, table_name, name, type_json, required, unique, default_json, position) = row?;
+            let ty: ColumnType = serde_json::from_str(&type_json)?;
+            let default = default_json
+                .map(|json| serde_json::from_str::<Value>(&json))
+                .transpose()?;
+            if let Some(table) = tables.iter_mut().find(|table| table.name == table_name) {
+                table.columns.push(Column {
+                    id,
+                    table: table_name,
+                    name,
+                    ty,
+                    required,
+                    unique,
+                    default,
+                    position: u32::try_from(position).unwrap_or(0),
+                });
+            }
+        }
+    }
+    let mut relations: Vec<Relation> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, parent_table, child_table, child_column, on_delete
+                 FROM _slab_relations ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let action: String = row.get(5)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                action,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, parent_table, child_table, child_column, action) = row?;
+            relations.push(Relation {
+                id,
+                name,
+                parent_table,
+                child_table,
+                child_column,
+                on_delete: match action.as_str() {
+                    "cascade" => DeleteAction::Cascade,
+                    "setNull" => DeleteAction::SetNull,
+                    _ => DeleteAction::Restrict,
+                },
+            });
+        }
+    }
+    let mut layouts: Vec<Layout> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT spec_json FROM _slab_layouts ORDER BY name")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            layouts.push(serde_json::from_str(&row?)?);
+        }
+    }
+    Ok(Schema {
+        tables,
+        relations,
+        layouts,
+    })
+}
+
+fn validate_workspace_schema(conn: &Connection) -> Result<(), StorageError> {
+    let schema = load_schema(conn)?;
+    schema.validate()?;
+    FormulaDag::build(&schema)?;
     Ok(())
 }
 
-fn ensure_audit_columns(conn: &Connection) -> Result<(), StorageError> {
+fn migrate(conn: &Connection) -> Result<(), StorageError> {
+    // Schema addition and hash backfill must commit together. SQLite DDL is
+    // transactional; a crash leaves the file untouched instead of with hash
+    // columns but no hashes (which would look like tampering forever).
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(SYSTEM_DDL)?;
+    let predates_hash_columns = ensure_audit_columns(&tx)?;
+    let format_version = read_meta(&tx, "format_version")?
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    ensure_audit_chain(&tx, predates_hash_columns, format_version)?;
+    // Record the format bump in the same transaction as the hash schema.
+    let version = FORMAT_VERSION.to_string();
+    if read_meta(&tx, "format_version")?.as_deref() != Some(version.as_str()) {
+        set_meta(&tx, "format_version", &version)?;
+        tx.execute_batch(&format!("PRAGMA user_version = {FORMAT_VERSION};"))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Adds the hash columns when they are missing.
+///
+/// Returns true only when the file predates the whole hash schema. A modern
+/// file whose hashes were NULLed keeps its `prev_hash`/`entry_hash` columns,
+/// so `ensure_audit_chain` can tell tampering from a genuine legacy log.
+fn ensure_audit_columns(conn: &Connection) -> Result<bool, StorageError> {
     let mut columns = Vec::new();
     {
         let mut stmt = conn.prepare("PRAGMA table_info(_slab_audit_log)")?;
@@ -2356,16 +2517,28 @@ fn ensure_audit_columns(conn: &Connection) -> Result<(), StorageError> {
             columns.push(row?);
         }
     }
+    let predates_hash_columns = !columns.iter().any(|name| name == "prev_hash")
+        && !columns.iter().any(|name| name == "entry_hash")
+        && !columns.iter().any(|name| name == "hash_version");
     if !columns.iter().any(|name| name == "prev_hash") {
         conn.execute_batch("ALTER TABLE _slab_audit_log ADD COLUMN prev_hash TEXT;")?;
     }
     if !columns.iter().any(|name| name == "entry_hash") {
         conn.execute_batch("ALTER TABLE _slab_audit_log ADD COLUMN entry_hash TEXT;")?;
     }
-    Ok(())
+    if !columns.iter().any(|name| name == "hash_version") {
+        conn.execute_batch(
+            "ALTER TABLE _slab_audit_log ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+    Ok(predates_hash_columns)
 }
 
-fn ensure_audit_chain(conn: &Connection) -> Result<(), StorageError> {
+fn ensure_audit_chain(
+    conn: &Connection,
+    predates_hash_columns: bool,
+    format_version: u32,
+) -> Result<(), StorageError> {
     let total: i64 =
         conn.query_row("SELECT COUNT(*) FROM _slab_audit_log", [], |row| row.get(0))?;
     let missing: i64 = conn.query_row(
@@ -2375,90 +2548,164 @@ fn ensure_audit_chain(conn: &Connection) -> Result<(), StorageError> {
         |row| row.get(0),
     )?;
     if missing > 0 {
-        // A wholly unhashed log is the legacy v1.0 format only when it also
-        // has no chain anchor. If the head exists, an attacker has NULLed the
-        // hashes of a modern log; backfilling would rewrite a fresh chain over
-        // the altered content.
-        if missing == total && read_meta(conn, "audit_head_hash")?.is_none() {
-            return backfill_audit_chain(conn);
+        // Only a file whose schema predates the hash columns can be a genuine
+        // legacy log. NULLing every hash in a modern file (and deleting the
+        // head anchor) must not let the next open mint a fresh chain over
+        // altered history.
+        if predates_hash_columns
+            && format_version < 2
+            && missing == total
+            && read_meta(conn, "audit_head_hash")?.is_none()
+        {
+            return rewrite_audit_chain(conn);
         }
         // Leave every other missing hash for `verify_audit_chain` to report.
         return Ok(());
     }
-    if read_meta(conn, "audit_head_hash")?.is_none() {
-        let last: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT id, entry_hash FROM _slab_audit_log ORDER BY id DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        match last {
-            Some((id, hash)) => {
-                set_meta(conn, "audit_head_hash", &hash)?;
-                set_meta(conn, "audit_head_id", &id.to_string())?;
-            }
-            None => {
-                set_meta(conn, "audit_head_hash", GENESIS_HASH)?;
-                set_meta(conn, "audit_head_id", "0")?;
-            }
-        }
-    }
+    // A missing head anchor on a modern log is tamper evidence, not something
+    // to repair by re-anchoring the remaining tail. A fresh empty log verifies
+    // without an anchor.
+    migrate_audit_hash_current(conn)?;
     Ok(())
 }
 
-fn backfill_audit_chain(conn: &Connection) -> Result<(), StorageError> {
-    // The migration updates every row and both head anchors. A crash midway
-    // must roll the whole backfill back, not leave a half-hashed log that the
-    // next open would have to guess about.
-    let tx = conn.unchecked_transaction()?;
-    let rows = {
-        let mut stmt = tx.prepare(
-            "SELECT id, hlc, table_name, row_id, operation, summary, schema_change,
-                    before_json, after_json
-             FROM _slab_audit_log ORDER BY id ASC",
-        )?;
-        let mapped = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)? != 0,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-            ))
-        })?;
-        let mut collected = Vec::new();
-        for row in mapped {
-            collected.push(row?);
-        }
-        collected
-    };
+/// Rows rewritten per pass. The before/after payloads can be large, so the
+/// migration must not materialize the whole log.
+const AUDIT_REWRITE_CHUNK: i64 = 256;
+
+/// One decoded audit row, shared by verification, migration, and tests so the
+/// column order has one definition.
+struct AuditRow {
+    id: i64,
+    hlc: String,
+    timestamp_ms: i64,
+    actor: String,
+    transaction_id: String,
+    table: Option<String>,
+    row_id: Option<i64>,
+    operation: String,
+    summary: String,
+    schema_change: bool,
+    before: Option<String>,
+    after: Option<String>,
+    prev_hash: Option<String>,
+    entry_hash: Option<String>,
+    hash_version: i64,
+}
+
+const AUDIT_ROW_COLUMNS: &str = "id, hlc, timestamp_ms, actor, transaction_id, table_name,
+    row_id, operation, summary, schema_change, before_json, after_json, prev_hash, entry_hash,
+    hash_version";
+
+impl AuditRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            hlc: row.get(1)?,
+            timestamp_ms: row.get(2)?,
+            actor: row.get(3)?,
+            transaction_id: row.get(4)?,
+            table: row.get(5)?,
+            row_id: row.get(6)?,
+            operation: row.get(7)?,
+            summary: row.get(8)?,
+            schema_change: row.get::<_, i64>(9)? != 0,
+            before: row.get(10)?,
+            after: row.get(11)?,
+            prev_hash: row.get(12)?,
+            entry_hash: row.get(13)?,
+            hash_version: row.get(14)?,
+        })
+    }
+
+    fn diff(&self) -> Result<String, StorageError> {
+        audit_diff_json(
+            &self.operation,
+            &self.summary,
+            self.schema_change,
+            self.before.as_deref(),
+            self.after.as_deref(),
+        )
+    }
+}
+
+/// Rewrites every audit entry with the current scheme in one transaction.
+///
+/// The caller must have verified the current chain first (when it already has
+/// hashes) so tampered content is never blessed with a fresh chain. Rows are
+/// read and updated in bounded chunks; a big legacy log cannot balloon memory.
+fn rewrite_audit_chain(conn: &Connection) -> Result<(), StorageError> {
+    // The caller owns the transaction so the legacy column adds and the
+    // rewrite commit (or roll back) as one unit.
     let mut previous = GENESIS_HASH.to_owned();
     let mut last_id = 0_i64;
-    for (id, hlc, table, row_id, operation, summary, schema_change, before, after) in rows {
-        let diff = audit_diff_json(
-            &operation,
-            &summary,
-            schema_change,
-            before.as_deref(),
-            after.as_deref(),
-        )?;
-        let hash = audit_hash(&previous, &hlc, table.as_deref(), row_id, &diff);
-        tx.execute(
-            "UPDATE _slab_audit_log SET prev_hash = ?1, entry_hash = ?2 WHERE id = ?3",
-            params![previous, hash, id],
-        )?;
-        previous.clone_from(&hash);
-        last_id = id;
+    loop {
+        let rows = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {AUDIT_ROW_COLUMNS} FROM _slab_audit_log
+                 WHERE id > ?1 ORDER BY id ASC LIMIT ?2"
+            ))?;
+            let mapped =
+                stmt.query_map(params![last_id, AUDIT_REWRITE_CHUNK], AuditRow::from_row)?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row?);
+            }
+            collected
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for audit in rows {
+            let diff = audit.diff()?;
+            let hash = audit_hash_current(
+                &previous,
+                &audit.hlc,
+                audit.timestamp_ms,
+                &audit.actor,
+                &audit.transaction_id,
+                audit.table.as_deref(),
+                audit.row_id,
+                &diff,
+            );
+            conn.execute(
+                "UPDATE _slab_audit_log
+                 SET prev_hash = ?1, entry_hash = ?2, hash_version = ?3 WHERE id = ?4",
+                params![previous, hash, AUDIT_HASH_CURRENT, audit.id],
+            )?;
+            previous.clone_from(&hash);
+            last_id = audit.id;
+        }
     }
-    set_meta(&tx, "audit_head_hash", &previous)?;
-    set_meta(&tx, "audit_head_id", &last_id.to_string())?;
-    tx.commit()?;
+    set_meta(conn, "audit_head_hash", &previous)?;
+    set_meta(conn, "audit_head_id", &last_id.to_string())?;
     Ok(())
+}
+
+/// Upgrades a valid legacy scheme-1 chain to cover the actor and transaction id.
+///
+/// A log that does not verify is left byte-for-byte alone; `integrity_check`
+/// reports the tamper instead of the migration laundering it.
+fn migrate_audit_hash_current(conn: &Connection) -> Result<(), StorageError> {
+    // The last row decides. New entries are appended with the current scheme and the rewrite is
+    // atomic, so a scheme-1 last row means a legacy chain to migrate. A scheme-2 last row
+    // means migration already ran (a mixed tail can only follow a tampered,
+    // verification-failing log).
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT hash_version FROM _slab_audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if last.is_none_or(|version| version >= AUDIT_HASH_CURRENT) {
+        return Ok(());
+    }
+    let (valid, _, _) = verify_audit_chain(conn)?;
+    if !valid {
+        return Ok(());
+    }
+    rewrite_audit_chain(conn)
 }
 
 fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), StorageError> {
@@ -2486,7 +2733,12 @@ fn audit_diff_json(
     }))?)
 }
 
-fn audit_hash(
+/// Legacy chain: covers the previous hash, clock, row identity, and diff.
+const AUDIT_HASH_LEGACY: i64 = 1;
+/// Current chain: additionally covers the recorded actor and transaction id.
+const AUDIT_HASH_CURRENT: i64 = 2;
+
+fn audit_hash_legacy(
     previous: &str,
     hlc: &str,
     table: Option<&str>,
@@ -2511,31 +2763,59 @@ fn audit_hash(
     hasher.finalize().to_hex().to_string()
 }
 
+/// A length-prefixed field. Lengths make the scheme-2 preimage unambiguous even
+/// when a user-controlled field contains the separator byte.
+fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hash preimage fields are inherently positional"
+)]
+fn audit_hash_current(
+    previous: &str,
+    hlc: &str,
+    timestamp_ms: i64,
+    actor: &str,
+    transaction_id: &str,
+    table: Option<&str>,
+    row_id: Option<i64>,
+    diff: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hash_field(&mut hasher, previous.as_bytes());
+    hash_field(&mut hasher, hlc.as_bytes());
+    hash_field(&mut hasher, &timestamp_ms.to_be_bytes());
+    hash_field(&mut hasher, actor.as_bytes());
+    hash_field(&mut hasher, transaction_id.as_bytes());
+    hash_field(&mut hasher, table.unwrap_or_default().as_bytes());
+    hash_field(
+        &mut hasher,
+        row_id
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hash_field(&mut hasher, diff.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn verify_audit_chain(conn: &Connection) -> Result<(bool, u64, Option<String>), StorageError> {
     let mut expected = GENESIS_HASH.to_owned();
     let mut count = 0_u64;
     let mut last_id = 0_i64;
     let mut last_hash = expected.clone();
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, hlc, table_name, row_id, operation, summary, schema_change,
-                    before_json, after_json, prev_hash, entry_hash
-             FROM _slab_audit_log ORDER BY id ASC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AUDIT_ROW_COLUMNS} FROM _slab_audit_log ORDER BY id ASC"
+        ))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let hlc: String = row.get(1)?;
-            let table: Option<String> = row.get(2)?;
-            let row_id: Option<i64> = row.get(3)?;
-            let operation: String = row.get(4)?;
-            let summary: String = row.get(5)?;
-            let schema_change: bool = row.get::<_, i64>(6)? != 0;
-            let before: Option<String> = row.get(7)?;
-            let after: Option<String> = row.get(8)?;
-            let prev: Option<String> = row.get(9)?;
-            let entry: Option<String> = row.get(10)?;
-            if prev.as_deref() != Some(expected.as_str()) {
+            let audit = AuditRow::from_row(row)?;
+            let id = audit.id;
+            if audit.prev_hash.as_deref() != Some(expected.as_str()) {
                 return Ok((
                     false,
                     count,
@@ -2544,15 +2824,36 @@ fn verify_audit_chain(conn: &Connection) -> Result<(bool, u64, Option<String>), 
                     )),
                 ));
             }
-            let diff = audit_diff_json(
-                &operation,
-                &summary,
-                schema_change,
-                before.as_deref(),
-                after.as_deref(),
-            )?;
-            let computed = audit_hash(&expected, &hlc, table.as_deref(), row_id, &diff);
-            if entry.as_deref() != Some(computed.as_str()) {
+            let diff = audit.diff()?;
+            let computed = match audit.hash_version {
+                AUDIT_HASH_LEGACY => audit_hash_legacy(
+                    &expected,
+                    &audit.hlc,
+                    audit.table.as_deref(),
+                    audit.row_id,
+                    &diff,
+                ),
+                AUDIT_HASH_CURRENT => audit_hash_current(
+                    &expected,
+                    &audit.hlc,
+                    audit.timestamp_ms,
+                    &audit.actor,
+                    &audit.transaction_id,
+                    audit.table.as_deref(),
+                    audit.row_id,
+                    &diff,
+                ),
+                other => {
+                    return Ok((
+                        false,
+                        count,
+                        Some(format!(
+                            "audit entry {id} uses unsupported hash version {other}"
+                        )),
+                    ));
+                }
+            };
+            if audit.entry_hash.as_deref() != Some(computed.as_str()) {
                 return Ok((
                     false,
                     count,
@@ -2688,6 +2989,30 @@ fn clone_file(source: &Path, target: &Path) -> Result<bool, StorageError> {
 #[cfg(not(target_os = "macos"))]
 fn clone_file(_source: &Path, _target: &Path) -> Result<bool, StorageError> {
     Ok(false)
+}
+
+/// True when the file carries the SlabBase metadata signature.
+///
+/// The probe performs reads only, so a foreign database is rejected before
+/// `configure` changes its journal mode or `migrate` creates metadata tables.
+/// `_slab_fts`, `_slab_audit_log`, and `_slab_rollups` are deliberately not
+/// required: a SQL export omits them and `migrate` recreates them.
+fn looks_like_workspace(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN
+            ('_slab_meta', '_slab_tables', '_slab_columns', '_slab_relations', '_slab_layouts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables != 5 {
+        return Ok(false);
+    }
+    let version: Result<String, rusqlite::Error> = conn.query_row(
+        "SELECT value FROM _slab_meta WHERE key = 'format_version'",
+        [],
+        |row| row.get(0),
+    );
+    Ok(version.is_ok_and(|value| value.parse::<u32>().is_ok()))
 }
 
 fn workspace_open_error(error: rusqlite::Error, path: &Path) -> StorageError {
@@ -2826,6 +3151,23 @@ pub(crate) fn read_stored_record(
     Ok(Some(slab_core::Record { id, values }))
 }
 
+/// Reads one stored row and evaluates its computed columns on `conn`.
+///
+/// `conn` must be the connection that owns the read snapshot (a writer
+/// transaction during a write, or a reader replica during a read).
+fn read_computed_record(
+    conn: &Connection,
+    schema: &Schema,
+    dag: &FormulaDag,
+    table: &Table,
+    id: RowId,
+) -> Result<slab_core::Record, StorageError> {
+    let mut record = read_stored_record(conn, table, id)?
+        .ok_or_else(|| StorageError::NotFound(format!("{} #{}", table.name, id)))?;
+    Workspace::compute_record_with_dag(conn, None, schema, table, &mut record, dag)?;
+    Ok(record)
+}
+
 fn insert_record_tx(
     tx: &Connection,
     table: &Table,
@@ -2939,6 +3281,7 @@ fn capture_cascades(
     schema: &Schema,
     table: &str,
     id: RowId,
+    seen: &mut BTreeSet<(String, RowId)>,
     out: &mut Vec<slab_core::RecordRef>,
 ) -> Result<(), StorageError> {
     for relation in schema.relations.iter().filter(|relation| {
@@ -2962,6 +3305,12 @@ fn capture_cascades(
         }
         drop(stmt);
         for child_id in child_ids {
+            // Two cascade paths can reach one child (for example a project
+            // whose Lead and Sponsor are the same person). Capture it once so
+            // the inverse insert cannot collide with itself.
+            if !seen.insert((child.name.clone(), child_id)) {
+                continue;
+            }
             let Some(row) = read_stored_record(conn, child, child_id)? else {
                 continue;
             };
@@ -2969,7 +3318,7 @@ fn capture_cascades(
                 table: child.name.clone(),
                 row,
             });
-            capture_cascades(conn, schema, &child.name, child_id, out)?;
+            capture_cascades(conn, schema, &child.name, child_id, seen, out)?;
         }
     }
     Ok(())
@@ -3248,9 +3597,14 @@ fn append_audit(
     let previous = read_meta(tx, "audit_head_hash")?
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| GENESIS_HASH.to_owned());
-    let entry = audit_hash(
+    let hlc_text = hlc.to_string();
+    let transaction_id = format!("tx-{hlc}");
+    let entry = audit_hash_current(
         &previous,
-        &hlc.to_string(),
+        &hlc_text,
+        hlc.wall_ms,
+        actor,
+        &transaction_id,
         command.table_name(),
         command.row_id(),
         &diff,
@@ -3258,13 +3612,13 @@ fn append_audit(
     tx.execute(
         "INSERT INTO _slab_audit_log
             (hlc, timestamp_ms, actor, transaction_id, table_name, row_id, operation, summary,
-             schema_change, before_json, after_json, prev_hash, entry_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             schema_change, before_json, after_json, prev_hash, entry_hash, hash_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
-            hlc.to_string(),
+            hlc_text,
             hlc.wall_ms,
             actor,
-            format!("tx-{hlc}"),
+            transaction_id,
             command.table_name(),
             command.row_id(),
             operation,
@@ -3274,6 +3628,7 @@ fn append_audit(
             after,
             previous,
             entry,
+            AUDIT_HASH_CURRENT,
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -3450,15 +3805,16 @@ fn rename_column_in_schema(
             relation.child_column = new_name.to_owned();
         }
     }
+    // A rename changes identity, not form content: keep `updated_at` stable
+    // so undo restores the exact previous form timestamp (the same rule as
+    // `RenameTable`).
     for layout in &mut candidate.layouts {
-        let mut changed = false;
         if layout.table == table {
             for item in &mut layout.items {
                 if let LayoutItemKind::Field { column } = &mut item.kind
                     && column == old_name
                 {
                     *column = new_name.to_owned();
-                    changed = true;
                 }
             }
         }
@@ -3474,14 +3830,10 @@ fn rename_column_in_schema(
                     for column in columns {
                         if column == old_name {
                             *column = new_name.to_owned();
-                            changed = true;
                         }
                     }
                 }
             }
-        }
-        if changed {
-            layout.updated_at = now_ms();
         }
     }
     candidate.validate()?;
@@ -3677,4 +4029,588 @@ fn hex_bytes(bytes: &[u8]) -> String {
         hex.push_str(&format!("{byte:02X}"));
     }
     hex
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::test_support::TestClock;
+    use slab_core::ColumnType;
+
+    fn note_workspace() -> Workspace {
+        let mut workspace =
+            Workspace::open_in_memory("Audit", Box::new(TestClock::new())).expect("workspace");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![ColumnDraft {
+                    name: "Body".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                }],
+            })
+            .expect("table");
+        for index in 0..3 {
+            workspace
+                .insert_row(
+                    "Notes",
+                    &RowData::from([("Body".to_owned(), Value::Text(format!("note {index}")))]),
+                )
+                .expect("row");
+        }
+        workspace
+    }
+
+    pub(super) fn downgrade_to_legacy_scheme(workspace: &Workspace) {
+        let rows = {
+            let mut stmt = workspace
+                .conn
+                .prepare(&format!(
+                    "SELECT {AUDIT_ROW_COLUMNS} FROM _slab_audit_log ORDER BY id ASC"
+                ))
+                .expect("select");
+            let mapped = stmt.query_map([], AuditRow::from_row).expect("map");
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.expect("row"));
+            }
+            collected
+        };
+        let mut previous = GENESIS_HASH.to_owned();
+        let mut last_id = 0;
+        for audit in rows {
+            let diff = audit.diff().expect("diff");
+            let hash = audit_hash_legacy(
+                &previous,
+                &audit.hlc,
+                audit.table.as_deref(),
+                audit.row_id,
+                &diff,
+            );
+            workspace
+                .conn
+                .execute(
+                    "UPDATE _slab_audit_log
+                     SET prev_hash = ?1, entry_hash = ?2, hash_version = 1 WHERE id = ?3",
+                    params![previous, hash, audit.id],
+                )
+                .expect("downgrade");
+            previous.clone_from(&hash);
+            last_id = audit.id;
+        }
+        set_meta(&workspace.conn, "audit_head_hash", &previous).expect("head");
+        set_meta(&workspace.conn, "audit_head_id", &last_id.to_string()).expect("head id");
+    }
+
+    pub(super) fn run_migration(workspace: &Workspace) {
+        let tx = workspace.conn.unchecked_transaction().expect("tx");
+        migrate_audit_hash_current(&tx).expect("migrate");
+        tx.commit().expect("commit");
+    }
+
+    pub(super) fn versions(workspace: &Workspace) -> Vec<i64> {
+        let mut stmt = workspace
+            .conn
+            .prepare("SELECT hash_version FROM _slab_audit_log ORDER BY id ASC")
+            .expect("select versions");
+        let mapped = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("map versions");
+        mapped.map(|row| row.expect("version")).collect()
+    }
+
+    #[test]
+    fn a_format_one_scheme_one_file_upgrades_on_open() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("scheme-one.slab");
+        let mut workspace =
+            Workspace::create(&path, "Audit", Box::new(TestClock::new())).expect("create");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![ColumnDraft {
+                    name: "Body".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                }],
+            })
+            .expect("table");
+        workspace
+            .insert_row(
+                "Notes",
+                &RowData::from([("Body".to_owned(), Value::Text("hello".into()))]),
+            )
+            .expect("row");
+        downgrade_to_legacy_scheme(&workspace);
+        set_meta(&workspace.conn, "format_version", "1").expect("format");
+        workspace.close().expect("close");
+        {
+            let connection = Connection::open(&path).expect("raw open");
+            connection
+                .execute_batch("ALTER TABLE _slab_audit_log DROP COLUMN hash_version;")
+                .expect("drop version column");
+        }
+
+        let workspace = Workspace::open(&path, Box::new(TestClock::new())).expect("open");
+        assert!(
+            workspace.integrity_check().expect("check").audit_chain,
+            "scheme-1 file did not upgrade and verify"
+        );
+        assert!(versions(&workspace).iter().all(|version| *version == 2));
+        assert_eq!(
+            workspace.info().expect("info").format_version,
+            slab_core::FORMAT_VERSION
+        );
+    }
+
+    #[test]
+    fn new_entries_hash_the_actor_and_transaction_id() {
+        let workspace = note_workspace();
+        assert!(versions(&workspace).iter().all(|version| *version == 2));
+        assert!(verify_audit_chain(&workspace.conn).expect("verify").0);
+
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log SET actor = 'attacker' WHERE id = 1",
+                [],
+            )
+            .expect("tamper actor");
+        let (valid, _, reason) = verify_audit_chain(&workspace.conn).expect("verify");
+        assert!(!valid, "actor tampering was not detected");
+        assert!(reason.is_some_and(|text| text.contains("BLAKE3")));
+
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log SET actor = 'local', transaction_id = 'forged' WHERE id = 1",
+                [],
+            )
+            .expect("tamper transaction");
+        let (valid, _, _) = verify_audit_chain(&workspace.conn).expect("verify");
+        assert!(!valid, "transaction-id tampering was not detected");
+    }
+
+    #[test]
+    fn timestamp_tampering_is_detected() {
+        let workspace = note_workspace();
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log SET timestamp_ms = timestamp_ms + 1 WHERE id = 1",
+                [],
+            )
+            .expect("tamper timestamp");
+        let (valid, _, _) = verify_audit_chain(&workspace.conn).expect("verify");
+        assert!(!valid, "timestamp tampering was not detected");
+    }
+
+    #[test]
+    fn deleting_the_head_or_all_hashes_does_not_launder_a_modern_log() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        for (name, statement) in [
+            (
+                "head-only",
+                "DELETE FROM _slab_meta WHERE key IN ('audit_head_hash', 'audit_head_id')",
+            ),
+            (
+                "nulled-and-head",
+                "UPDATE _slab_audit_log
+                    SET prev_hash = NULL, entry_hash = NULL, actor = 'mallory';
+                 DELETE FROM _slab_meta WHERE key IN ('audit_head_hash', 'audit_head_id')",
+            ),
+        ] {
+            let path = directory.path().join(format!("{name}.slab"));
+            let mut workspace =
+                Workspace::create(&path, "Audit", Box::new(TestClock::new())).expect("create");
+            workspace
+                .create_table(&TableDraft {
+                    name: "Notes".into(),
+                    columns: vec![ColumnDraft {
+                        name: "Body".into(),
+                        ty: ColumnType::Text,
+                        required: false,
+                        unique: false,
+                        default: None,
+                    }],
+                })
+                .expect("table");
+            workspace
+                .insert_row(
+                    "Notes",
+                    &RowData::from([("Body".to_owned(), Value::Text("hello".into()))]),
+                )
+                .expect("row");
+            workspace.close().expect("close");
+
+            {
+                let connection = Connection::open(&path).expect("raw open");
+                connection.execute_batch(statement).expect("tamper");
+            }
+            let workspace = Workspace::open(&path, Box::new(TestClock::new())).expect("reopen");
+            let report = workspace.integrity_check().expect("check");
+            assert!(
+                !report.audit_chain,
+                "{name}: a deleted anchor or NULLed modern log was laundered"
+            );
+            assert!(report.audit_tamper.is_some(), "{name}: no diagnostic");
+        }
+    }
+
+    #[test]
+    fn a_legacy_chain_migrates_to_the_current_scheme() {
+        let workspace = note_workspace();
+        downgrade_to_legacy_scheme(&workspace);
+        assert!(versions(&workspace).iter().all(|version| *version == 1));
+        assert!(
+            verify_audit_chain(&workspace.conn)
+                .expect("scheme 1 verify")
+                .0
+        );
+
+        run_migration(&workspace);
+        assert!(versions(&workspace).iter().all(|version| *version == 2));
+        assert!(
+            verify_audit_chain(&workspace.conn)
+                .expect("scheme 2 verify")
+                .0
+        );
+
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log SET actor = 'attacker' WHERE id = 2",
+                [],
+            )
+            .expect("tamper");
+        assert!(!verify_audit_chain(&workspace.conn).expect("verify").0);
+    }
+
+    #[test]
+    fn a_tampered_legacy_chain_is_not_migrated() {
+        let workspace = note_workspace();
+        downgrade_to_legacy_scheme(&workspace);
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log SET summary = 'silently rewritten' WHERE id = 2",
+                [],
+            )
+            .expect("tamper");
+
+        run_migration(&workspace);
+        assert!(versions(&workspace).iter().all(|version| *version == 1));
+        assert!(
+            !verify_audit_chain(&workspace.conn).expect("verify").0,
+            "a tampered legacy chain was laundered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_chunk_tests {
+    use super::audit_tests::run_migration;
+    use super::*;
+    use crate::test_support::TestClock;
+    use slab_core::ColumnType;
+
+    #[test]
+    fn a_legacy_chain_migrates_across_chunk_boundaries() {
+        let mut workspace =
+            Workspace::open_in_memory("Audit", Box::new(TestClock::new())).expect("workspace");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![ColumnDraft {
+                    name: "Body".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                }],
+            })
+            .expect("table");
+        let rows: Vec<RowData> = (0..300)
+            .map(|index| RowData::from([("Body".to_owned(), Value::Text(format!("note {index}")))]))
+            .collect();
+        workspace.insert_rows("Notes", &rows).expect("rows");
+
+        // 301 entries (create table + 300 rows) cross the 256-row chunk.
+        super::audit_tests::downgrade_to_legacy_scheme(&workspace);
+        assert!(verify_audit_chain(&workspace.conn).expect("scheme 1").0);
+
+        run_migration(&workspace);
+        let versions = super::audit_tests::versions(&workspace);
+        assert_eq!(versions.len(), 301);
+        assert!(versions.iter().all(|version| *version == 2));
+        assert!(verify_audit_chain(&workspace.conn).expect("scheme 2").0);
+    }
+}
+
+#[cfg(test)]
+mod audit_provenance_tests {
+    use super::*;
+    use crate::test_support::TestClock;
+    use slab_core::ColumnType;
+
+    #[test]
+    fn dropping_only_the_hash_columns_does_not_reenable_backfill() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("audit-half-migrated.slab");
+        let mut workspace =
+            Workspace::create(&path, "Audit", Box::new(TestClock::new())).expect("create");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![ColumnDraft {
+                    name: "Body".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                }],
+            })
+            .expect("table");
+        workspace
+            .insert_row(
+                "Notes",
+                &RowData::from([("Body".to_owned(), Value::Text("hello".into()))]),
+            )
+            .expect("row");
+        workspace.close().expect("close");
+
+        {
+            let connection = Connection::open(&path).expect("raw open");
+            // A modern log keeps `hash_version`; dropping only the two hash
+            // columns must not make it look like a pre-hash legacy file.
+            connection
+                .execute_batch(
+                    "ALTER TABLE _slab_audit_log DROP COLUMN prev_hash;
+                     ALTER TABLE _slab_audit_log DROP COLUMN entry_hash;
+                     UPDATE _slab_audit_log SET summary = 'silently rewritten';
+                     DELETE FROM _slab_meta WHERE key IN ('audit_head_hash', 'audit_head_id');",
+                )
+                .expect("tamper");
+        }
+
+        let workspace = Workspace::open(&path, Box::new(TestClock::new())).expect("reopen");
+        let report = workspace.integrity_check().expect("check");
+        assert!(
+            !report.audit_chain,
+            "a half-migrated modern log was backfilled and laundered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_atomic_tests {
+    use super::*;
+    use crate::test_support::TestClock;
+
+    #[test]
+    fn a_failed_legacy_migration_rolls_the_new_columns_back() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/design-studio.slab");
+        if !source.exists() {
+            return;
+        }
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("fixture.slab");
+        std::fs::copy(&source, &path).expect("copy fixture");
+        {
+            let connection = Connection::open(&path).expect("raw open");
+            let version: String = connection
+                .query_row(
+                    "SELECT value FROM _slab_meta WHERE key = 'format_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("format");
+            assert_eq!(version, "1", "the fixture must predate format 2");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_audit_rewrite BEFORE UPDATE ON _slab_audit_log
+                     BEGIN SELECT RAISE(ABORT, 'forced migration failure'); END;",
+                )
+                .expect("trigger");
+        }
+        assert!(
+            Workspace::open(&path, Box::new(TestClock::new())).is_err(),
+            "the forced rewrite failure must abort the open"
+        );
+        {
+            let connection = Connection::open(&path).expect("raw reopen");
+            let mut stmt = connection
+                .prepare("PRAGMA table_info(_slab_audit_log)")
+                .expect("table info");
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("columns")
+                .map(|row| row.expect("column"))
+                .collect();
+            assert!(
+                !columns.iter().any(|name| name == "prev_hash"),
+                "a failed migration left the new columns behind: {columns:?}"
+            );
+            connection
+                .execute_batch("DROP TRIGGER fail_audit_rewrite")
+                .expect("drop trigger");
+        }
+        let workspace = Workspace::open(&path, Box::new(TestClock::new())).expect("retry");
+        assert!(workspace.integrity_check().expect("check").audit_chain);
+    }
+}
+
+#[cfg(test)]
+mod open_validation_tests {
+    use super::*;
+    use crate::test_support::TestClock;
+
+    fn fixture_copy(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/design-studio.slab");
+        let path = directory.path().join("fixture.slab");
+        std::fs::copy(&source, &path).expect("copy fixture");
+        path
+    }
+
+    #[test]
+    fn an_invalid_stored_formula_is_rejected_before_the_format_migration() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/design-studio.slab");
+        if !source.exists() {
+            return;
+        }
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = fixture_copy(&directory);
+        {
+            let connection = Connection::open(&path).expect("raw open");
+            let version: String = connection
+                .query_row(
+                    "SELECT value FROM _slab_meta WHERE key = 'format_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("format");
+            assert_eq!(version, "1", "the fixture must predate format 2");
+            let expression = format!("{}1", "1+".repeat(200));
+            connection
+                .execute(
+                    "UPDATE _slab_columns SET type_json = ?1
+                     WHERE name = 'Name' AND table_name = 'Clients'",
+                    params![format!(
+                        r#"{{"kind":"formula","expression":"{expression}"}}"#
+                    )],
+                )
+                .expect("long formula");
+        }
+
+        assert!(
+            Workspace::open(&path, Box::new(TestClock::new())).is_err(),
+            "an over-limit stored formula must be rejected"
+        );
+
+        let connection = Connection::open(&path).expect("raw reopen");
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM _slab_meta WHERE key = 'format_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("format");
+        assert_eq!(version, "1", "a rejected open bumped the format");
+        let mut stmt = connection
+            .prepare("PRAGMA table_info(_slab_audit_log)")
+            .expect("table info");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns")
+            .map(|row| row.expect("column"))
+            .collect();
+        assert!(
+            !columns.iter().any(|name| name == "prev_hash"),
+            "a rejected open added hash columns: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_file_with_matching_table_names_is_not_mutated() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("foreign.slab");
+        {
+            let connection = Connection::open(&path).expect("raw create");
+            connection
+                .execute_batch(
+                    "CREATE TABLE _slab_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE _slab_tables (x TEXT);
+                     CREATE TABLE _slab_columns (x TEXT);
+                     CREATE TABLE _slab_relations (x TEXT);
+                     CREATE TABLE _slab_layouts (x TEXT);
+                     INSERT INTO _slab_meta VALUES ('format_version', '1');",
+                )
+                .expect("seed");
+        }
+        let before = std::fs::read(&path).expect("read before");
+        assert!(Workspace::open(&path, Box::new(TestClock::new())).is_err());
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(before, after, "a foreign file was mutated before rejection");
+    }
+}
+
+#[cfg(test)]
+mod audit_foreign_columns_tests {
+    use super::*;
+    use crate::test_support::TestClock;
+    use slab_core::ColumnType;
+
+    #[test]
+    fn dropping_every_hash_column_does_not_reenable_backfill_on_format_two() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let path = directory.path().join("all-hash-columns-dropped.slab");
+        let mut workspace =
+            Workspace::create(&path, "Audit", Box::new(TestClock::new())).expect("create");
+        workspace
+            .create_table(&TableDraft {
+                name: "Notes".into(),
+                columns: vec![ColumnDraft {
+                    name: "Body".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                }],
+            })
+            .expect("table");
+        workspace
+            .insert_row(
+                "Notes",
+                &RowData::from([("Body".to_owned(), Value::Text("hello".into()))]),
+            )
+            .expect("row");
+        workspace.close().expect("close");
+
+        {
+            let connection = Connection::open(&path).expect("raw open");
+            connection
+                .execute_batch(
+                    "ALTER TABLE _slab_audit_log DROP COLUMN prev_hash;
+                     ALTER TABLE _slab_audit_log DROP COLUMN entry_hash;
+                     ALTER TABLE _slab_audit_log DROP COLUMN hash_version;
+                     UPDATE _slab_audit_log SET summary = 'silently rewritten';
+                     DELETE FROM _slab_meta WHERE key IN ('audit_head_hash', 'audit_head_id');",
+                )
+                .expect("tamper");
+        }
+
+        let workspace = Workspace::open(&path, Box::new(TestClock::new())).expect("reopen");
+        let report = workspace.integrity_check().expect("check");
+        assert!(
+            !report.audit_chain,
+            "a format-2 log with every hash column dropped was backfilled"
+        );
+    }
 }
