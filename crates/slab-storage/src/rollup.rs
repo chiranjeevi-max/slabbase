@@ -882,10 +882,10 @@ pub(crate) fn value_less(left: &Value, right: &Value) -> bool {
         (Value::Integer(left), Value::Decimal(right)) => Decimal::from_integer(*left) < *right,
         (Value::Decimal(left), Value::Integer(right)) => *left < Decimal::from_integer(*right),
         (Value::Currency(left), Value::Currency(right)) => left.amount() < right.amount(),
-        (Value::Text(left), Value::Text(right))
-        | (Value::Select(left), Value::Text(right))
-        | (Value::Text(left), Value::Select(right))
-        | (Value::Select(left), Value::Select(right)) => left < right,
+        (
+            Value::Text(left) | Value::Select(left) | Value::AttachmentRef(left),
+            Value::Text(right) | Value::Select(right) | Value::AttachmentRef(right),
+        ) => left < right,
         (Value::Date(left), Value::Date(right)) => left < right,
         (Value::Timestamp(left), Value::Timestamp(right)) => left < right,
         (Value::Boolean(left), Value::Boolean(right)) => left < right,

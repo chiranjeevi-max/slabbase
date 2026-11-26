@@ -335,11 +335,10 @@ fn compare(left: &Value, right: &Value) -> Result<Option<Ordering>, FormulaError
             }
             Ok(Some(compare_decimals(left.amount(), right.amount())))
         }
-        (Value::Text(left), Value::Text(right))
-        | (Value::Select(left), Value::Text(right))
-        | (Value::Text(left), Value::Select(right))
-        | (Value::Select(left), Value::Select(right))
-        | (Value::AttachmentRef(left), Value::AttachmentRef(right)) => Ok(Some(left.cmp(right))),
+        (
+            Value::Text(left) | Value::Select(left) | Value::AttachmentRef(left),
+            Value::Text(right) | Value::Select(right) | Value::AttachmentRef(right),
+        ) => Ok(Some(left.cmp(right))),
         (Value::Boolean(left), Value::Boolean(right)) => Ok(Some(left.cmp(right))),
         (Value::Date(left), Value::Date(right)) => Ok(Some(left.cmp(right))),
         (Value::Timestamp(left), Value::Timestamp(right)) => Ok(Some(left.cmp(right))),

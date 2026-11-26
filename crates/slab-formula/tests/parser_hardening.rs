@@ -299,3 +299,16 @@ fn renaming_back_to_a_bare_name_restores_the_bare_spelling() {
     assert_eq!(qualified, "[Items].Price");
     assert!(slab_formula::parse(&qualified).is_ok());
 }
+
+#[test]
+fn attachment_refs_compare_as_text() {
+    let context = Context::new(vec![("Path", Value::AttachmentRef("/tmp/x".into()))]);
+    assert_eq!(
+        eval("[Path] = \"/tmp/x\"", &context).expect("equals"),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        eval("[Path] < \"/tmp/y\"", &context).expect("ordering"),
+        Value::Boolean(true)
+    );
+}
