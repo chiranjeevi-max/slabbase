@@ -31,14 +31,14 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 ### Fixed
 
 - Keep the desktop shell inside the viewport when macOS classic scrollbars are active, and stabilize the macOS release timing and UI audit CI gates.
-- Round money multiplication and division once at the currency scale, widen decimal remainders before aligning, and compare mixed-scale decimals exactly; `₹`/`$` totals no longer lose a cent to double rounding.
+- Round money multiplication and division once at the currency scale, widen decimal remainders before aligning, compare mixed-scale decimals exactly, and widen addition and subtraction before aligning so a representable mixed-scale sum is not rejected; `₹`/`$` totals no longer lose a cent to double rounding.
 - Reject a formula deeper than 128 levels or larger than 16 KiB before recursive consumers see it, drop the expression tree iteratively, and reject an over-limit stored formula at open before any migration so the file is left untouched.
-- Parse timestamps with multibyte garbage as a typed error instead of a panic, accept an omitted trailing `Z`, and keep `SlabDate` inside the supported 1..=9999 era.
-- Preserve select and attachment values on read, so editing another field, importing an attachment column, and the Form Studio select control no longer treat them as plain text.
+- Parse timestamps with multibyte garbage as a typed error instead of a panic, accept an omitted trailing `Z`, keep `SlabDate` inside the supported 1..=9999 era, and report `iso()` at the clamped instant.
+- Preserve select and attachment values on read, so editing another field, importing an attachment column, and the Form Studio select control no longer treat them as plain text. Compare attachment paths with text in formulas and rollups, and restore select and attachment revisions whose audit payload stored them as text.
 - Evaluate the record returned by a write inside its transaction; a formula error now rolls the row, audit entry, FTS update, and rollup change back together instead of reporting failure after a commit.
 - Capture each cascaded child once when two relations reach it, and keep lookup counts exact through that delete and its undo.
 - Reject a foreign SQLite file before changing its journal mode or creating metadata tables.
-- Match text filters against the displayed decimal, currency, boolean, and ISO timestamp text, and parse typed equality values instead of silently returning no rows.
+- Match text filters against the displayed decimal, currency, boolean, and ISO timestamp text, parse typed equality values instead of silently returning no rows, and reject a typed filter with more precision than its column instead of rounding it.
 - Exclude computed columns from import auto-mapping and skip them when a source column happens to share their name.
 - Preserve empty and whitespace-only text through JSON import (CSV empty fields remain NULL), plus tagged values, currency codes, guarded select options, attachment paths, and a UTF-8 BOM.
 - Publish SQL exports through the same scratch-file contract as CSV and JSON, and keep the already-open scratch handle so the dump cannot be redirected through a predictable path.
