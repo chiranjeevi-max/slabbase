@@ -1382,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn fitting_zero_width_text_stays_linear_and_truncates() {
+    fn fitting_zero_width_text_terminates_and_truncates() {
         let value = format!("{}{}", "\u{200B}".repeat(50_000), "@".repeat(50_000));
         let started = std::time::Instant::now();
         let fitted = fit_text(&value, 200.0, 9.0);
