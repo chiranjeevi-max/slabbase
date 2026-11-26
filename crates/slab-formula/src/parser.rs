@@ -41,6 +41,15 @@ pub fn parse(input: &str) -> Result<Expr, FormulaError> {
             limit: MAX_EXPRESSION_DEPTH,
         });
     }
+    // Rendering escapes newlines and tabs, so a source that fits can render
+    // larger than the limit and then fail to re-parse as its own canonical
+    // form. Keep the round-trip inside the same ceiling.
+    if expression.to_string().len() > MAX_FORMULA_BYTES {
+        return Err(FormulaError::Parse {
+            message: format!("formula exceeds {MAX_FORMULA_BYTES} bytes when rendered"),
+            position: MAX_FORMULA_BYTES,
+        });
+    }
     Ok(expression)
 }
 

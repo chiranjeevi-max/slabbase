@@ -312,3 +312,13 @@ fn attachment_refs_compare_as_text() {
         Value::Boolean(true)
     );
 }
+
+#[test]
+fn rejects_source_that_renders_larger_than_the_limit() {
+    let source = format!("\"{}\"", "\n".repeat(9_000));
+    assert!(source.len() <= 16 * 1024);
+    assert!(
+        parse(&source).is_err(),
+        "an escaped literal must not exceed the limit when rendered"
+    );
+}
