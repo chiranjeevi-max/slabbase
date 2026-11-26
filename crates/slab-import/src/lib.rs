@@ -152,7 +152,7 @@ impl SourceValue {
     /// The text used for inference and preview, matching the old flattening
     /// (a tagged `Value` renders through `display_string`; other objects keep
     /// their JSON text).
-    fn as_text(&self) -> Option<String> {
+    fn to_text(&self) -> Option<String> {
         match self {
             Self::Null => None,
             Self::Text(text) => Some(text.clone()),
@@ -579,7 +579,7 @@ pub fn preview(
             let mut columns = columns.borrow_mut();
             if infer_this_row {
                 for column in &mut *columns {
-                    let value = row.values.get(&column.name).and_then(SourceValue::as_text);
+                    let value = row.values.get(&column.name).and_then(SourceValue::to_text);
                     match value.filter(|value| !value.trim().is_empty()) {
                         Some(value) => {
                             let candidate = classify(&value);
@@ -612,7 +612,7 @@ pub fn preview(
                     row_number: row.number,
                     values: columns
                         .iter()
-                        .map(|column| row.values.get(&column.name).and_then(SourceValue::as_text))
+                        .map(|column| row.values.get(&column.name).and_then(SourceValue::to_text))
                         .collect(),
                 });
             }
