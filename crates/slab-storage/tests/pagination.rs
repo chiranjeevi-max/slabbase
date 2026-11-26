@@ -495,7 +495,7 @@ fn decimal_filters_rescale_and_reject_sub_scale_bounds() {
             }],
         })
         .expect("table");
-    for amount in ["12.30", "1.23"] {
+    for amount in ["12.30", "12.30", "12.30", "1.23"] {
         workspace
             .insert_row(
                 "Invoices",
@@ -506,19 +506,32 @@ fn decimal_filters_rescale_and_reject_sub_scale_bounds() {
             )
             .expect("insert");
     }
-    let exact = workspace
+    let filter = Filter {
+        column: "Amount".into(),
+        op: FilterOp::Eq,
+        value: Some(Value::Text("12.3".into())),
+    };
+    let first = workspace
         .page(&PageQuery {
             table: "Invoices".into(),
-            limit: 10,
-            filters: vec![Filter {
-                column: "Amount".into(),
-                op: FilterOp::Eq,
-                value: Some(Value::Text("12.3".into())),
-            }],
+            limit: 2,
+            filters: vec![filter.clone()],
             ..PageQuery::default()
         })
-        .expect("exact filter");
-    assert_eq!(exact.rows.len(), 1);
+        .expect("first filtered page");
+    assert_eq!(first.rows.len(), 2);
+    let cursor = first.next_cursor.clone().expect("next cursor");
+    let second = workspace
+        .page(&PageQuery {
+            table: "Invoices".into(),
+            limit: 2,
+            cursor: Some(cursor),
+            filters: vec![filter],
+            ..PageQuery::default()
+        })
+        .expect("second filtered page");
+    assert_eq!(second.rows.len(), 1);
+    assert!(second.next_cursor.is_none());
     assert!(
         workspace
             .page(&PageQuery {

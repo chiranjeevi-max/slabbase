@@ -291,30 +291,32 @@ impl Workspace {
         if term.is_empty() {
             return Ok(Vec::new());
         }
-        let limit = i64::from(limit.clamp(1, 200));
+        let limit = usize::try_from(limit.clamp(1, 200)).unwrap_or(200);
         let conn = self.read_conn();
         let _active = ActiveQuery::begin(self.search_cancel.as_ref(), conn.get_interrupt_handle());
+        // No SQL LIMIT: denied tables must not consume the authorized page.
+        // Stop as soon as enough readable hits are collected.
         let sql = "SELECT table_name, CAST(row_id AS INTEGER),
                           snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
                           bm25(_slab_fts)
                    FROM _slab_fts
                    WHERE _slab_fts MATCH ?1
-                   ORDER BY bm25(_slab_fts)
-                   LIMIT ?2";
+                   ORDER BY bm25(_slab_fts)";
         let mut stmt = conn.prepare_cached(sql)?;
-        let rows = stmt.query_map(params![fts_query(term), limit], |row| {
-            Ok(SearchHit {
+        let mut rows = stmt.query(params![fts_query(term)])?;
+        let mut hits = Vec::new();
+        while let Some(row) = rows.next()? {
+            let hit = SearchHit {
                 table: row.get(0)?,
                 row_id: row.get(1)?,
                 snippet: row.get(2)?,
                 rank: row.get(3)?,
-            })
-        })?;
-        let mut hits = Vec::new();
-        for row in rows {
-            let hit = row?;
+            };
             if self.policy.can_read_table(&hit.table) {
                 hits.push(hit);
+                if hits.len() == limit {
+                    break;
+                }
             }
         }
         Ok(hits)
@@ -1061,9 +1063,12 @@ fn display_expression(column: &Column) -> String {
         ),
         ColumnType::Decimal { scale } => decimal_display(&identifier, *scale),
         ColumnType::Currency { currency } => decimal_display(&identifier, currency.default_scale()),
-        ColumnType::Timestamp => {
-            format!("strftime('%Y-%m-%dT%H:%M:%fZ', {identifier} / 1000.0, 'unixepoch')")
-        }
+        ColumnType::Timestamp => format!(
+            "strftime('%Y-%m-%dT%H:%M:%fZ', \
+             MIN(MAX({identifier}, {}), {}) / 1000.0, 'unixepoch')",
+            slab_core::date::MIN_SUPPORTED_MILLIS,
+            slab_core::date::MAX_SUPPORTED_MILLIS
+        ),
         _ => format!("CAST({identifier} AS TEXT)"),
     }
 }

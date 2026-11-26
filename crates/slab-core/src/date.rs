@@ -368,9 +368,9 @@ const MIN_SUPPORTED_DAYS: i64 = -719_162;
 /// Days since 1970-01-01 for 9999-12-31.
 const MAX_SUPPORTED_DAYS: i64 = 2_932_896;
 /// First supported Unix millisecond.
-const MIN_SUPPORTED_MILLIS: i64 = MIN_SUPPORTED_DAYS * 86_400_000;
+pub const MIN_SUPPORTED_MILLIS: i64 = MIN_SUPPORTED_DAYS * 86_400_000;
 /// Last supported Unix millisecond.
-const MAX_SUPPORTED_MILLIS: i64 = MAX_SUPPORTED_DAYS * 86_400_000 + 86_399_999;
+pub const MAX_SUPPORTED_MILLIS: i64 = MAX_SUPPORTED_DAYS * 86_400_000 + 86_399_999;
 
 const fn days_in_month(year: i32, month: u8) -> u8 {
     match month {

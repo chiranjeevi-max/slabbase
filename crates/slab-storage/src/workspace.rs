@@ -26,7 +26,9 @@ use slab_formula::FormulaDag;
 use crate::ddl::{column_definition, create_table_sql, relation_index_sql, unique_index_sql};
 use crate::error::StorageError;
 use crate::rollup;
-use crate::sql::{decode_value, encode_value, normalize_value, quote_ident, stored_columns};
+use crate::sql::{
+    decode_value, encode_value, normalize_value, quote_ident, sql_literal, stored_columns,
+};
 use slab_formula::parse as parse_formula;
 use slab_formula::rewrite_column_source;
 
@@ -691,12 +693,27 @@ impl Workspace {
             };
             writeln!(out, "DROP TABLE IF EXISTS {};", quote_ident(table_name))?;
             writeln!(out, "{create};")?;
+            let definition = schema.table(table_name);
+            let mut stored = None;
             let sql = if table_name == "_slab_meta" {
                 // The audit log is not part of this dump. Carrying its head
                 // anchors would make every restored file look tampered.
                 format!(
                     "SELECT * FROM {} WHERE key NOT IN
                         ('audit_head_hash', 'audit_head_id', 'fts_pending')",
+                    quote_ident(table_name)
+                )
+            } else if let Some(definition) = definition {
+                let mut names = vec![quote_ident("id")];
+                let mut columns = Vec::new();
+                for column in definition.stored_columns() {
+                    names.push(quote_ident(&column.name));
+                    columns.push(column);
+                }
+                stored = Some(columns);
+                format!(
+                    "SELECT {} FROM {}",
+                    names.join(", "),
                     quote_ident(table_name)
                 )
             } else {
@@ -710,7 +727,18 @@ impl Workspace {
                 let mut literals = Vec::with_capacity(column_count);
                 for index in 0..column_count {
                     let value = row.get_ref(index)?;
-                    literals.push(sql_value_literal(value));
+                    let column = stored
+                        .as_ref()
+                        .and_then(|columns| index.checked_sub(1).and_then(|i| columns.get(i)));
+                    let Some(column) = column else {
+                        literals.push(sql_value_literal(value));
+                        continue;
+                    };
+                    let decoded = decode_value(row, index, &column.ty)?;
+                    match self.policy.redact(table_name, &column.name, &decoded) {
+                        Some(replacement) => literals.push(sql_literal(&replacement, &column.ty)?),
+                        None => literals.push(sql_value_literal(value)),
+                    }
                 }
                 writeln!(
                     out,
@@ -1508,6 +1536,8 @@ impl Workspace {
         id: RowId,
         changes: &RowData,
     ) -> Result<slab_core::Record, StorageError> {
+        self.ensure_writer_available()?;
+        self.check_policy(table)?;
         let schema = self.schema()?;
         let definition = schema
             .table(table)
@@ -1593,7 +1623,10 @@ impl Workspace {
         };
         let inverse = command.inverse();
         let summary = format!("Undo {}", command.label());
-        match self.apply_command_with_audit(&inverse, "undo", &summary) {
+        let outcome = self
+            .check_command_policy(&inverse)
+            .and_then(|()| self.apply_command_with_audit(&inverse, "undo", &summary));
+        match outcome {
             Ok(_) => {
                 self.redo.push(command);
                 Ok(self.undo_state())
@@ -1611,7 +1644,10 @@ impl Workspace {
             return Err(StorageError::NothingToRedo);
         };
         let summary = format!("Redo {}", command.label());
-        match self.apply_command_with_audit(&command, "redo", &summary) {
+        let outcome = self
+            .check_command_policy(&command)
+            .and_then(|()| self.apply_command_with_audit(&command, "redo", &summary));
+        match outcome {
             Ok(_) => {
                 // Keep the remaining redo stack intact. `push_undo` clears it
                 // for new edits, but a redo is a replay, not a new edit.
@@ -1695,7 +1731,19 @@ impl Workspace {
             let (audit_id, hlc, timestamp_ms, actor, operation, summary, before, after) = row?;
             let before = parse_payload_values(before.as_deref())?;
             let after = parse_payload_values(after.as_deref())?;
-            let diffs = field_diffs(before.as_ref(), after.as_ref());
+            let mut diffs = field_diffs(before.as_ref(), after.as_ref());
+            for diff in &mut diffs {
+                if let Some(value) = &diff.before
+                    && let Some(replacement) = self.policy.redact(table, &diff.column, value)
+                {
+                    diff.before = Some(replacement);
+                }
+                if let Some(value) = &diff.after
+                    && let Some(replacement) = self.policy.redact(table, &diff.column, value)
+                {
+                    diff.after = Some(replacement);
+                }
+            }
             revisions.push(slab_core::RecordRevision {
                 audit_id,
                 timestamp_ms,
@@ -1824,6 +1872,22 @@ impl Workspace {
             self.apply_command_with_audit(command, command.operation(), &command.label())?;
         self.push_undo(applied.clone());
         Ok(applied)
+    }
+
+    /// Checks every table a replayed command can touch before undo or redo.
+    fn check_command_policy(&self, command: &Command) -> Result<(), StorageError> {
+        if let Some(table) = command.table_name() {
+            self.check_policy(table)?;
+        }
+        match command {
+            Command::InsertRow { children, .. } | Command::DeleteRow { children, .. } => {
+                for child in children {
+                    self.check_policy(&child.table)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Applies a row mutation and returns its fully computed record from the

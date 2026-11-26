@@ -9,7 +9,7 @@ use slab_core::{
     Aggregate, ColumnDraft, ColumnType, DeleteAction, Filter, FilterOp, GridSpec, Layout,
     LayoutItem, LayoutItemKind, PageQuery, RelationDraft, RowData, TableDraft, Value,
 };
-use slab_storage::Workspace;
+use slab_storage::{StorageError, Workspace};
 use support::TestClock;
 
 fn workspace() -> Workspace {
@@ -781,6 +781,17 @@ fn a_denied_table_cannot_be_written_through_the_readback_path() {
             .restore_record_revision("Secret", original.id, insert_audit)
             .is_err()
     );
+    let denied = workspace
+        .update_row(
+            "Secret",
+            999_999,
+            &row(&[("Name", Value::Text("missing".into()))]),
+        )
+        .expect_err("a denied update must fail before the row lookup");
+    assert!(
+        matches!(denied, StorageError::Query(ref message) if message.contains("policy")),
+        "a denied update leaked whether the row exists: {denied}"
+    );
     assert!(
         workspace
             .search("needle", 10)
@@ -815,6 +826,171 @@ fn a_denied_table_cannot_be_written_through_the_readback_path() {
             .get("Name"),
         Some(&Value::Text("needle secret".into()))
     );
+}
+
+struct RedactSecret;
+
+impl slab_core::PolicyHook for RedactSecret {
+    fn redact(&self, table: &str, column: &str, _value: &Value) -> Option<Value> {
+        (table == "Secret" && column == "Name").then(|| Value::Text("[redacted]".into()))
+    }
+}
+
+#[test]
+fn history_and_sql_export_apply_field_redaction() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Secret".into(),
+            columns: vec![text("Name")],
+        })
+        .expect("table");
+    let secret = workspace
+        .insert_row(
+            "Secret",
+            &row(&[("Name", Value::Text("needle secret".into()))]),
+        )
+        .expect("insert");
+    workspace.set_policy(std::sync::Arc::new(RedactSecret));
+
+    let revisions = workspace
+        .record_history("Secret", secret.id)
+        .expect("history");
+    let values: Vec<&Value> = revisions
+        .iter()
+        .flat_map(|revision| &revision.diffs)
+        .filter_map(|diff| diff.after.as_ref())
+        .collect();
+    assert!(
+        values
+            .iter()
+            .all(|value| **value == Value::Text("[redacted]".into())),
+        "history leaked a redacted value: {values:?}"
+    );
+
+    let mut dump = Vec::new();
+    workspace.export_sql_to(&mut dump).expect("sql export");
+    let dump = String::from_utf8(dump).expect("utf8 dump");
+    assert!(dump.contains("[redacted]"));
+    assert!(
+        dump.contains("INSERT INTO \"Secret\" (\"id\", \"Name\")"),
+        "the SQL export must keep the physical row id"
+    );
+    assert!(
+        !dump.contains("needle secret"),
+        "SQL export leaked a redacted value"
+    );
+}
+
+#[test]
+fn undo_does_not_mutate_a_table_denied_by_policy() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Secret".into(),
+            columns: vec![text("Name")],
+        })
+        .expect("table");
+    workspace
+        .insert_row("Secret", &row(&[("Name", Value::Text("secret".into()))]))
+        .expect("insert");
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+
+    let denied = workspace.undo().expect_err("undo must respect the policy");
+    assert!(
+        matches!(denied, StorageError::Query(ref message) if message.contains("policy")),
+        "undo bypassed the policy: {denied}"
+    );
+    workspace.set_policy(std::sync::Arc::new(slab_core::NoopPolicy));
+    workspace.undo().expect("undo after the policy is lifted");
+    assert!(
+        workspace
+            .page(&PageQuery {
+                table: "Secret".into(),
+                limit: 10,
+                ..PageQuery::default()
+            })
+            .expect("page")
+            .rows
+            .is_empty(),
+        "undo did not remove the inserted row"
+    );
+}
+
+#[test]
+fn search_does_not_lose_authorized_hits_behind_denied_ones() {
+    let mut workspace = workspace();
+    for table in ["Secret", "Public"] {
+        workspace
+            .create_table(&TableDraft {
+                name: table.into(),
+                columns: vec![text("Name")],
+            })
+            .expect("table");
+    }
+    for index in 0..250 {
+        workspace
+            .insert_row(
+                "Secret",
+                &row(&[("Name", Value::Text(format!("needle {index}")))]),
+            )
+            .expect("secret insert");
+    }
+    workspace
+        .insert_row(
+            "Public",
+            &row(&[(
+                "Name",
+                Value::Text(format!("needle {}", "filler ".repeat(2_000))),
+            )]),
+        )
+        .expect("public insert");
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+
+    let hits = workspace.search("needle", 200).expect("search");
+    assert!(
+        hits.iter().any(|hit| hit.table == "Public"),
+        "an authorized hit beyond the denied prefix was dropped"
+    );
+}
+
+#[test]
+fn extreme_timestamps_match_the_clamped_display() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Events".into(),
+            columns: vec![ColumnDraft {
+                name: "When".into(),
+                ty: ColumnType::Timestamp,
+                required: false,
+                unique: false,
+                default: None,
+            }],
+        })
+        .expect("table");
+    workspace
+        .insert_row(
+            "Events",
+            &row(&[(
+                "When",
+                Value::Timestamp(slab_core::SlabTimestamp::from_millis(i64::MAX)),
+            )]),
+        )
+        .expect("insert");
+    let page = workspace
+        .page(&PageQuery {
+            table: "Events".into(),
+            limit: 10,
+            filters: vec![Filter {
+                column: "When".into(),
+                op: FilterOp::Contains,
+                value: Some(Value::Text("9999-12-31".into())),
+            }],
+            ..PageQuery::default()
+        })
+        .expect("page");
+    assert_eq!(page.rows.len(), 1);
 }
 
 #[test]
