@@ -1036,7 +1036,7 @@ const HELVETICA_WIDTHS: [u16; 95] = [
 /// Helvetica advance widths for the WinAnsi 0x80..0x9F block.
 const WINANSI_WIDTHS: [u16; 32] = [
     556, 556, 222, 556, 333, 1000, 556, 556, 333, 1000, 667, 333, 1000, 556, 611, 556, 556, 222,
-    222, 333, 333, 350, 500, 1000, 333, 1000, 556, 333, 944, 556, 500, 667,
+    222, 333, 333, 350, 556, 1000, 333, 1000, 556, 333, 944, 556, 500, 667,
 ];
 
 fn count_to_f64(value: usize) -> f64 {
@@ -1074,11 +1074,12 @@ fn text_width(value: &str, size: f64) -> f64 {
 }
 
 fn fit_text(value: &str, width: f64, size: f64) -> String {
-    if width <= 0.0 {
+    if width <= 0.0 || text_width(value, size) <= width {
         return value.to_owned();
     }
     // Accumulate widths instead of rebuilding and re-measuring the growing
-    // candidate for every character; zero-width fallbacks made that O(n²).
+    // candidate for every character; zero-width glyphs would otherwise force
+    // a full prefix rescan per character.
     let ellipsis = text_width("…", size);
     let mut output = String::new();
     let mut used = 0.0;
@@ -1368,7 +1369,20 @@ mod tests {
     }
 
     #[test]
-    fn fitting_zero_width_text_is_linear_and_truncates() {
+    fn fitting_text_keeps_a_value_that_exactly_fits() {
+        let value = "AAAA";
+        let width = text_width(value, 9.0);
+        assert_eq!(fit_text(value, width, 9.0), value);
+    }
+
+    #[test]
+    fn winansi_punctuation_uses_its_rendered_width() {
+        assert_eq!(char_width('–'), 556);
+        assert_eq!(char_width('—'), 1000);
+    }
+
+    #[test]
+    fn fitting_zero_width_text_stays_linear_and_truncates() {
         let value = format!("{}{}", "\u{200B}".repeat(50_000), "@".repeat(50_000));
         let started = std::time::Instant::now();
         let fitted = fit_text(&value, 200.0, 9.0);
