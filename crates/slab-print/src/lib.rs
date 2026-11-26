@@ -1039,6 +1039,16 @@ const WINANSI_WIDTHS: [u16; 32] = [
     222, 333, 333, 350, 556, 1000, 333, 1000, 556, 333, 944, 556, 500, 667,
 ];
 
+/// Helvetica advance widths for the WinAnsi Latin-1 block, 0xA0..=0xFF.
+const WINANSI_LATIN1_WIDTHS: [u16; 96] = [
+    278, 333, 556, 556, 556, 556, 260, 556, 333, 737, 370, 556, 584, 333, 737, 333, 400, 584, 333,
+    333, 333, 556, 537, 278, 333, 333, 365, 556, 834, 834, 834, 611, 667, 667, 667, 667, 667, 667,
+    1000, 722, 667, 667, 667, 667, 278, 278, 278, 278, 722, 722, 778, 778, 778, 778, 778, 584, 778,
+    722, 722, 722, 722, 667, 667, 611, 556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556,
+    278, 278, 278, 278, 556, 556, 556, 556, 556, 556, 556, 584, 611, 556, 556, 556, 556, 500, 556,
+    500,
+];
+
 fn count_to_f64(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
@@ -1048,6 +1058,8 @@ fn byte_width(byte: u8) -> u64 {
         u64::from(HELVETICA_WIDTHS[(byte - 32) as usize])
     } else if (0x80..=0x9F).contains(&byte) {
         u64::from(WINANSI_WIDTHS[(byte - 0x80) as usize])
+    } else if (0xA0..=0xFF).contains(&byte) {
+        u64::from(WINANSI_LATIN1_WIDTHS[(byte - 0xA0) as usize])
     } else {
         556
     }
@@ -1379,6 +1391,14 @@ mod tests {
     fn winansi_punctuation_uses_its_rendered_width() {
         assert_eq!(char_width('–'), 556);
         assert_eq!(char_width('—'), 1000);
+    }
+
+    #[test]
+    fn winansi_latin1_uses_its_rendered_width() {
+        assert_eq!(char_width('\u{A0}'), 278);
+        assert_eq!(char_width('é'), 556);
+        assert_eq!(char_width('æ'), 889);
+        assert_eq!(char_width('ÿ'), 500);
     }
 
     #[test]
