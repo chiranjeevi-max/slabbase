@@ -140,6 +140,10 @@ impl<'de> Deserialize<'de> for SlabDate {
 }
 
 /// A UTC timestamp stored as milliseconds since the Unix epoch.
+///
+/// The supported calendar range is 1..=9999. `date()` clamps an out-of-range
+/// instant to that era so every `SlabDate` it returns is valid and parseable;
+/// `millis()` still exposes the exact stored instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlabTimestamp {
     millis: i64,
@@ -187,11 +191,16 @@ impl SlabTimestamp {
         })
     }
 
-    /// The UTC calendar date.
+    /// The UTC calendar date. Instants outside the supported 1..=9999 era are
+    /// clamped to its first or last day so the returned `SlabDate` is valid.
     pub fn date(self) -> SlabDate {
-        let days = self.millis.div_euclid(86_400_000);
-        let days = i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX });
-        SlabDate { days }
+        let days = self
+            .millis
+            .div_euclid(86_400_000)
+            .clamp(MIN_SUPPORTED_DAYS, MAX_SUPPORTED_DAYS);
+        SlabDate {
+            days: i32::try_from(days).unwrap_or(0),
+        }
     }
 
     /// Milliseconds within the second, 0 through 999.
@@ -218,35 +227,54 @@ impl SlabTimestamp {
         u8::try_from(value).unwrap_or(0)
     }
 
-    /// Parses `YYYY-MM-DDTHH:MM:SS[.mmm]Z` and the space-separated variant.
+    /// Parses `YYYY-MM-DDTHH:MM:SS[.mmm][Z]`, with an optional space
+    /// separator. A trailing `Z` is optional; the value is always UTC.
     pub fn parse(input: &str) -> Result<Self, CoreError> {
         let trimmed = input.trim();
         let bytes = trimmed.as_bytes();
-        if bytes.len() < 20 {
+        if bytes.len() < 19 {
             return Err(CoreError::InvalidDate(trimmed.to_owned()));
         }
         if !(bytes[10] == b'T' || bytes[10] == b' ') || bytes[13] != b':' || bytes[16] != b':' {
             return Err(CoreError::InvalidDate(trimmed.to_owned()));
         }
-        let date = SlabDate::parse(&trimmed[0..10])?;
-        let hour: u8 = trimmed[11..13]
+        // Every fixed field must be sliced on an ASCII boundary. A multibyte
+        // character in the seconds or fraction position would otherwise make
+        // `&trimmed[..]` panic inside a character instead of returning the
+        // typed invalid-date error.
+        let date = trimmed
+            .get(0..10)
+            .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?;
+        let date = SlabDate::parse(date)?;
+        let hour: u8 = trimmed
+            .get(11..13)
+            .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?
             .parse()
             .map_err(|_| CoreError::InvalidDate(trimmed.to_owned()))?;
-        let minute: u8 = trimmed[14..16]
+        let minute: u8 = trimmed
+            .get(14..16)
+            .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?
             .parse()
             .map_err(|_| CoreError::InvalidDate(trimmed.to_owned()))?;
-        let second: u8 = trimmed[17..19]
+        let second: u8 = trimmed
+            .get(17..19)
+            .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?
             .parse()
             .map_err(|_| CoreError::InvalidDate(trimmed.to_owned()))?;
-        let rest = &trimmed[19..];
+        let rest = trimmed
+            .get(19..)
+            .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?;
         let (millis, suffix) = if let Some(fraction) = rest.strip_prefix('.') {
-            if fraction.len() < 3 {
-                return Err(CoreError::InvalidDate(trimmed.to_owned()));
-            }
-            let millis: u16 = fraction[0..3]
+            let digits = fraction
+                .get(0..3)
+                .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?;
+            let millis: u16 = digits
                 .parse()
                 .map_err(|_| CoreError::InvalidDate(trimmed.to_owned()))?;
-            (millis, &fraction[3..])
+            let suffix = fraction
+                .get(3..)
+                .ok_or_else(|| CoreError::InvalidDate(trimmed.to_owned()))?;
+            (millis, suffix)
         } else {
             (0, rest)
         };
@@ -331,6 +359,11 @@ impl<'de> Deserialize<'de> for SlabTimestamp {
 const fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
+
+/// Days since 1970-01-01 for 0001-01-01.
+const MIN_SUPPORTED_DAYS: i64 = -719_162;
+/// Days since 1970-01-01 for 9999-12-31.
+const MAX_SUPPORTED_DAYS: i64 = 2_932_896;
 
 const fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
@@ -425,5 +458,32 @@ mod tests {
     fn negative_timestamps_are_utc_correct() {
         let stamp = SlabTimestamp::from_millis(-1);
         assert_eq!(stamp.iso(), "1969-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn timestamp_without_trailing_z_round_trips() {
+        for input in ["2026-11-25T00:00:00", "2026-11-25 00:00:00"] {
+            let stamp = SlabTimestamp::parse(input).expect("timestamp");
+            assert_eq!(stamp.iso(), "2026-11-25T00:00:00.000Z");
+        }
+        let stamp = SlabTimestamp::parse("2026-11-25T00:00:00.017").expect("fraction");
+        assert_eq!(stamp.iso(), "2026-11-25T00:00:00.017Z");
+        assert_eq!(stamp.millisecond(), 17);
+    }
+
+    #[test]
+    fn timestamp_date_clamps_to_the_supported_era() {
+        assert_eq!(
+            SlabTimestamp::from_millis(i64::MAX).date().iso(),
+            "9999-12-31"
+        );
+        assert_eq!(
+            SlabTimestamp::from_millis(i64::MIN).date().iso(),
+            "0001-01-01"
+        );
+        for days in [MIN_SUPPORTED_DAYS, MAX_SUPPORTED_DAYS] {
+            let days = i32::try_from(days).expect("in i32 range");
+            assert!(SlabDate::from_days_since_epoch(days).is_ok());
+        }
     }
 }

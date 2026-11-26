@@ -54,4 +54,8 @@ pub const MAX_PAGE_SIZE: u32 = 500;
 pub const MAX_EXPRESSION_DEPTH: u32 = 128;
 
 /// Workspace format version written to `_slab_meta`.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 covers audit hash scheme 2 (`hash_version`, actor and timestamp
+/// in the chain). An older build refuses it instead of verifying scheme-2
+/// entries with the scheme-1 algorithm and reporting false tampering.
+pub const FORMAT_VERSION: u32 = 2;
