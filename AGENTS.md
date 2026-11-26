@@ -63,6 +63,7 @@ cargo deny check licenses
 npm --prefix apps/desktop ci
 npm --prefix apps/desktop run typecheck
 npm --prefix apps/desktop run build
+npm --prefix apps/desktop exec -- playwright install chromium
 npm --prefix apps/desktop run test:ui
 ```
 

@@ -3366,6 +3366,7 @@ version = "1.0.0"
 dependencies = [
  "csv",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "slab-core",

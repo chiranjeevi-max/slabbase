@@ -38,7 +38,7 @@ export function RelationGraph({
   const move = (event: React.PointerEvent) => {
     if (!drag || drag.pointerId !== event.pointerId) return;
     const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    if (!rect || !(rect.width > 0) || !(rect.height > 0)) return;
     const x = Math.max(
       0,
       Math.min(76, ((event.clientX - rect.left) / rect.width) * 100 - drag.offsetX),
@@ -47,6 +47,7 @@ export function RelationGraph({
       0,
       Math.min(82, ((event.clientY - rect.top) / rect.height) * 100 - drag.offsetY),
     );
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
     setPositions((current) => ({ ...current, [drag.name]: { x, y } }));
   };
 

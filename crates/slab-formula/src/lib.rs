@@ -36,7 +36,7 @@ pub fn rewrite_column_source(
     to: &str,
 ) -> Result<String, FormulaError> {
     let tokens = tokenize(input)?;
-    let mut edits: Vec<(usize, usize)> = Vec::new();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let TokenKind::Ident(name) = &token.kind else {
             continue;
@@ -67,21 +67,60 @@ pub fn rewrite_column_source(
             }
             _ => continue,
         }
-        let start = if input.as_bytes().get(token.position) == Some(&b'[') {
-            token.position + 1
+        let bracketed = input.as_bytes().get(token.position) == Some(&b'[');
+        // Reversing a rename that had to add brackets restores the original
+        // bare spelling instead of leaving `[Price]` behind.
+        let unbracket = bracketed && !is_bare_identifier(from) && is_bare_identifier(to);
+        let (start, end, expected) = if unbracket {
+            (
+                token.position,
+                token.position + name.len() + 2,
+                format!("[{name}]"),
+            )
+        } else if bracketed {
+            (
+                token.position + 1,
+                token.position + 1 + name.len(),
+                name.clone(),
+            )
         } else {
-            token.position
+            (token.position, token.position + name.len(), name.clone())
         };
-        let end = start + name.len();
-        if input.get(start..end) == Some(name.as_str()) {
-            edits.push((start, end));
+        if input.get(start..end) == Some(expected.as_str()) {
+            // A bare reference can only stay bare when the new name is itself a
+            // legal bare identifier. Names with spaces, a leading digit, or a
+            // keyword spelling need brackets; a name that was already bracketed
+            // stays inside its existing brackets.
+            let replacement = if (bracketed && !unbracket) || is_bare_identifier(to) {
+                to.to_owned()
+            } else {
+                format!("[{to}]")
+            };
+            edits.push((start, end, replacement));
         }
     }
     let mut output = input.to_owned();
-    for (start, end) in edits.into_iter().rev() {
-        output.replace_range(start..end, to);
+    for (start, end, replacement) in edits.into_iter().rev() {
+        output.replace_range(start..end, &replacement);
     }
     Ok(output)
+}
+
+fn is_bare_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return false;
+    }
+    !matches!(
+        name.to_ascii_uppercase().as_str(),
+        "AND" | "OR" | "NOT" | "TRUE" | "FALSE" | "NULL"
+    )
 }
 
 #[cfg(test)]

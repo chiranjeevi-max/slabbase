@@ -30,6 +30,10 @@ export function FormStudio() {
     null,
   );
   const canvasRef = useRef<HTMLDivElement>(null);
+  const layoutRef = useRef<Layout | null>(null);
+  const loadedLayout = useRef<{ key: string; updatedAt: number } | null>(null);
+  const dirtyRef = useRef(false);
+  layoutRef.current = layout;
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
   const relations = useMemo(
@@ -43,9 +47,30 @@ export function FormStudio() {
       schema?.layouts.find(
         (candidate) => candidate.id === activeLayoutId && candidate.table === activeTable,
       ) ?? schema?.layouts.find((candidate) => candidate.table === activeTable);
+    const key = `${activeTable ?? ""}|${activeLayoutId ?? ""}`;
+    const updatedAt = existing?.updated_at ?? -1;
+    const loaded = loadedLayout.current;
+    if (
+      loaded &&
+      loaded.key === key &&
+      layoutRef.current !== null &&
+      (dirtyRef.current || loaded.updatedAt === updatedAt)
+    ) {
+      // A schema refresh (undo, column add, relation change) replaces the
+      // schema object but not this persisted layout. Keep the in-progress form
+      // and its selection instead of discarding unsaved drags. Only resync the
+      // portal picker, which is not part of the layout.
+      const names = relations.map((relation) => relation.name);
+      setPortalRelation((current) =>
+        names.includes(current) ? current : (names[0] ?? ""),
+      );
+      return;
+    }
     setLayout(existing ?? null);
     setSelectedId(null);
     setPortalRelation(relations[0]?.name ?? "");
+    loadedLayout.current = { key, updatedAt };
+    dirtyRef.current = false;
   }, [schema, activeTable, activeLayoutId, relations]);
 
   useEffect(() => {
@@ -94,7 +119,10 @@ export function FormStudio() {
     Math.max(0, ...layout.items.map((item) => item.y + item.h)) * ROW_HEIGHT + 80,
   );
 
-  const update = (next: Layout) => setLayout({ ...next, items: [...next.items] });
+  const update = (next: Layout) => {
+    dirtyRef.current = true;
+    setLayout({ ...next, items: [...next.items] });
+  };
 
   const updateItem = (id: string, patch: Partial<LayoutItem>) => {
     update({
@@ -107,9 +135,11 @@ export function FormStudio() {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
+    if (!(rect.width > 0)) return null;
     const columns = 12;
     const rawX = ((event.clientX - rect.left) / rect.width) * columns;
     const rawY = Math.max(0, Math.floor((event.clientY - rect.top) / ROW_HEIGHT));
+    if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) return null;
     return { x: Math.max(0, Math.min(columns - 1, Math.round(rawX))), y: rawY };
   };
 
@@ -152,9 +182,21 @@ export function FormStudio() {
   };
 
   const save = async () => {
+    const snapshot = { ...layout, updated_at: Date.now() };
+    dirtyRef.current = false;
     setSaving(true);
-    await saveLayout({ ...layout, updated_at: Date.now() });
+    const saved = await saveLayout(snapshot);
     setSaving(false);
+    if (saved) {
+      // Edits made while the save was in flight set dirtyRef again; the effect
+      // will preserve them instead of replacing the form with this snapshot.
+      loadedLayout.current = {
+        key: `${activeTable ?? ""}|${snapshot.id}`,
+        updatedAt: snapshot.updated_at,
+      };
+    } else {
+      dirtyRef.current = true;
+    }
   };
 
   return (
@@ -471,9 +513,12 @@ function StudioItem({
 
   const moveResize = (event: React.PointerEvent) => {
     const origin = resizeOrigin.current;
-    if (!origin) return;
-    const dx = Math.round(((event.clientX - origin.startX) / origin.rect.width) * 12);
-    const dy = Math.round((event.clientY - origin.startY) / ROW_HEIGHT);
+    if (!origin || !(origin.rect.width > 0)) return;
+    const rawDx = ((event.clientX - origin.startX) / origin.rect.width) * 12;
+    const rawDy = (event.clientY - origin.startY) / ROW_HEIGHT;
+    if (!Number.isFinite(rawDx) || !Number.isFinite(rawDy)) return;
+    const dx = Math.round(rawDx);
+    const dy = Math.round(rawDy);
     let { x, y, w, h } = origin.item;
     if (origin.handle.includes("e")) {
       w = Math.max(1, Math.min(12 - x, origin.item.w + dx));
@@ -682,9 +727,12 @@ function ItemInspector({
               className="field-input inspector-number"
               type="number"
               value={kind.rows}
-              onChange={(event) =>
-                onChange({ kind: { ...kind, rows: Number(event.target.value) } })
-              }
+              onChange={(event) => {
+                const parsed = Number(event.target.value);
+                if (!Number.isFinite(parsed)) return;
+                const rows = Math.max(1, Math.min(50, Math.trunc(parsed)));
+                onChange({ kind: { ...kind, rows } });
+              }}
             />
           </label>
         </>
@@ -698,13 +746,25 @@ function ItemInspector({
               className="field-input inspector-number"
               type="number"
               min={key === "w" || key === "h" ? 1 : 0}
-              max={key === "x" ? 11 : key === "w" ? 12 : 40}
+              max={
+                key === "x"
+                  ? Math.max(0, 12 - item.w)
+                  : key === "w"
+                    ? Math.max(1, 12 - item.x)
+                    : 40
+              }
               value={item[key]}
               onChange={(event) => {
-                const value = Math.max(
-                  key === "w" || key === "h" ? 1 : 0,
-                  Number(event.target.value),
-                );
+                const parsed = Number(event.target.value);
+                if (!Number.isFinite(parsed)) return;
+                const minimum = key === "w" || key === "h" ? 1 : 0;
+                const maximum =
+                  key === "x"
+                    ? Math.max(0, 12 - item.w)
+                    : key === "w"
+                      ? Math.max(1, 12 - item.x)
+                      : 40;
+                const value = Math.max(minimum, Math.min(maximum, Math.trunc(parsed)));
                 onChange({ [key]: value });
               }}
             />

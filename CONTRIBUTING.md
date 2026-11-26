@@ -20,6 +20,7 @@ git commit -S -s
 
 ```bash
 npm --prefix apps/desktop ci
+npm --prefix apps/desktop exec -- playwright install chromium
 cargo build --workspace
 ```
 
@@ -36,6 +37,7 @@ cargo test --workspace
 cargo deny check
 npm --prefix apps/desktop run typecheck
 npm --prefix apps/desktop run build
+npm --prefix apps/desktop run test:ui
 ```
 
 For release candidates, build the auditable binary:

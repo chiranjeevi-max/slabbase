@@ -32,7 +32,7 @@ The `v*.*.*` tag triggers `.github/workflows/release.yml`. The workflow:
 7. Creates SLSA build provenance and SBOM attestations with `actions/attest`.
 8. Creates a draft GitHub Release with the DMG, SBOM, and checksums attached.
 
-The runner is `macos-15`. Do not use `macos-14`.
+The runner is `macos-26`. Do not use `macos-14`.
 
 ## Signing and notarization secrets
 

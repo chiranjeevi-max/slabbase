@@ -28,7 +28,7 @@ jobs:
         include:
           - language: rust
             build-mode: none
-            os: macos-15
+            os: macos-26
           - language: javascript-typescript
             build-mode: none
             os: ubuntu-latest

@@ -23,11 +23,29 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 
 ### Changed
 
+- The UI audit runs on the Chromium build pinned by `@playwright/test` instead of the runner's system Chrome, and macOS CI and release jobs run on `macos-26`.
 - Version 1.0.0 is locked across `Cargo.toml`, `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`.
 
 ### Fixed
 
 - Keep the desktop shell inside the viewport when macOS classic scrollbars are active, and stabilize the macOS release timing and UI audit CI gates.
+- Suspend foreign-key enforcement while rebuilding a relation or column, so `DROP TABLE` cannot fire `ON DELETE CASCADE` and silently delete child rows.
+- Invalidate derived rollup state on workspace open, use `i128` intermediates for `SUM`/`AVG` replacements, and keep the `MIN`/`MAX` cached count exact across NULL transitions.
+- Remove rollup contributions before forgetting parent state during a cascade delete, so no cache row survives for a deleted parent.
+- Treat only a wholly unhashed legacy log with no chain anchor as migratable, and backfill it in one transaction, so NULLing hashes cannot launder an altered entry.
+- Preserve search, embedded NUL text, late `UNIQUE` indexes, and a fresh audit genesis through a SQL export and restore.
+- Reject dangling-symlink snapshot targets, publish `VACUUM INTO` snapshots atomically, and never unlink a concurrently created target.
+- Roll back an abandoned import on the next write or clean close instead of wedging the writer in an open transaction.
+- Scope query cancellation to one workspace generation and one registration, so a stale interrupt cannot cancel another query.
+- Discard stale inspector responses and cancel the delayed row select on table or filter changes, preventing a write against a different table or row.
+- Bracket a renamed formula reference when the new column name is not a legal bare identifier.
+- Neutralize spreadsheet formula injection, including a leading line feed, and publish CSV/JSON exports atomically so a failed export cannot truncate an existing file.
+- Restore the original bare formula spelling when a rename that needed brackets is undone.
+- Exclude concurrent read leases from schema-changing commands, so a read never prepares SQL against a schema that was renamed underneath it.
+- Create an export's scratch file with the existing destination's permissions, so re-exporting over a private `0600` file never exposes its rows to other users, during the write or after publishing.
+- Keep Form Studio edits made while a save is in flight, clamp item position and width to the 12-column grid, and resync the portal relation picker when relations change.
+- Keep a New Record draft open when the grid is clicked or double-clicked, and refresh an open inspector when another row is double-clicked.
+- Leave a newer selection alone when a delete or insert resolves, and clear the row-loading indicator whenever a page request is discarded.
 
 ### Security
 
@@ -35,6 +53,8 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Stable `SLAB_E_*` error codes and `unwrap`/`expect`/`panic` denial in library crates.
 - Zero outbound network requests from the desktop shell, enforced by the Playwright air-gap audit.
 - Private vulnerability reporting, Dependabot alerts, automated security fixes, CodeQL, Scorecard, and dependency auditing in CI.
+- A log with missing hashes is never repaired automatically; only a wholly unhashed legacy log with no chain anchor migrates, so NULLing every hash cannot launder an altered entry into a fresh chain.
+- CSV export prefixes user text that starts with a spreadsheet formula character with an apostrophe, because quoting alone does not stop Excel or Numbers from evaluating it.
 
 ### Notes
 

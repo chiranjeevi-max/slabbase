@@ -25,7 +25,7 @@ env:
 jobs:
   release:
     name: Draft release
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 180
     permissions:
       contents: write
@@ -110,6 +110,8 @@ jobs:
         run: cargo test --workspace
       - name: Audit dependencies
         run: cargo deny check
+      - name: Install Playwright Chromium
+        run: npm --prefix apps/desktop exec -- playwright install chromium
       - name: Run UI audit
         run: npm --prefix apps/desktop run test:ui -- --output=test-results
 
@@ -295,6 +297,7 @@ jobs:
           commit="$(git rev-parse HEAD)"
           VERSION="$version" ARCH="$arch" DMG="$dmg" SIGNED="${{ steps.signing.outputs.signed }}" COMMIT="$commit" python3 - <<'PY'
           import os
+          import platform
 
           version = os.environ["VERSION"]
           arch = os.environ["ARCH"]
@@ -315,7 +318,7 @@ jobs:
 
           notes = f"""# SlabBase {version}
 
-          Draft release built from `{commit}` on macOS 15 ({arch}).
+          Draft release built from `{commit}` on macOS {platform.mac_ver()[0]} ({arch}).
           {signing_note}
 
           ## Install
