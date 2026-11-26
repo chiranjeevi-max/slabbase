@@ -751,6 +751,13 @@ fn a_denied_table_cannot_be_written_through_the_readback_path() {
         )
         .expect("seed row");
     let audit_before = workspace.audit_entries(50, 0).expect("audit").len();
+    let insert_audit = workspace
+        .audit_entries(50, 0)
+        .expect("audit")
+        .into_iter()
+        .find(|entry| entry.operation == "insert" && entry.table.as_deref() == Some("Secret"))
+        .expect("insert audit")
+        .id;
 
     workspace.set_policy(std::sync::Arc::new(DenySecret));
     assert!(
@@ -769,6 +776,11 @@ fn a_denied_table_cannot_be_written_through_the_readback_path() {
     );
     assert!(workspace.delete_row("Secret", original.id).is_err());
     assert!(workspace.record_history("Secret", original.id).is_err());
+    assert!(
+        workspace
+            .restore_record_revision("Secret", original.id, insert_audit)
+            .is_err()
+    );
     assert!(
         workspace
             .search("needle", 10)
