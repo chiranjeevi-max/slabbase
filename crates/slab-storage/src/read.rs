@@ -968,12 +968,14 @@ fn fts_query(term: &str) -> String {
     format!("\"{}\"", cleaned.replace('"', "\"\""))
 }
 
-/// Coerces a text filter value into the column's stored type.
+/// Coerces a filter value into the column's stored type.
 ///
 /// The shell may send the text a user typed (`12.34`, `Yes`, `USD 1.20`) for
 /// an `=`, `!=`, or ordering filter. Comparing that text directly to minor
 /// units or 0/1 silently returned no rows; parse it and reject malformed input
-/// with a typed query error instead.
+/// with a typed query error instead. Typed values are normalized without
+/// rounding, so a filter with more precision than the column is rejected
+/// rather than answering a different question.
 fn filter_value(column: &Column, value: &Value) -> Result<Value, StorageError> {
     let Value::Text(text) = value else {
         let normalized = normalize_value(value, &column.ty).map_err(|error| {

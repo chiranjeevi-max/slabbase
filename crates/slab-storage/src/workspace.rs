@@ -632,12 +632,14 @@ impl Workspace {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let (temporary, file) = create_scratch_sibling(parent)?;
-        // Match the destination's mode before any rows are written, as the
-        // desktop export does.
-        if let Ok(metadata) = std::fs::metadata(path) {
-            std::fs::set_permissions(&temporary, metadata.permissions())?;
-        }
-        let outcome = self.export_sql_to(file).and_then(|()| {
+        let outcome = (|| {
+            // Apply the destination's mode before the first row is written.
+            if let Ok(metadata) = std::fs::metadata(path) {
+                std::fs::set_permissions(&temporary, metadata.permissions())?;
+            }
+            self.export_sql_to(file)
+        })()
+        .and_then(|()| {
             std::fs::rename(&temporary, path)?;
             Ok(())
         });
@@ -2937,7 +2939,7 @@ fn ensure_absent(path: &Path) -> Result<(), StorageError> {
     }
 }
 
-/// Creates a uniquely named empty scratch file beside the snapshot target.
+/// Creates a uniquely named empty scratch file beside the destination.
 ///
 /// `create_new` never follows a symlink and never reuses an entry another
 /// process owns.
@@ -4703,10 +4705,108 @@ mod restore_compat_tests {
                 params![insert_audit],
             )
             .expect("legacy payload");
+        let payload: String = workspace
+            .conn
+            .query_row(
+                "SELECT after_json FROM _slab_audit_log WHERE id = ?1",
+                params![insert_audit],
+                |row| row.get(0),
+            )
+            .expect("payload");
+        assert!(
+            payload.contains("\"Text\":\"Open\""),
+            "the legacy payload rewrite must match: {payload}"
+        );
 
         let restored = workspace
             .restore_record_revision("Deals", deal.id, insert_audit)
             .expect("restore legacy select revision");
         assert_eq!(restored.get("Stage"), Some(&Value::Select("Open".into())));
+    }
+
+    #[test]
+    fn restores_a_text_tagged_attachment_revision() {
+        let mut workspace =
+            Workspace::open_in_memory("Restore", Box::new(TestClock::new())).expect("workspace");
+        workspace
+            .create_table(&TableDraft {
+                name: "Files".into(),
+                columns: vec![
+                    ColumnDraft {
+                        name: "Label".into(),
+                        ty: ColumnType::Text,
+                        required: false,
+                        unique: false,
+                        default: None,
+                    },
+                    ColumnDraft {
+                        name: "Path".into(),
+                        ty: ColumnType::AttachmentRef,
+                        required: false,
+                        unique: false,
+                        default: None,
+                    },
+                ],
+            })
+            .expect("table");
+        let file = workspace
+            .insert_row(
+                "Files",
+                &RowData::from([
+                    ("Label".to_owned(), Value::Text("Spec".into())),
+                    (
+                        "Path".to_owned(),
+                        Value::AttachmentRef("/tmp/spec.pdf".into()),
+                    ),
+                ]),
+            )
+            .expect("insert");
+        let insert_audit = workspace
+            .audit_entries(10, 0)
+            .expect("audit")
+            .into_iter()
+            .find(|entry| entry.operation == "insert" && entry.table.as_deref() == Some("Files"))
+            .expect("insert audit")
+            .id;
+        workspace
+            .update_row(
+                "Files",
+                file.id,
+                &RowData::from([(
+                    "Path".to_owned(),
+                    Value::AttachmentRef("/tmp/other.pdf".into()),
+                )]),
+            )
+            .expect("update");
+
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log
+                 SET after_json = replace(after_json, '\"AttachmentRef\":\"/tmp/spec.pdf\"', '\"Text\":\"/tmp/spec.pdf\"')
+                 WHERE id = ?1",
+                params![insert_audit],
+            )
+            .expect("legacy payload");
+        let payload: String = workspace
+            .conn
+            .query_row(
+                "SELECT after_json FROM _slab_audit_log WHERE id = ?1",
+                params![insert_audit],
+                |row| row.get(0),
+            )
+            .expect("payload");
+        assert!(
+            payload.contains("\"Text\":\"/tmp/spec.pdf\""),
+            "the legacy payload rewrite must match: {payload}"
+        );
+
+        let restored = workspace
+            .restore_record_revision("Files", file.id, insert_audit)
+            .expect("restore legacy attachment revision");
+        assert_eq!(
+            restored.get("Path"),
+            Some(&Value::AttachmentRef("/tmp/spec.pdf".into()))
+        );
     }
 }

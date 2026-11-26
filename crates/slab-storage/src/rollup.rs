@@ -949,3 +949,18 @@ pub(crate) fn accumulate(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::value_less;
+    use slab_core::Value;
+
+    #[test]
+    fn attachment_refs_order_as_text() {
+        let first = Value::AttachmentRef("/a.pdf".into());
+        let second = Value::AttachmentRef("/b.pdf".into());
+        assert!(value_less(&first, &second));
+        assert!(!value_less(&second, &first));
+        assert!(!value_less(&first, &first));
+    }
+}

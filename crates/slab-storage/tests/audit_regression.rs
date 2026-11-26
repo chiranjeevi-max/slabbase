@@ -947,3 +947,35 @@ fn typed_decimal_filters_normalize_without_rounding() {
         "a typed sub-scale filter must not round"
     );
 }
+
+#[test]
+fn typed_currency_filters_normalize_without_rounding() {
+    use slab_core::{CurrencyCode, Money};
+
+    let workspace = invoice_workspace();
+    let price = |value: Value| {
+        workspace.page(&PageQuery {
+            table: "Invoices".into(),
+            limit: 50,
+            filters: vec![Filter {
+                column: "Price".into(),
+                op: FilterOp::Eq,
+                value: Some(value),
+            }],
+            ..PageQuery::default()
+        })
+    };
+    let usd = CurrencyCode::parse("USD").expect("usd");
+    let exact = price(Value::Currency(
+        Money::from_minor_scaled(usd, 12345, 2).expect("exact"),
+    ))
+    .expect("typed currency filter");
+    assert_eq!(exact.rows.len(), 1);
+    assert!(
+        price(Value::Currency(
+            Money::from_minor_scaled(usd, 12344, 3).expect("sub-scale")
+        ))
+        .is_err(),
+        "a typed sub-scale currency filter must not round"
+    );
+}
