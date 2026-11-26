@@ -19,6 +19,16 @@ use slab_core::{
     SlabTimestamp, Table, Value,
 };
 
+/// Characters a spreadsheet treats as the start of a formula.
+pub const SPREADSHEET_PREFIXES: [char; 7] = ['=', '+', '-', '@', '\t', '\r', '\n'];
+
+/// Removes the apostrophe `csv_cell` adds to a spreadsheet-formula prefix.
+pub fn unguard_spreadsheet_text(text: &str) -> &str {
+    text.strip_prefix('\'')
+        .filter(|rest| rest.starts_with(&SPREADSHEET_PREFIXES[..]))
+        .unwrap_or(text)
+}
+
 /// Supported import formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportFormat {
@@ -123,13 +133,47 @@ pub struct ImportPreview {
     pub issues: Vec<RowIssue>,
 }
 
+/// One cell as it appeared in the source, before type conversion.
+///
+/// `Text` is a scalar; `Json` keeps an object, array, number, or boolean from
+/// a JSON source so a tagged `Value` can be recognized by the target type
+/// instead of being flattened to a string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SourceValue {
+    /// The key was absent, or the JSON value was `null`.
+    Null,
+    /// A scalar string.
+    Text(String),
+    /// A non-string JSON value.
+    Json(serde_json::Value),
+}
+
+impl SourceValue {
+    /// The text used for inference and preview, matching the old flattening
+    /// (a tagged `Value` renders through `display_string`; other objects keep
+    /// their JSON text).
+    fn as_text(&self) -> Option<String> {
+        match self {
+            Self::Null => None,
+            Self::Text(text) => Some(text.clone()),
+            Self::Json(value) => match serde_json::from_value::<Value>(value.clone()) {
+                Ok(typed) => Some(typed.display_string()),
+                Err(_) => Some(value.to_string()),
+            },
+        }
+    }
+}
+
 /// A row read from a source before type conversion.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SourceRow {
     /// One-based row number.
     pub number: u64,
     /// Values keyed by column name.
-    pub values: BTreeMap<String, Option<String>>,
+    pub values: BTreeMap<String, SourceValue>,
+    /// True for CSV, where an empty field means SQL NULL. JSON preserves an
+    /// explicit empty string so an export round-trips.
+    pub empty_text_is_null: bool,
     /// Structural issues in this row.
     pub issues: Vec<String>,
 }
@@ -206,7 +250,7 @@ impl ImportAdapter for CsvAdapter {
             }
         }
         on_columns(&headers);
-        let mut row_number = 0_u64;
+        let mut row_number = if options.has_headers { 0 } else { 1 };
         if !options.has_headers
             && let Some(record) = first
         {
@@ -230,6 +274,7 @@ fn emit_csv_row(
 ) {
     let mut row = SourceRow {
         number: row_number,
+        empty_text_is_null: true,
         ..SourceRow::default()
     };
     if record.len() != headers.len() {
@@ -247,7 +292,10 @@ fn emit_csv_row(
                 value.to_owned()
             }
         });
-        row.values.insert(header.clone(), value);
+        row.values.insert(
+            header.clone(),
+            value.map_or(SourceValue::Null, SourceValue::Text),
+        );
     }
     on_row(row);
 }
@@ -268,8 +316,26 @@ impl ImportAdapter for JsonAdapter {
         on_columns: &mut dyn FnMut(&[String]),
         on_row: &mut dyn FnMut(SourceRow),
     ) -> Result<(), ImportError> {
+        // Strip one UTF-8 BOM, as the CSV adapter does. A BOM is too short to
+        // peek with a buffer and then un-read, so read the three-byte prefix
+        // and chain it back unless it is a BOM.
+        let mut prefix = [0_u8; 3];
+        let mut filled = 0;
+        while filled < prefix.len() {
+            match reader.read(&mut prefix[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut source = if prefix[..filled] == [0xEF, 0xBB, 0xBF] {
+            std::io::Cursor::new(Vec::new()).chain(reader)
+        } else {
+            std::io::Cursor::new(prefix[..filled].to_vec()).chain(reader)
+        };
         let mut tail = TailReader {
-            inner: reader,
+            inner: &mut source,
             last_non_whitespace: None,
         };
         let mut deserializer = serde_json::Deserializer::from_reader(&mut tail);
@@ -356,7 +422,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
         let mut values = BTreeMap::new();
         while let Some(key) = map.next_key::<String>()? {
             let value: serde_json::Value = map.next_value()?;
-            values.insert(key, json_text(&value));
+            values.insert(key, source_value(value));
         }
         self.emit_object(values);
         Ok(())
@@ -424,7 +490,7 @@ impl JsonVisitor<'_> {
                 self.emit_object(
                     object
                         .into_iter()
-                        .map(|(key, value)| (key, json_text(&value)))
+                        .map(|(key, value)| (key, source_value(value)))
                         .collect(),
                 );
             }
@@ -439,7 +505,7 @@ impl JsonVisitor<'_> {
         }
     }
 
-    fn emit_object(&mut self, values: BTreeMap<String, String>) {
+    fn emit_object(&mut self, values: BTreeMap<String, SourceValue>) {
         let mut added = false;
         for key in values.keys() {
             if self.seen.insert(key.clone()) {
@@ -456,24 +522,21 @@ impl JsonVisitor<'_> {
             ..SourceRow::default()
         };
         for column in self.columns.iter() {
-            match values.get(column) {
-                Some(value) => {
-                    row.values.insert(column.clone(), Some(value.clone()));
-                }
-                None => {
-                    row.values.insert(column.clone(), None);
-                }
-            }
+            row.values.insert(
+                column.clone(),
+                values.get(column).cloned().unwrap_or(SourceValue::Null),
+            );
         }
         (self.on_row)(row);
     }
 }
 
-fn json_text(value: &serde_json::Value) -> String {
+/// A JSON cell keeps its shape until the target column type is known.
+fn source_value(value: serde_json::Value) -> SourceValue {
     match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+        serde_json::Value::Null => SourceValue::Null,
+        serde_json::Value::String(text) => SourceValue::Text(text),
+        other => SourceValue::Json(other),
     }
 }
 
@@ -516,19 +579,19 @@ pub fn preview(
             let mut columns = columns.borrow_mut();
             if infer_this_row {
                 for column in &mut *columns {
-                    let value = row.values.get(&column.name).and_then(Option::as_deref);
+                    let value = row.values.get(&column.name).and_then(SourceValue::as_text);
                     match value.filter(|value| !value.trim().is_empty()) {
                         Some(value) => {
-                            let candidate = classify(value);
+                            let candidate = classify(&value);
                             if column.samples.is_empty() {
                                 column.ty = candidate.clone();
                             } else {
                                 column.ty = merge_types(&column.ty, &candidate);
                             }
                             if column.samples.len() < 3
-                                && !column.samples.iter().any(|s| s == value)
+                                && !column.samples.iter().any(|sample| sample == &value)
                             {
-                                column.samples.push(value.to_owned());
+                                column.samples.push(value);
                             }
                         }
                         None => column.nullable = true,
@@ -549,7 +612,7 @@ pub fn preview(
                     row_number: row.number,
                     values: columns
                         .iter()
-                        .map(|column| row.values.get(&column.name).cloned().flatten())
+                        .map(|column| row.values.get(&column.name).and_then(SourceValue::as_text))
                         .collect(),
                 });
             }
@@ -821,20 +884,32 @@ fn convert_row(
             });
             continue;
         };
-        let raw = row.values.get(source).cloned().flatten();
-        let value = match raw {
-            Some(text) if !text.trim().is_empty() => match convert_value(&text, &column.ty) {
-                Ok(value) => value,
-                Err(message) => {
-                    issues.push(RowIssue {
-                        row_number: row.number,
-                        column: Some(destinaton.clone()),
-                        message,
-                    });
-                    continue;
-                }
-            },
-            _ => Value::Null,
+        // Computed columns are virtual. A source column that happens to share
+        // their name (an export includes them) is skipped, not a row error.
+        if column.ty.is_computed() {
+            continue;
+        }
+        let converted = match row.values.get(source) {
+            None | Some(SourceValue::Null) => Ok(Value::Null),
+            Some(SourceValue::Text(text))
+                if text.trim().is_empty()
+                    && (row.empty_text_is_null || !matches!(column.ty, ColumnType::Text)) =>
+            {
+                Ok(Value::Null)
+            }
+            Some(SourceValue::Text(text)) => convert_value(text, &column.ty),
+            Some(SourceValue::Json(json)) => convert_json(json, &column.ty),
+        };
+        let value = match converted {
+            Ok(value) => value,
+            Err(message) => {
+                issues.push(RowIssue {
+                    row_number: row.number,
+                    column: Some(destinaton.clone()),
+                    message,
+                });
+                continue;
+            }
         };
         if column.required && value.is_null() {
             issues.push(RowIssue {
@@ -861,13 +936,58 @@ fn convert_row(
     }
 }
 
+/// Converts a JSON cell with the target type in mind.
+///
+/// A tagged `Value` is used directly when it matches the column. A tag for a
+/// different type is preserved as JSON text in a text-like column instead of
+/// being silently flattened (`{"Integer":7}` must not become the text "7").
+fn convert_json(value: &serde_json::Value, column_type: &ColumnType) -> Result<Value, String> {
+    let scalar = match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    if let Some(text) = scalar {
+        return convert_value(&text, column_type);
+    }
+    let text_like = matches!(
+        column_type,
+        ColumnType::Text | ColumnType::Select { .. } | ColumnType::AttachmentRef
+    );
+    match serde_json::from_value::<Value>(value.clone()) {
+        Ok(typed) if typed.is_null() => Ok(Value::Null),
+        Ok(typed) if column_type.accepts(&typed) => Ok(typed),
+        _ if text_like => convert_value(&value.to_string(), column_type),
+        Ok(_) => Err(format!(
+            "value {value} does not fit column type {}",
+            column_type.name()
+        )),
+        Err(_) => Err(format!(
+            "value {value} is not a scalar for column type {}",
+            column_type.name()
+        )),
+    }
+}
+
 fn convert_value(text: &str, column_type: &ColumnType) -> Result<Value, String> {
     let trimmed = text.trim();
     match column_type {
-        ColumnType::Text | ColumnType::AttachmentRef => Ok(Value::Text(text.to_owned())),
+        ColumnType::Text => Ok(Value::Text(text.to_owned())),
+        ColumnType::AttachmentRef => Ok(Value::AttachmentRef(
+            unguard_spreadsheet_text(text).to_owned(),
+        )),
         ColumnType::Select { options } => {
-            if options.iter().any(|option| option == trimmed) {
-                Ok(Value::Select(trimmed.to_owned()))
+            // A select option that starts with a spreadsheet-formula
+            // character was protected with an apostrophe on export. Try the
+            // unguarded text first, then the literal text (an option may
+            // itself start with an apostrophe).
+            let candidate = unguard_spreadsheet_text(trimmed);
+            if let Some(option) = options
+                .iter()
+                .find(|option| *option == candidate || *option == trimmed)
+            {
+                Ok(Value::Select(option.clone()))
             } else {
                 Err(format!("{trimmed:?} is not one of {}", options.join(", ")))
             }
@@ -879,12 +999,9 @@ fn convert_value(text: &str, column_type: &ColumnType) -> Result<Value, String> 
         ColumnType::Decimal { .. } => Decimal::parse(trimmed)
             .map(Value::Decimal)
             .map_err(|error| error.to_string()),
-        ColumnType::Currency { currency } => {
-            let decimal = Decimal::parse(trimmed).map_err(|error| error.to_string())?;
-            Money::from_decimal(*currency, decimal)
-                .map(Value::Currency)
-                .map_err(|error| error.to_string())
-        }
+        ColumnType::Currency { currency } => Money::parse(trimmed, *currency)
+            .map(Value::Currency)
+            .map_err(|error| error.to_string()),
         ColumnType::Boolean => match trimmed.to_ascii_lowercase().as_str() {
             "true" | "yes" | "1" => Ok(Value::Boolean(true)),
             "false" | "no" | "0" => Ok(Value::Boolean(false)),
@@ -909,7 +1026,7 @@ pub fn suggest_mapping(source_columns: &[String], target: &Table) -> BTreeMap<St
         if let Some(column) = target
             .columns
             .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(source))
+            .find(|column| !column.ty.is_computed() && column.name.eq_ignore_ascii_case(source))
         {
             mapping.insert(source.clone(), column.name.clone());
         }
