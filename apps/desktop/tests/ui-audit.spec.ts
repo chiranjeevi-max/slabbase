@@ -1274,7 +1274,7 @@ test.describe("interaction polish", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v1.0 torture audit: wide content, rapid interaction, destructive recovery,
+// v1.0 release hardening: wide content, rapid interaction, destructive recovery,
 // keyboard-only operation, internationalization, accessibility, zoom, and
 // air-gapped boot.
 // ---------------------------------------------------------------------------
@@ -1286,7 +1286,7 @@ async function openWideStress(page: Page): Promise<string[]> {
   return errors;
 }
 
-test.describe("v1 torture", () => {
+test.describe("release hardening", () => {
   test("wide table and long values stay inside the grid viewport", async ({ page }) => {
     const errors = await openWideStress(page);
     const metrics = await page.evaluate(() => {
@@ -1543,7 +1543,7 @@ test.describe("v1 torture", () => {
     expect(errors).toEqual([]);
   });
 
-  test("keyboard-only navigation, hostile search, and undo routing", async ({ page }) => {
+  test("keyboard-only navigation, malformed search, and undo routing", async ({ page }) => {
     const errors = await boot(page);
     await page.keyboard.press("Meta+2");
     await expect(page.getByRole("tab", { name: "Form" })).toHaveAttribute(
