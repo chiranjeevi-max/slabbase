@@ -194,36 +194,39 @@ impl SlabTimestamp {
     /// The UTC calendar date. Instants outside the supported 1..=9999 era are
     /// clamped to its first or last day so the returned `SlabDate` is valid.
     pub fn date(self) -> SlabDate {
-        let days = self
-            .millis
-            .div_euclid(86_400_000)
-            .clamp(MIN_SUPPORTED_DAYS, MAX_SUPPORTED_DAYS);
+        let days = self.clamped_millis().div_euclid(86_400_000);
         SlabDate {
             days: i32::try_from(days).unwrap_or(0),
         }
     }
 
+    /// The instant clamped to the supported 1..=9999 era.
+    fn clamped_millis(self) -> i64 {
+        self.millis
+            .clamp(MIN_SUPPORTED_MILLIS, MAX_SUPPORTED_MILLIS)
+    }
+
     /// Milliseconds within the second, 0 through 999.
     pub fn millisecond(self) -> u16 {
-        let value = self.millis.rem_euclid(1_000);
+        let value = self.clamped_millis().rem_euclid(1_000);
         u16::try_from(value).unwrap_or(0)
     }
 
     /// Seconds within the minute.
     pub fn second(self) -> u8 {
-        let value = self.millis.div_euclid(1_000).rem_euclid(60);
+        let value = self.clamped_millis().div_euclid(1_000).rem_euclid(60);
         u8::try_from(value).unwrap_or(0)
     }
 
     /// Minutes within the hour.
     pub fn minute(self) -> u8 {
-        let value = self.millis.div_euclid(60_000).rem_euclid(60);
+        let value = self.clamped_millis().div_euclid(60_000).rem_euclid(60);
         u8::try_from(value).unwrap_or(0)
     }
 
     /// Hours within the day.
     pub fn hour(self) -> u8 {
-        let value = self.millis.div_euclid(3_600_000).rem_euclid(24);
+        let value = self.clamped_millis().div_euclid(3_600_000).rem_euclid(24);
         u8::try_from(value).unwrap_or(0)
     }
 
@@ -364,6 +367,10 @@ const fn is_leap_year(year: i32) -> bool {
 const MIN_SUPPORTED_DAYS: i64 = -719_162;
 /// Days since 1970-01-01 for 9999-12-31.
 const MAX_SUPPORTED_DAYS: i64 = 2_932_896;
+/// First supported Unix millisecond.
+const MIN_SUPPORTED_MILLIS: i64 = MIN_SUPPORTED_DAYS * 86_400_000;
+/// Last supported Unix millisecond.
+const MAX_SUPPORTED_MILLIS: i64 = MAX_SUPPORTED_DAYS * 86_400_000 + 86_399_999;
 
 const fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
@@ -480,6 +487,14 @@ mod tests {
         assert_eq!(
             SlabTimestamp::from_millis(i64::MIN).date().iso(),
             "0001-01-01"
+        );
+        assert_eq!(
+            SlabTimestamp::from_millis(i64::MAX).iso(),
+            "9999-12-31T23:59:59.999Z"
+        );
+        assert_eq!(
+            SlabTimestamp::from_millis(i64::MIN).iso(),
+            "0001-01-01T00:00:00.000Z"
         );
         for days in [MIN_SUPPORTED_DAYS, MAX_SUPPORTED_DAYS] {
             let days = i32::try_from(days).expect("in i32 range");

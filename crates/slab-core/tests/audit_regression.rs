@@ -121,3 +121,16 @@ fn money_parses_display_text_and_rejects_a_foreign_code() {
         "an exact parse must reject sub-scale precision"
     );
 }
+
+#[test]
+fn mixed_scale_addition_does_not_false_overflow() {
+    let large = Decimal::parse("1000000000000000000").expect("large");
+    let negative = Decimal::parse("-900000000000000000.0").expect("negative");
+    let sum = large.checked_add(negative).expect("representable sum");
+    assert_eq!(sum.to_string(), "100000000000000000.0");
+    let positive = Decimal::parse("900000000000000000.0").expect("positive");
+    assert_eq!(
+        large.checked_sub(positive).expect("sub").to_string(),
+        "100000000000000000.0"
+    );
+}

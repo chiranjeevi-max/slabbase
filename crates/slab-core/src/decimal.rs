@@ -237,11 +237,12 @@ impl Decimal {
     /// Checked addition. The result uses the larger input scale.
     pub fn checked_add(self, other: Self) -> Result<Self, CoreError> {
         let scale = self.scale.max(other.scale);
-        let left = i128::from(self.rescale(scale, RoundingMode::HalfEven)?.units);
-        let right = i128::from(other.rescale(scale, RoundingMode::HalfEven)?.units);
-        let sum = left.checked_add(right).ok_or(CoreError::NumericOverflow {
-            operation: "adding decimals",
-        })?;
+        let sum = self
+            .aligned_units(scale)?
+            .checked_add(other.aligned_units(scale)?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "adding decimals",
+            })?;
         Ok(Self {
             units: i64::try_from(sum).map_err(|_| CoreError::NumericOverflow {
                 operation: "adding decimals",
@@ -252,15 +253,28 @@ impl Decimal {
 
     /// Checked subtraction. The result uses the larger input scale.
     pub fn checked_sub(self, other: Self) -> Result<Self, CoreError> {
-        self.checked_add(Self {
-            units: other
-                .units
-                .checked_neg()
-                .ok_or(CoreError::NumericOverflow {
-                    operation: "negating a decimal",
-                })?,
-            scale: other.scale,
+        let scale = self.scale.max(other.scale);
+        let difference = self
+            .aligned_units(scale)?
+            .checked_sub(other.aligned_units(scale)?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "subtracting decimals",
+            })?;
+        Ok(Self {
+            units: i64::try_from(difference).map_err(|_| CoreError::NumericOverflow {
+                operation: "subtracting decimals",
+            })?,
+            scale,
         })
+    }
+
+    /// This coefficient widened to `scale` without rounding.
+    fn aligned_units(self, scale: u8) -> Result<i128, CoreError> {
+        i128::from(self.units)
+            .checked_mul(pow10(u32::from(scale - self.scale))?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "aligning decimal scales",
+            })
     }
 
     /// Checked multiplication. The result scale is the sum of input scales,
@@ -344,19 +358,10 @@ impl Decimal {
         let scale = self.scale.max(other.scale);
         // Widen before aligning. Rescaling into an `i64` first rejected
         // representable remainders (and panicked on `i64::MIN % -1`).
-        let left = i128::from(self.units)
-            .checked_mul(pow10(u32::from(scale - self.scale))?)
-            .ok_or(CoreError::NumericOverflow {
-                operation: "aligning a decimal remainder",
+        let units = i64::try_from(self.aligned_units(scale)? % other.aligned_units(scale)?)
+            .map_err(|_| CoreError::NumericOverflow {
+                operation: "taking a decimal remainder",
             })?;
-        let right = i128::from(other.units)
-            .checked_mul(pow10(u32::from(scale - other.scale))?)
-            .ok_or(CoreError::NumericOverflow {
-                operation: "aligning a decimal remainder",
-            })?;
-        let units = i64::try_from(left % right).map_err(|_| CoreError::NumericOverflow {
-            operation: "taking a decimal remainder",
-        })?;
         Ok(Self { units, scale })
     }
 
