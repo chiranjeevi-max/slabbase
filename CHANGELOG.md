@@ -32,7 +32,7 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 
 - Keep the desktop shell inside the viewport when macOS classic scrollbars are active, and stabilize the macOS release timing and UI audit CI gates.
 - Round money multiplication and division once at the currency scale, widen decimal remainders before aligning, and compare mixed-scale decimals exactly; `₹`/`$` totals no longer lose a cent to double rounding.
-- Reject a formula deeper than 128 nodes or larger than 16 KiB before recursive consumers see it, drop the expression tree iteratively, and reject an over-limit stored formula at open before any migration so the file is left untouched.
+- Reject a formula deeper than 128 levels or larger than 16 KiB before recursive consumers see it, drop the expression tree iteratively, and reject an over-limit stored formula at open before any migration so the file is left untouched.
 - Parse timestamps with multibyte garbage as a typed error instead of a panic, accept an omitted trailing `Z`, and keep `SlabDate` inside the supported 1..=9999 era.
 - Preserve select and attachment values on read, so editing another field, importing an attachment column, and the Form Studio select control no longer treat them as plain text.
 - Evaluate the record returned by a write inside its transaction; a formula error now rolls the row, audit entry, FTS update, and rollup change back together instead of reporting failure after a commit.
