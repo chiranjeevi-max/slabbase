@@ -68,6 +68,9 @@ jobs:
           tool: cargo-mutants
       - name: Run mutation tests
         timeout-minutes: 120
+        env:
+          # A mutant can allocate indefinitely. Bound each test process so the runner survives.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=1073741824 --core=0 --
         run: cargo mutants --package slab-core --package slab-formula --timeout 180 --jobs 1 --shard ${{ matrix.shard }}/4
       - name: Upload mutation report
         if: always()
