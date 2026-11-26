@@ -134,3 +134,16 @@ fn mixed_scale_addition_does_not_false_overflow() {
         "100000000000000000.0"
     );
 }
+
+#[test]
+fn subtraction_across_the_integer_range_stays_exact() {
+    let minimum = Decimal::new(i64::MIN, 0).expect("minimum");
+    let minus_one = Decimal::new(-1, 0).expect("minus one");
+    assert_eq!(
+        minus_one
+            .checked_sub(minimum)
+            .expect("difference")
+            .to_string(),
+        i64::MAX.to_string()
+    );
+}
