@@ -88,7 +88,6 @@ impl DbHandle {
     /// The replacement is already built and its info was read; a failed
     /// checkpoint on the old workspace must not discard it or leave the path
     /// pointing at a writer-less workspace.
-    #[allow(clippy::print_stderr)]
     fn replace_writer(&self, workspace: Workspace) {
         // The switch must succeed even when the outgoing checkpoint fails, and
         // the shell has no logger; stderr is the only non-fatal channel.
@@ -96,7 +95,10 @@ impl DbHandle {
         if let Some(previous) = previous
             && let Err(error) = previous.close()
         {
-            eprintln!("SlabBase could not checkpoint the previous workspace: {error}");
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!("SlabBase could not checkpoint the previous workspace: {error}\n"),
+            );
         }
     }
 
