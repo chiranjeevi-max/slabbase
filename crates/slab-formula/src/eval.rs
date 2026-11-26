@@ -486,13 +486,7 @@ fn divide(left: &Value, right: &Value) -> Result<Value, FormulaError> {
             let divisor = number_decimal(
                 number(other).ok_or_else(|| FormulaError::Eval("expected a number".into()))?,
             );
-            let amount = money.amount().checked_div(divisor)?;
-            let amount = amount.rescale(money.scale(), RoundingMode::HalfEven)?;
-            Ok(Value::Currency(Money::from_minor_scaled(
-                money.currency(),
-                amount.units(),
-                amount.scale(),
-            )?))
+            Ok(Value::Currency(money.checked_div_decimal(divisor)?))
         }
         (Value::Currency(left), Value::Currency(right)) => {
             if left.currency() != right.currency() {
