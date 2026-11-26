@@ -5,6 +5,8 @@ name: CI
     branches: [main]
   pull_request:
     branches: [main]
+    # Label changes re-run CI so ok-to-test is re-evaluated on the same commit.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 permissions:
@@ -19,8 +21,37 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  quick:
+    name: Quick check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Install frontend dependencies
+        run: npm --prefix apps/desktop ci
+      - name: Typecheck frontend
+        run: npm --prefix apps/desktop run typecheck
+
+  # macOS jobs run on PRs only with the ok-to-test label.
   rust:
     name: Rust gate
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: macos-26
     timeout-minutes: 60
     permissions:
@@ -52,6 +83,7 @@ jobs:
 
   desktop:
     name: Desktop gate (${{ matrix.shard }}/4)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: macos-26
     timeout-minutes: 45
     permissions:
@@ -133,3 +165,49 @@ jobs:
         run: otool -l target/release/slabbase-desktop | grep -q dep-v0
       - name: Build macOS application bundle
         run: npm --prefix apps/desktop run tauri build
+
+  # Here, not in codeql.yml, so CI gate can depend on it.
+  codeql-rust:
+    name: Analyze (rust)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      packages: read
+      contents: read
+      actions: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust for CodeQL
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          languages: rust
+          build-mode: none
+      - name: Analyze
+        uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          category: /language:rust
+
+  # The required check. Skipped jobs count as passing on GitHub, so this job
+  # fails when any gated job was skipped (no ok-to-test), failed or cancelled.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [quick, rust, desktop, bundle, codeql-rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require ok-to-test and passing jobs
+        if: contains(needs.*.result, 'skipped') || contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::Add the ok-to-test label, or fix the failed job."
+          exit 1

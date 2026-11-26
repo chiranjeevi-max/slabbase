@@ -25,6 +25,7 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 
 - The UI audit runs on the Chromium build pinned by `@playwright/test` instead of the runner's system Chrome, and macOS CI and release jobs run on `macos-26`.
 - Version 1.0.0 is locked across `Cargo.toml`, `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`.
+- Pull request macOS CI and Rust CodeQL run only with the `ok-to-test` label; every push gets a quick Ubuntu check and a single `CI gate` status.
 
 ### Fixed
 
