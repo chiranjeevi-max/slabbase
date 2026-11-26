@@ -56,8 +56,10 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Scope query cancellation to one workspace generation and one registration, so a stale interrupt cannot cancel another query.
 - Discard stale inspector responses and cancel the delayed row select on table or filter changes, preventing a write against a different table or row.
 - Bracket a renamed formula reference when the new column name is not a legal bare identifier.
-- Neutralize spreadsheet formula injection, including a leading line feed, and publish CSV/JSON exports atomically so a failed export cannot truncate an existing file.
+- Neutralize spreadsheet formula injection, including a leading line feed, and publish CSV/JSON exports atomically so a failed export cannot truncate an existing file. A literal leading apostrophe is doubled on export and restored on import, so guarded text round-trips exactly.
 - Restore the original bare formula spelling when a rename that needed brackets is undone.
+- Apply policy redaction to revision history and SQL exports, gate undo, redo, and row updates before any row read, and stop denied tables from consuming the FTS search page.
+- Clamp timestamp filter display at the supported era, measure WinAnsi Latin-1 glyphs at their Helvetica widths, and reject a formula whose escaped rendering exceeds the source limit.
 - Exclude concurrent read leases from schema-changing commands, so a read never prepares SQL against a schema that was renamed underneath it.
 - Create an export's scratch file with the existing destination's permissions, so re-exporting over a private `0600` file never exposes its rows to other users, during the write or after publishing.
 - Keep Form Studio edits made while a save is in flight, clamp item position and width to the 12-column grid, and resync the portal relation picker when relations change.
@@ -71,7 +73,7 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Zero outbound network requests from the desktop shell, enforced by the Playwright air-gap audit.
 - Private vulnerability reporting, Dependabot alerts, automated security fixes, CodeQL, Scorecard, and dependency auditing in CI.
 - A log with missing hashes is never repaired automatically; only a wholly unhashed legacy log with no chain anchor migrates, so NULLing every hash cannot launder an altered entry into a fresh chain.
-- CSV export prefixes user text that starts with a spreadsheet formula character with an apostrophe, because quoting alone does not stop Excel or Numbers from evaluating it.
+- CSV export prefixes user text that starts with a spreadsheet formula character with an apostrophe, because quoting alone does not stop Excel or Numbers from evaluating it. A literal leading apostrophe is doubled so the guard is reversible.
 
 ### Notes
 
