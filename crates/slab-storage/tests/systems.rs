@@ -404,7 +404,7 @@ fn incremental_rollups_match_full_recomputation_over_one_thousand_operations() {
 }
 
 #[test]
-fn rollup_delta_latency_stays_bounded() {
+fn rollup_delta_latency_stays_under_two_milliseconds() {
     let directory = tempfile::TempDir::new().expect("tempdir");
     let (_path, mut workspace) = rollup_workspace(&directory);
     let invoice = workspace
@@ -454,11 +454,11 @@ fn rollup_delta_latency_stays_bounded() {
     durations.sort();
     let median = durations[durations.len() / 2];
     if !cfg!(debug_assertions) {
-        // The precise number comes from `systems_bench`; this is a coarse
-        // smoke guard. Five milliseconds matches CI so a loaded workstation
-        // does not turn scheduler noise into a failure while a regression to
-        // a full child scan still trips it.
-        let budget = Duration::from_millis(5);
+        let budget = if std::env::var_os("CI").is_some() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(2)
+        };
         assert!(
             median < budget,
             "rollup edit median {median:?} exceeded {budget:?}"

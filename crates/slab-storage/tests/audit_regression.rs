@@ -858,3 +858,92 @@ fn a_decimal_filter_rescales_to_the_column_scale() {
         assert!(outcome.is_err(), "{op:?} accepted a sub-scale bound");
     }
 }
+
+#[test]
+fn an_attachment_formula_compares_against_text() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Files".into(),
+            columns: vec![
+                ColumnDraft {
+                    name: "Path".into(),
+                    ty: ColumnType::AttachmentRef,
+                    required: false,
+                    unique: false,
+                    default: None,
+                },
+                ColumnDraft {
+                    name: "Matches".into(),
+                    ty: ColumnType::Formula {
+                        expression: "[Path] = \"/tmp/x\"".into(),
+                    },
+                    required: false,
+                    unique: false,
+                    default: None,
+                },
+            ],
+        })
+        .expect("table");
+    let file = workspace
+        .insert_row(
+            "Files",
+            &row(&[("Path", Value::AttachmentRef("/tmp/x".into()))]),
+        )
+        .expect("insert");
+    assert_eq!(
+        file.get("Matches"),
+        Some(&Value::Boolean(true)),
+        "attachment comparison regressed to false"
+    );
+}
+
+#[test]
+fn typed_decimal_filters_normalize_without_rounding() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Invoices".into(),
+            columns: vec![ColumnDraft {
+                name: "Amount".into(),
+                ty: ColumnType::Decimal { scale: 2 },
+                required: false,
+                unique: false,
+                default: None,
+            }],
+        })
+        .expect("table");
+    workspace
+        .insert_row(
+            "Invoices",
+            &row(&[(
+                "Amount",
+                Value::Decimal(slab_core::Decimal::parse("12.30").expect("amount")),
+            )]),
+        )
+        .expect("insert");
+    let filter = |value: Value| {
+        workspace.page(&PageQuery {
+            table: "Invoices".into(),
+            limit: 10,
+            filters: vec![Filter {
+                column: "Amount".into(),
+                op: FilterOp::Eq,
+                value: Some(value),
+            }],
+            ..PageQuery::default()
+        })
+    };
+    let exact = filter(Value::Decimal(
+        slab_core::Decimal::parse("12.3").expect("exact"),
+    ))
+    .expect("typed filter");
+    assert_eq!(exact.rows.len(), 1);
+    assert!(
+        filter(Value::Decimal(
+            slab_core::Decimal::parse("12.304").expect("sub-scale")
+        ))
+        .is_err(),
+        "a typed sub-scale filter must not round"
+    );
+}

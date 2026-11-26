@@ -976,7 +976,25 @@ fn fts_query(term: &str) -> String {
 /// with a typed query error instead.
 fn filter_value(column: &Column, value: &Value) -> Result<Value, StorageError> {
     let Value::Text(text) = value else {
-        return Ok(value.clone());
+        let normalized = normalize_value(value, &column.ty).map_err(|error| {
+            StorageError::Query(format!(
+                "filter value does not fit column {}: {error}",
+                column.name
+            ))
+        })?;
+        let exact = match (value, &normalized) {
+            (Value::Decimal(left), Value::Decimal(right)) => left == right,
+            (Value::Integer(left), Value::Decimal(right)) => Decimal::from_integer(*left) == *right,
+            (Value::Currency(left), Value::Currency(right)) => left == right,
+            _ => normalized == *value,
+        };
+        if !exact {
+            return Err(StorageError::Query(format!(
+                "filter value has more precision than column {}",
+                column.name
+            )));
+        }
+        return Ok(normalized);
     };
     let trimmed = text.trim();
     let parsed: Result<Value, ()> = match &column.ty {

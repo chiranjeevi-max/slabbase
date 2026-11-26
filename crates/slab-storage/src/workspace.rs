@@ -631,11 +631,13 @@ impl Workspace {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let (temporary, file) = create_temporary_sibling(parent)?;
+        let (temporary, file) = create_scratch_sibling(parent)?;
+        // Match the destination's mode before any rows are written, as the
+        // desktop export does.
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&temporary, metadata.permissions())?;
+        }
         let outcome = self.export_sql_to(file).and_then(|()| {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                std::fs::set_permissions(&temporary, metadata.permissions())?;
-            }
             std::fs::rename(&temporary, path)?;
             Ok(())
         });
@@ -805,7 +807,7 @@ impl Workspace {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let (temporary, file) = create_temporary_sibling(parent)?;
+        let (temporary, file) = create_scratch_sibling(parent)?;
         drop(file);
         let Some(target) = temporary.to_str() else {
             // A non-UTF-8 parent produces a valid Unix path that `VACUUM INTO`
@@ -1730,13 +1732,32 @@ impl Workspace {
             .ok_or_else(|| {
                 StorageError::NotFound(format!("audit revision {audit_id} for {table} #{row_id}"))
             })?;
-        let target = parse_payload_values(after.as_deref())?
+        let mut target = parse_payload_values(after.as_deref())?
             .or(parse_payload_values(before.as_deref())?)
             .ok_or_else(|| {
                 StorageError::Query(format!(
                     "audit revision {audit_id} does not contain a restorable row"
                 ))
             })?;
+        // Revisions written before select/attachment decode fidelity stored
+        // those values as Text. Coerce only when the value is valid for the
+        // column so a restore does not fail on its own history.
+        for (name, value) in target.iter_mut() {
+            let Some(column) = definition.column(name) else {
+                continue;
+            };
+            match (&column.ty, value.clone()) {
+                (ColumnType::Select { options }, Value::Text(text))
+                    if options.iter().any(|option| option == &text) =>
+                {
+                    *value = Value::Select(text);
+                }
+                (ColumnType::AttachmentRef, Value::Text(text)) => {
+                    *value = Value::AttachmentRef(text);
+                }
+                _ => {}
+            }
+        }
         let current = read_stored_record(self.read_conn(), definition, row_id)?;
         let command = match current {
             Some(before) => {
@@ -2920,14 +2941,14 @@ fn ensure_absent(path: &Path) -> Result<(), StorageError> {
 ///
 /// `create_new` never follows a symlink and never reuses an entry another
 /// process owns.
-fn create_temporary_sibling(parent: &Path) -> Result<(PathBuf, File), StorageError> {
+fn create_scratch_sibling(parent: &Path) -> Result<(PathBuf, File), StorageError> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     for _ in 0..64 {
         let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
-            ".slabbase-snapshot-{}-{serial}.tmp",
+            ".slabbase-scratch-{}-{serial}.tmp",
             std::process::id()
         ));
         match File::create_new(&path) {
@@ -2937,7 +2958,7 @@ fn create_temporary_sibling(parent: &Path) -> Result<(PathBuf, File), StorageErr
         }
     }
     Err(StorageError::Internal(
-        "could not allocate a snapshot scratch file".into(),
+        "could not allocate a scratch file".into(),
     ))
 }
 
@@ -4612,5 +4633,80 @@ mod audit_foreign_columns_tests {
             !report.audit_chain,
             "a format-2 log with every hash column dropped was backfilled"
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_compat_tests {
+    use super::*;
+    use crate::test_support::TestClock;
+    use slab_core::{ColumnDraft, ColumnType};
+
+    #[test]
+    fn restores_a_text_tagged_select_revision() {
+        let mut workspace =
+            Workspace::open_in_memory("Restore", Box::new(TestClock::new())).expect("workspace");
+        workspace
+            .create_table(&TableDraft {
+                name: "Deals".into(),
+                columns: vec![
+                    ColumnDraft {
+                        name: "Name".into(),
+                        ty: ColumnType::Text,
+                        required: false,
+                        unique: false,
+                        default: None,
+                    },
+                    ColumnDraft {
+                        name: "Stage".into(),
+                        ty: ColumnType::Select {
+                            options: vec!["Open".into(), "Won".into()],
+                        },
+                        required: false,
+                        unique: false,
+                        default: None,
+                    },
+                ],
+            })
+            .expect("table");
+        let deal = workspace
+            .insert_row(
+                "Deals",
+                &RowData::from([
+                    ("Name".to_owned(), Value::Text("Northlight".into())),
+                    ("Stage".to_owned(), Value::Select("Open".into())),
+                ]),
+            )
+            .expect("insert");
+        let insert_audit = workspace
+            .audit_entries(10, 0)
+            .expect("audit")
+            .into_iter()
+            .find(|entry| entry.operation == "insert" && entry.table.as_deref() == Some("Deals"))
+            .expect("insert audit")
+            .id;
+        workspace
+            .update_row(
+                "Deals",
+                deal.id,
+                &RowData::from([("Stage".to_owned(), Value::Select("Won".into()))]),
+            )
+            .expect("update");
+
+        // Simulate a revision written before decode fidelity.
+        workspace
+            .conn
+            .execute(
+                "UPDATE _slab_audit_log
+                 SET after_json = replace(after_json, '\"Select\":\"Open\"', '\"Text\":\"Open\"')
+                 WHERE id = ?1",
+                params![insert_audit],
+            )
+            .expect("legacy payload");
+
+        let restored = workspace
+            .restore_record_revision("Deals", deal.id, insert_audit)
+            .expect("restore legacy select revision");
+        assert_eq!(restored.get("Stage"), Some(&Value::Select("Open".into())));
     }
 }
