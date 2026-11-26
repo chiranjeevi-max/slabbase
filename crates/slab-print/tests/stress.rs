@@ -240,7 +240,7 @@ fn form_pdf_uses_deterministic_winansi_fallbacks_for_unicode() {
 }
 
 #[test]
-fn html_render_escapes_hostile_text_and_keeps_long_tokens() {
+fn html_render_escapes_malformed_text_and_keeps_long_tokens() {
     let (schema, mut layout, mut bundle) = invoice();
     layout.items.truncate(2);
     bundle.record.values.insert(
