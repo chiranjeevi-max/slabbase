@@ -27,7 +27,8 @@ use crate::ddl::{column_definition, create_table_sql, relation_index_sql, unique
 use crate::error::StorageError;
 use crate::rollup;
 use crate::sql::{
-    decode_value, encode_value, normalize_value, quote_ident, sql_literal, stored_columns,
+    decode_value, encode_value, ensure_value_fits, normalize_value, quote_ident, sql_literal,
+    stored_columns,
 };
 use slab_formula::parse as parse_formula;
 use slab_formula::rewrite_column_source;
@@ -736,7 +737,10 @@ impl Workspace {
                     };
                     let decoded = decode_value(row, index, &column.ty)?;
                     match self.policy.redact(table_name, &column.name, &decoded) {
-                        Some(replacement) => literals.push(sql_literal(&replacement, &column.ty)?),
+                        Some(replacement) => {
+                            ensure_value_fits(&replacement, &column.ty)?;
+                            literals.push(sql_literal(&replacement, &column.ty)?);
+                        }
                         None => literals.push(sql_value_literal(value)),
                     }
                 }
@@ -1618,6 +1622,7 @@ impl Workspace {
 
     /// Reverses the most recent command.
     pub fn undo(&mut self) -> Result<UndoState, StorageError> {
+        self.ensure_writer_available()?;
         let Some(command) = self.undo.pop() else {
             return Err(StorageError::NothingToUndo);
         };
@@ -1640,6 +1645,7 @@ impl Workspace {
 
     /// Reapplies the most recently undone command.
     pub fn redo(&mut self) -> Result<UndoState, StorageError> {
+        self.ensure_writer_available()?;
         let Some(command) = self.redo.pop() else {
             return Err(StorageError::NothingToRedo);
         };

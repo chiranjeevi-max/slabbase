@@ -58,7 +58,7 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Bracket a renamed formula reference when the new column name is not a legal bare identifier.
 - Neutralize spreadsheet formula injection, including a leading line feed, and publish CSV/JSON exports atomically so a failed export cannot truncate an existing file. A literal leading apostrophe is doubled on export and restored on import, so guarded text round-trips exactly.
 - Restore the original bare formula spelling when a rename that needed brackets is undone.
-- Apply policy redaction to revision history and SQL exports, gate undo, redo, and row updates before any row read, and stop denied tables from consuming the FTS search page.
+- Apply policy redaction to revision history and SQL exports, reject a redaction the target column cannot store, gate undo, redo, and row updates before any row read, and push the table policy into FTS search so denied tables neither consume the page nor force a full scan.
 - Clamp timestamp filter display at the supported era, measure WinAnsi Latin-1 glyphs at their Helvetica widths, and reject a formula whose escaped rendering exceeds the source limit.
 - Exclude concurrent read leases from schema-changing commands, so a read never prepares SQL against a schema that was renamed underneath it.
 - Create an export's scratch file with the existing destination's permissions, so re-exporting over a private `0600` file never exposes its rows to other users, during the write or after publishing.

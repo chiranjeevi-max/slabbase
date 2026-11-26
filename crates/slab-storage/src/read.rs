@@ -13,7 +13,9 @@ use slab_formula::{EvalContext, FormulaDag, FormulaError, evaluate_expression, p
 
 use crate::error::StorageError;
 use crate::rollup;
-use crate::sql::{decode_value, encode_value, normalize_value, quote_ident, stored_columns};
+use crate::sql::{
+    decode_value, encode_value, normalize_value, quote_ident, quote_literal, stored_columns,
+};
 use crate::workspace::{Workspace, now_ms, read_stored_record};
 
 impl Workspace {
@@ -291,33 +293,43 @@ impl Workspace {
         if term.is_empty() {
             return Ok(Vec::new());
         }
-        let limit = usize::try_from(limit.clamp(1, 200)).unwrap_or(200);
+        let limit = i64::from(limit.clamp(1, 200));
+        let schema = self.schema()?;
+        let readable: Vec<String> = schema
+            .tables
+            .iter()
+            .filter(|table| self.policy.can_read_table(&table.name))
+            .map(|table| quote_literal(&table.name))
+            .collect();
+        if readable.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.read_conn();
         let _active = ActiveQuery::begin(self.search_cancel.as_ref(), conn.get_interrupt_handle());
-        // No SQL LIMIT: denied tables must not consume the authorized page.
-        // Stop as soon as enough readable hits are collected.
-        let sql = "SELECT table_name, CAST(row_id AS INTEGER),
-                          snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
-                          bm25(_slab_fts)
-                   FROM _slab_fts
-                   WHERE _slab_fts MATCH ?1
-                   ORDER BY bm25(_slab_fts)";
-        let mut stmt = conn.prepare_cached(sql)?;
-        let mut rows = stmt.query(params![fts_query(term)])?;
-        let mut hits = Vec::new();
-        while let Some(row) = rows.next()? {
-            let hit = SearchHit {
+        // Push the table policy into SQL so denied hits neither consume the
+        // page nor force a scan of the entire ranked result.
+        let sql = format!(
+            "SELECT table_name, CAST(row_id AS INTEGER),
+                    snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
+                    bm25(_slab_fts)
+             FROM _slab_fts
+             WHERE _slab_fts MATCH ?1 AND table_name IN ({})
+             ORDER BY bm25(_slab_fts)
+             LIMIT ?2",
+            readable.join(", ")
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![fts_query(term), limit], |row| {
+            Ok(SearchHit {
                 table: row.get(0)?,
                 row_id: row.get(1)?,
                 snippet: row.get(2)?,
                 rank: row.get(3)?,
-            };
-            if self.policy.can_read_table(&hit.table) {
-                hits.push(hit);
-                if hits.len() == limit {
-                    break;
-                }
-            }
+            })
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
         }
         Ok(hits)
     }

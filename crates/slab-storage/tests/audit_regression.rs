@@ -882,6 +882,48 @@ fn history_and_sql_export_apply_field_redaction() {
     );
 }
 
+struct WrongRedact;
+
+impl slab_core::PolicyHook for WrongRedact {
+    fn redact(&self, _table: &str, _column: &str, _value: &Value) -> Option<Value> {
+        Some(Value::Text("[redacted]".into()))
+    }
+}
+
+#[test]
+fn sql_export_rejects_an_incompatible_redaction() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Invoices".into(),
+            columns: vec![ColumnDraft {
+                name: "Amount".into(),
+                ty: ColumnType::Decimal { scale: 2 },
+                required: false,
+                unique: false,
+                default: None,
+            }],
+        })
+        .expect("table");
+    workspace
+        .insert_row(
+            "Invoices",
+            &row(&[(
+                "Amount",
+                Value::Decimal(slab_core::Decimal::parse("12.30").expect("amount")),
+            )]),
+        )
+        .expect("insert");
+    workspace.set_policy(std::sync::Arc::new(WrongRedact));
+    let error = workspace
+        .export_sql_to(Vec::new())
+        .expect_err("an unreadable redaction must not publish a dump");
+    assert!(
+        error.to_string().contains("does not fit column"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn undo_does_not_mutate_a_table_denied_by_policy() {
     let mut workspace = workspace();
@@ -915,6 +957,37 @@ fn undo_does_not_mutate_a_table_denied_by_policy() {
             .is_empty(),
         "undo did not remove the inserted row"
     );
+}
+
+#[test]
+fn undo_recovers_an_abandoned_import_before_checking_policy() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Secret".into(),
+            columns: vec![text("Name")],
+        })
+        .expect("table");
+    workspace
+        .insert_row("Secret", &row(&[("Name", Value::Text("secret".into()))]))
+        .expect("insert");
+    workspace.begin_import().expect("begin import");
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+
+    let error = workspace
+        .undo()
+        .expect_err("undo must refuse the open import");
+    assert!(
+        error
+            .to_string()
+            .contains("abandoned transaction was rolled back"),
+        "undo checked policy before recovering the writer: {error}"
+    );
+    workspace.set_policy(std::sync::Arc::new(slab_core::NoopPolicy));
+    workspace
+        .begin_import()
+        .expect("the writer is usable again");
+    workspace.rollback_import().expect("rollback");
 }
 
 #[test]
