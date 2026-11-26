@@ -20,9 +20,10 @@ fn failed_create_keeps_the_current_workspace_open() {
     std::fs::write(&blocked, "not an empty workspace").expect("blocker");
     let error = db.create(blocked.to_str().expect("path").to_owned(), "Blocked".into());
     assert!(error.is_err(), "create over a non-empty file must fail");
-    assert!(
-        db.info().expect("info").is_some(),
-        "a failed create closed the active workspace"
+    assert_eq!(
+        db.info().expect("info").expect("open").name,
+        "Open",
+        "a failed create replaced the active workspace"
     );
 
     // The surviving writer is still usable, and a later create can switch it.

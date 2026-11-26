@@ -88,10 +88,15 @@ impl DbHandle {
     /// The replacement is already built and its info was read; a failed
     /// checkpoint on the old workspace must not discard it or leave the path
     /// pointing at a writer-less workspace.
+    #[allow(clippy::print_stderr)]
     fn replace_writer(&self, workspace: Workspace) {
+        // The switch must succeed even when the outgoing checkpoint fails, and
+        // the shell has no logger; stderr is the only non-fatal channel.
         let previous = lock(&self.writer).replace(workspace);
-        if let Some(previous) = previous {
-            let _ = previous.close();
+        if let Some(previous) = previous
+            && let Err(error) = previous.close()
+        {
+            eprintln!("SlabBase could not checkpoint the previous workspace: {error}");
         }
     }
 
@@ -330,11 +335,16 @@ fn close_writer(slot: &Mutex<Option<Workspace>>) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Locks a mutex, recovering the data if a previous holder panicked.
+/// Locks a mutex, recovering the data and clearing poison if a previous
+/// holder panicked.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// Bounds concurrent read leases so the reader pool never grows past four.
@@ -386,5 +396,28 @@ impl Drop for ReadPermit<'_> {
 impl Drop for DbHandle {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock;
+    use std::sync::Mutex;
+
+    #[test]
+    fn lock_clears_poison_after_a_panic() {
+        let mutex = Mutex::new(1);
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().expect("lock");
+            panic!("poison the mutex");
+        });
+        assert!(poisoned.is_err());
+        assert!(mutex.is_poisoned());
+        {
+            let mut guard = lock(&mutex);
+            *guard = 2;
+        }
+        assert!(!mutex.is_poisoned());
+        assert_eq!(*mutex.lock().expect("recovered"), 2);
     }
 }
