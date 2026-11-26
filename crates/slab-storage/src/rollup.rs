@@ -417,15 +417,217 @@ fn update_child(
         if old_is_extreme || new_beats {
             return store_state(conn, key, &compute_state(conn, reference, key.parent_id)?);
         }
-        return Ok(());
+        // The extremum itself did not move, but a NULL transition still changes
+        // how many non-NULL children contribute. Leaving the serialized count
+        // stale makes the cache disagree with a fresh scan.
+        let count = updated_count(state.count, old, new)?;
+        if count == state.count {
+            return Ok(());
+        }
+        state.count = count;
+        if state.count <= 0 {
+            state.extreme = None;
+        }
+        return store_state(conn, key, &state);
     }
-    if let Some(old) = old {
-        remove_value(&mut state, reference.aggregate, old)?;
-    }
-    if let Some(new) = new {
-        add_value(&mut state, reference.aggregate, new)?;
+    // A replacement is one arithmetic step. Removing `old` and then adding
+    // `new` in i64 respectively can overflow between the two operations even
+    // when the final total is representable, so widen the whole delta first.
+    state.count = updated_count(state.count, old, new)?;
+    if matches!(reference.aggregate, Aggregate::Sum | Aggregate::Avg) {
+        state.sum = replace_sum(state.sum.as_ref(), old, new, &reference.child_type)?;
     }
     store_state(conn, key, &state)
+}
+
+fn updated_count(
+    count: i64,
+    old: Option<&Value>,
+    new: Option<&Value>,
+) -> Result<i64, StorageError> {
+    let mut count = count;
+    if old.is_some() {
+        count = count
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::Internal("rollup count underflowed".into()))?;
+    }
+    if new.is_some() {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Internal("rollup count overflowed".into()))?;
+    }
+    Ok(count)
+}
+
+/// Replaces one contribution in an exact sum using an `i128` accumulator.
+///
+/// `SUM` and `AVG` keep an `i64`-backed `Value`, but `total - old + new` is a
+/// single mathematical operation. Computing it in 128 bits and narrowing once
+/// avoids a spurious overflow when the intermediate falls outside `i64`.
+fn replace_sum(
+    sum: Option<&Value>,
+    old: Option<&Value>,
+    new: Option<&Value>,
+    column_type: &ColumnType,
+) -> Result<Option<Value>, StorageError> {
+    match column_type {
+        ColumnType::Integer => {
+            let base = option_integer(sum)?;
+            let removed = option_integer(old)?;
+            let added = option_integer(new)?;
+            let total = base
+                .checked_sub(removed)
+                .and_then(|value| value.checked_add(added))
+                .ok_or_else(|| overflow("adding rollup deltas"))?;
+            Ok(Some(Value::Integer(narrow(total)?)))
+        }
+        ColumnType::Decimal { .. } => {
+            let scale = decimal_scale(sum, old, new);
+            let base = decimal_contributions(sum, scale)?;
+            let removed = decimal_contributions(old, scale)?;
+            let added = decimal_contributions(new, scale)?;
+            let total = base
+                .checked_sub(removed)
+                .and_then(|value| value.checked_add(added))
+                .ok_or_else(|| overflow("adding decimal rollup deltas"))?;
+            Ok(Some(Value::Decimal(Decimal::new(narrow(total)?, scale)?)))
+        }
+        ColumnType::Currency { .. } => {
+            let scale = money_scale(sum, old, new);
+            let currency = money_currency(sum, old, new)?;
+            let base = money_contributions(sum, scale, currency)?;
+            let removed = money_contributions(old, scale, currency)?;
+            let added = money_contributions(new, scale, currency)?;
+            let total = base
+                .checked_sub(removed)
+                .and_then(|value| value.checked_add(added))
+                .ok_or_else(|| overflow("adding currency rollup deltas"))?;
+            Ok(Some(Value::Currency(Money::from_minor_scaled(
+                currency,
+                narrow(total)?,
+                scale,
+            )?)))
+        }
+        _ => {
+            // The cache path is only reached for numeric lookup columns; a
+            // non-numeric aggregate fails on the read path with a typed error.
+            Err(StorageError::Query(format!(
+                "cannot sum {}",
+                column_type.name()
+            )))
+        }
+    }
+}
+
+fn overflow(operation: &str) -> StorageError {
+    StorageError::Query(format!(
+        "aggregate sum overflowed an integer while {operation}"
+    ))
+}
+
+fn narrow(value: i128) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|_| overflow("narrowing the total"))
+}
+
+fn option_integer(value: Option<&Value>) -> Result<i128, StorageError> {
+    match value {
+        None => Ok(0),
+        Some(Value::Integer(value)) => Ok(i128::from(*value)),
+        Some(other) => Err(StorageError::Internal(format!(
+            "expected an integer rollup value, found {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn decimal_scale(sum: Option<&Value>, old: Option<&Value>, new: Option<&Value>) -> u8 {
+    [sum, old, new]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| match value {
+            Value::Decimal(decimal) => Some(decimal.scale()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn decimal_contributions(value: Option<&Value>, target_scale: u8) -> Result<i128, StorageError> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let Value::Decimal(decimal) = value else {
+        return Err(StorageError::Internal(format!(
+            "expected a decimal rollup value, found {}",
+            value.type_name()
+        )));
+    };
+    if decimal.scale() > target_scale {
+        return Err(StorageError::Internal(
+            "decimal rollup scale widened unexpectedly".into(),
+        ));
+    }
+    let factor = 10_i128.pow(u32::from(target_scale - decimal.scale()));
+    i128::from(decimal.units())
+        .checked_mul(factor)
+        .ok_or_else(|| overflow("aligning decimal scale"))
+}
+
+fn money_scale(sum: Option<&Value>, old: Option<&Value>, new: Option<&Value>) -> u8 {
+    [sum, old, new]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| match value {
+            Value::Currency(money) => Some(money.scale()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn money_currency(
+    sum: Option<&Value>,
+    old: Option<&Value>,
+    new: Option<&Value>,
+) -> Result<slab_core::CurrencyCode, StorageError> {
+    [sum, old, new]
+        .into_iter()
+        .flatten()
+        .find_map(|value| match value {
+            Value::Currency(money) => Some(money.currency()),
+            _ => None,
+        })
+        .ok_or_else(|| StorageError::Internal("currency rollup has no contribution".into()))
+}
+
+fn money_contributions(
+    value: Option<&Value>,
+    target_scale: u8,
+    currency: slab_core::CurrencyCode,
+) -> Result<i128, StorageError> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let Value::Currency(money) = value else {
+        return Err(StorageError::Internal(format!(
+            "expected a currency rollup value, found {}",
+            value.type_name()
+        )));
+    };
+    if money.currency() != currency {
+        return Err(StorageError::Internal(
+            "currency rollup mixed two currencies".into(),
+        ));
+    }
+    if money.scale() > target_scale {
+        return Err(StorageError::Internal(
+            "currency rollup scale widened unexpectedly".into(),
+        ));
+    }
+    let factor = 10_i128.pow(u32::from(target_scale - money.scale()));
+    i128::from(money.minor_units())
+        .checked_mul(factor)
+        .ok_or_else(|| overflow("aligning currency scale"))
 }
 
 fn each_reference(

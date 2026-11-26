@@ -54,7 +54,7 @@ jobs:
   rust:
     name: Rust gate
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       contents: read
@@ -86,7 +86,7 @@ jobs:
   desktop:
     name: Desktop gate (${{ matrix.shard }}/4)
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     permissions:
       contents: read
@@ -118,6 +118,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Install Playwright Chromium
+        run: npm --prefix apps/desktop exec -- playwright install chromium
       - name: Run UI audit
         run: npm --prefix apps/desktop run test:ui -- --shard=${{ matrix.shard }}/4 --output=test-results
       - name: Upload Playwright results
@@ -131,7 +133,7 @@ jobs:
 
   bundle:
     name: Bundle check
-    runs-on: macos-15
+    runs-on: macos-26
     needs: [rust, desktop]
     timeout-minutes: 60
     permissions:
@@ -172,7 +174,7 @@ jobs:
   codeql-rust:
     name: Analyze (rust)
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       security-events: write

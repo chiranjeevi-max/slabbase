@@ -1016,31 +1016,37 @@ test.describe("interaction polish", () => {
     await page.evaluate(() => {
       document.documentElement.dataset["native"] = "true";
     });
-    await page.waitForTimeout(60);
-    const nativeLight = await readGlass();
-    const nativeLightPopover = await readPopover();
-    expectGlassBlurToken(nativeLight.sidebarBlur);
-    expectGlassBackdrop(nativeLight.sidebarFilter);
-    expect(alphaOf(nativeLight.sidebarBg)).toBeGreaterThan(0.2);
-    expect(alphaOf(nativeLight.sidebarBg)).toBeLessThan(0.6);
-    expect(alphaOf(nativeLight.gridBg)).toBeGreaterThanOrEqual(0.96);
-    expect(nativeLightPopover).not.toBeNull();
-    expect(alphaOf(nativeLightPopover?.background ?? "")).toBeGreaterThan(0.5);
-    expect(alphaOf(nativeLightPopover?.background ?? "")).toBeLessThan(0.75);
-    expect(alphaOf(nativeLightPopover?.border ?? "")).toBeGreaterThan(0.4);
-    expect(nativeLightPopover?.bevel).toContain("inset");
+    // Reduced motion collapses every transition to 0.01ms, yet each computed
+    // value still changes only when its transition finishes on the next
+    // animation frame, and a loaded runner can delay that frame past any
+    // fixed sleep. Retry the whole snapshot until every token has settled.
+    await expect(async () => {
+      const nativeLight = await readGlass();
+      const nativeLightPopover = await readPopover();
+      expectGlassBlurToken(nativeLight.sidebarBlur);
+      expectGlassBackdrop(nativeLight.sidebarFilter);
+      expect(alphaOf(nativeLight.sidebarBg)).toBeGreaterThan(0.2);
+      expect(alphaOf(nativeLight.sidebarBg)).toBeLessThan(0.6);
+      expect(alphaOf(nativeLight.gridBg)).toBeGreaterThanOrEqual(0.96);
+      expect(nativeLightPopover).not.toBeNull();
+      expect(alphaOf(nativeLightPopover?.background ?? "")).toBeGreaterThan(0.5);
+      expect(alphaOf(nativeLightPopover?.background ?? "")).toBeLessThan(0.75);
+      expect(alphaOf(nativeLightPopover?.border ?? "")).toBeGreaterThan(0.4);
+      expect(nativeLightPopover?.bevel).toContain("inset");
+    }).toPass({ timeout: 6_000 });
 
     await popover.getByRole("button", { name: "Dark", exact: true }).click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-    await page.waitForTimeout(60);
-    const nativeDark = await readGlass();
-    const nativeDarkPopover = await readPopover();
-    expect(alphaOf(nativeDark.sidebarBg)).toBeGreaterThan(0.3);
-    expect(alphaOf(nativeDark.sidebarBg)).toBeLessThan(0.5);
-    expect(alphaOf(nativeDark.gridBg)).toBeGreaterThanOrEqual(0.96);
-    expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
-    expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
-    expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
+    await expect(async () => {
+      const nativeDark = await readGlass();
+      const nativeDarkPopover = await readPopover();
+      expect(alphaOf(nativeDark.sidebarBg)).toBeGreaterThan(0.3);
+      expect(alphaOf(nativeDark.sidebarBg)).toBeLessThan(0.5);
+      expect(alphaOf(nativeDark.gridBg)).toBeGreaterThanOrEqual(0.96);
+      expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeGreaterThan(0.5);
+      expect(alphaOf(nativeDarkPopover?.background ?? "")).toBeLessThan(0.75);
+      expect(alphaOf(nativeDarkPopover?.border ?? "")).toBeLessThan(0.25);
+    }).toPass({ timeout: 6_000 });
 
     await setReducedTransparency(page, "reduce");
     await expect.poll(async () => (await readGlass()).sidebarBlur).toBe("none");
@@ -1919,5 +1925,156 @@ test.describe("accessibility", () => {
       await page.keyboard.press("Escape");
       expect(errors).toEqual([]);
     }
+  });
+});
+
+test.describe("async races", () => {
+  test("a stale inspector read cannot replace a newer table selection", async ({ page }) => {
+    const errors = await boot(page);
+
+    // Arm the delay before the click so the Clients read (whether the focus
+    // select or the 180 ms timer wins) is unambiguously the delayed one.
+    await page.evaluate(() => {
+      (
+        window as unknown as {
+          __slabFixtureDelay?: { command: string; ms: number; once?: boolean };
+        }
+      ).__slabFixtureDelay = { command: "read_record", ms: 2_500, once: true };
+    });
+    const clientsRow = page.locator('[data-testid="grid-row"]').first();
+    const clientsName = (
+      await clientsRow.locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+    await clientsRow.click();
+    await page.waitForTimeout(300);
+
+    await selectSidebarItem(page, "Invoices");
+    await expect(
+      page.locator('[data-testid="grid-header"] [data-column="Number"]'),
+    ).toBeVisible();
+
+    const invoiceRow = page.locator('[data-testid="grid-row"]').first();
+    const invoiceNumber = (
+      await invoiceRow.locator('[data-column="Number"] .cell-text').innerText()
+    ).trim();
+    await invoiceRow.click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      invoiceNumber,
+    );
+
+    // The slow Clients response resolves now. It must be discarded.
+    await page.waitForTimeout(2_800);
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      invoiceNumber,
+    );
+    await expect(page.getByTestId("inspector")).not.toContainText(clientsName);
+    expect(errors).toEqual([]);
+  });
+
+  test("a delayed row select is cancelled by a table switch", async ({ page }) => {
+    const errors = await boot(page);
+
+    // Select a Clients row and switch tables in one task, well inside the
+    // 180 ms inspector delay. The pending select must not open an unrelated
+    // Invoices row with the same id.
+    await page.evaluate(() => {
+      document
+        .querySelector<HTMLElement>('[data-testid="grid-row"]')
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      document
+        .querySelector<HTMLElement>('[data-testid="sidebar"] [data-table="Invoices"]')
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await page.waitForTimeout(650);
+    await expect(page.getByTestId("inspector")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe("form studio state", () => {
+  test("unsaved item edits survive a schema refresh", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "form inspector survival runs once at the laptop size");
+    const errors = await boot(page);
+    // Seed the fixture undo stack so Cmd+Z below actually replaces the schema
+    // object, which is what triggers the Form Studio reset in the old code.
+    const cell = page.locator('.grid-cell[data-column="Name"]').first();
+    await cell.dblclick();
+    const inline = cell.locator("input.field-input");
+    await inline.fill("Northlight Edited");
+    await page.keyboard.press("Enter");
+    await expect(cell.locator(".cell-text")).toHaveText("Northlight Edited");
+
+    await page.getByRole("tab", { name: "Form" }).click();
+    await expect(page.locator(".studio")).toBeVisible();
+
+    const item = page.locator(".studio-item").first();
+    await item.click();
+    const y = page.locator(".inspector-grid input").nth(1);
+    await expect(y).toBeVisible();
+    await y.fill("5");
+    await expect(y).toHaveValue("5");
+
+    // Blur the number input so Cmd+Z is an app undo, not native text undo.
+    await item.click();
+    await page.keyboard.press("Meta+z");
+    await page.waitForTimeout(500);
+
+    // The undo refreshed the schema object. The unsaved Y position and the
+    // item selection must still be there.
+    await expect(page.locator(".inspector-grid input").nth(1)).toHaveValue("5");
+    await expect(page.locator(".studio-item.selected")).toHaveCount(1);
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe("inspector state", () => {
+  test("double-clicking another row refreshes an open inspector", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "inspector double-click runs once at the laptop size");
+    const errors = await boot(page);
+    const rows = page.locator('[data-testid="grid-row"]');
+    const firstTitle = (
+      await rows.nth(0).locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+    const secondTitle = (
+      await rows.nth(1).locator('[data-column="Name"] .cell-text').innerText()
+    ).trim();
+
+    await rows.nth(0).click();
+    await expect(page.getByTestId("inspector")).toBeVisible();
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      firstTitle,
+    );
+
+    await rows.nth(1).locator('[data-column="Name"]').dblclick();
+    await expect(page.getByTestId("inspector").locator("h2").first()).toHaveText(
+      secondTitle,
+    );
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe("draft isolation", () => {
+  test("a grid double-click does not steal an open draft", async ({ page }) => {
+    const width = page.viewportSize()?.width ?? 0;
+    test.skip(width !== 1440, "draft isolation runs once at the laptop size");
+    const errors = await boot(page);
+    await page.getByRole("button", { name: /New Record/ }).first().click();
+    await expect(page.getByTestId("inspector")).toContainText("New Record");
+
+    const row = page.locator('[data-testid="grid-row"]').nth(1);
+    await row.locator('[data-column="Name"]').dblclick();
+    await page
+      .getByTestId("inspector")
+      .getByRole("button", { name: "Cancel" })
+      .first()
+      .click();
+
+    await expect(page.getByTestId("inspector")).not.toContainText("New Record");
+    await expect(page.locator(".grid-row.selected")).toHaveCount(0);
+    expect(errors).toEqual([]);
   });
 });

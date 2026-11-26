@@ -55,6 +55,7 @@ const EMPTY_UNDO: UndoState = {
 };
 
 let pageRequest = 0;
+let inspectorRequest = 0;
 let toastCounter = 0;
 
 function firstTable(schema: Schema | null): string | null {
@@ -125,6 +126,7 @@ export interface AppStore {
 
   selectedId: number | null;
   bundle: RecordBundle | null;
+  bundleTable: string | null;
   creating: boolean;
   undoState: UndoState;
   historyOpen: boolean;
@@ -257,14 +259,31 @@ export const useStore = create<AppStore>((set, get) => {
       )?.id ??
       layoutFor(schema, activeTable)?.id ??
       null;
-    set({ schema, info: info ?? state.info, undoState, activeTable, activeLayoutId });
+    const selectionIsCurrent =
+      state.selectedId !== null && state.bundleTable === activeTable;
+    set({
+      schema,
+      info: info ?? state.info,
+      undoState,
+      activeTable,
+      activeLayoutId,
+      ...(selectionIsCurrent
+        ? {}
+        : { selectedId: null, bundle: null, bundleTable: null }),
+    });
     return { schema, activeTable };
   };
 
   const loadFirstPage = async () => {
     const state = get();
     if (!state.activeTable) {
-      set({ rows: [], hasMore: false, nextCursor: null, elapsedMs: 0 });
+      set({
+        rows: [],
+        hasMore: false,
+        nextCursor: null,
+        elapsedMs: 0,
+        loadingRows: false,
+      });
       return;
     }
     const token = ++pageRequest;
@@ -324,6 +343,7 @@ export const useStore = create<AppStore>((set, get) => {
 
     selectedId: null,
     bundle: null,
+    bundleTable: null,
     creating: false,
     undoState: EMPTY_UNDO,
     historyOpen: false,
@@ -345,7 +365,15 @@ export const useStore = create<AppStore>((set, get) => {
     integrityCheckedAt: null,
 
     initialize: async () => {
-      set({ booting: true });
+      pageRequest += 1;
+      inspectorRequest += 1;
+      set({
+        booting: true,
+        bundle: null,
+        bundleTable: null,
+        selectedId: null,
+        loadingRows: false,
+      });
       try {
         const info = await api.workspaceInfo();
         if (!info) {
@@ -366,6 +394,7 @@ export const useStore = create<AppStore>((set, get) => {
           rows: [],
           selectedId: null,
           bundle: null,
+          bundleTable: null,
           creating: false,
           inspectorOpen: false,
         });
@@ -377,6 +406,8 @@ export const useStore = create<AppStore>((set, get) => {
     },
 
     openWorkspace: async (path) => {
+      pageRequest += 1;
+      inspectorRequest += 1;
       set({ busy: true });
       try {
         await api.openWorkspace(path);
@@ -390,6 +421,8 @@ export const useStore = create<AppStore>((set, get) => {
     },
 
     createWorkspace: async (path, name) => {
+      pageRequest += 1;
+      inspectorRequest += 1;
       set({ busy: true });
       try {
         await api.createWorkspace(path, name);
@@ -403,6 +436,8 @@ export const useStore = create<AppStore>((set, get) => {
     },
 
     loadSample: async () => {
+      pageRequest += 1;
+      inspectorRequest += 1;
       set({ busy: true });
       try {
         await api.loadSample();
@@ -416,6 +451,8 @@ export const useStore = create<AppStore>((set, get) => {
     },
 
     closeWorkspace: async () => {
+      pageRequest += 1;
+      inspectorRequest += 1;
       try {
         await api.closeWorkspace();
         set({
@@ -423,10 +460,12 @@ export const useStore = create<AppStore>((set, get) => {
           schema: null,
           rows: [],
           bundle: null,
+          bundleTable: null,
           selectedId: null,
           activeTable: null,
           view: "table",
           inspectorOpen: false,
+          loadingRows: false,
         });
       } catch (error) {
         notifyError(error);
@@ -450,16 +489,19 @@ export const useStore = create<AppStore>((set, get) => {
     selectTable: async (table) => {
       const state = get();
       if (state.activeTable === table) return;
+      inspectorRequest += 1;
       const definition = state.schema?.tables.find((candidate) => candidate.name === table);
       set({
         activeTable: table,
         activeLayoutId: layoutFor(state.schema, table)?.id ?? null,
         selectedId: null,
         bundle: null,
+        bundleTable: null,
         creating: false,
         rows: [],
         nextCursor: null,
         hasMore: true,
+        loadingRows: false,
         sort: [],
         filters: [],
         filterText: "",
@@ -468,6 +510,7 @@ export const useStore = create<AppStore>((set, get) => {
         view: "table",
         inspectorOpen: false,
         historyOpen: false,
+        historyLoading: false,
         recordHistory: [],
       });
       await loadFirstPage();
@@ -499,7 +542,6 @@ export const useStore = create<AppStore>((set, get) => {
         current?.column === column
           ? [{ column, direction: current.direction === "asc" ? "desc" : "asc" }]
           : [{ column, direction: "asc" }];
-      void api.cancelSearch().catch(() => undefined);
       set({ sort });
       await get().loadFirstPage();
     },
@@ -518,7 +560,6 @@ export const useStore = create<AppStore>((set, get) => {
           ]
         : [];
       set({ filters, filterText: text });
-      void api.cancelSearch().catch(() => undefined);
       await get().loadFirstPage();
     },
 
@@ -548,14 +589,18 @@ export const useStore = create<AppStore>((set, get) => {
     openHistory: async () => {
       const state = get();
       if (!state.activeTable || state.selectedId === null) return;
+      const table = state.activeTable;
+      const id = state.selectedId;
+      const token = inspectorRequest;
       set({ historyOpen: true, historyLoading: true });
       try {
-        const recordHistory = await api.recordHistory(
-          state.activeTable,
-          state.selectedId,
-        );
+        const recordHistory = await api.recordHistory(table, id);
+        if (token !== inspectorRequest) return;
+        const current = get();
+        if (current.activeTable !== table || current.selectedId !== id) return;
         set({ recordHistory, historyLoading: false });
       } catch (error) {
+        if (token !== inspectorRequest) return;
         set({ historyLoading: false });
         notifyError(error);
       }
@@ -566,17 +611,20 @@ export const useStore = create<AppStore>((set, get) => {
     restoreRevision: async (auditId) => {
       const state = get();
       if (!state.activeTable || state.selectedId === null) return false;
+      const table = state.activeTable;
+      const id = state.selectedId;
       try {
-        await api.restoreRecordRevision(
-          state.activeTable,
-          state.selectedId,
-          auditId,
-        );
+        await api.restoreRecordRevision(table, id, auditId);
         const [undoState, recordHistory] = await Promise.all([
           api.undoState(),
-          api.recordHistory(state.activeTable, state.selectedId),
+          api.recordHistory(table, id),
         ]);
-        set({ undoState, recordHistory });
+        const current = get();
+        if (current.activeTable === table && current.selectedId === id) {
+          set({ undoState, recordHistory });
+        } else {
+          set({ undoState });
+        }
         await get().loadFirstPage();
         await get().refreshBundle();
         notify("success", "Revision restored");
@@ -626,17 +674,24 @@ export const useStore = create<AppStore>((set, get) => {
     selectRow: async (id) => {
       const state = get();
       if (!state.activeTable) return;
+      const table = state.activeTable;
+      const token = ++inspectorRequest;
       set({
         selectedId: id,
         creating: false,
         inspectorOpen: true,
         historyOpen: false,
+        historyLoading: false,
         recordHistory: [],
       });
       try {
-        const record = await api.readRecord(state.activeTable, id);
-        set({ bundle: { record, portals: {} } });
+        const record = await api.readRecord(table, id);
+        if (token !== inspectorRequest) return;
+        const current = get();
+        if (current.activeTable !== table || current.selectedId !== id) return;
+        set({ bundle: { record, portals: {} }, bundleTable: table });
       } catch (error) {
+        if (token !== inspectorRequest) return;
         if (!isCancelledError(error)) notifyError(error);
       }
     },
@@ -648,43 +703,65 @@ export const useStore = create<AppStore>((set, get) => {
       await get().selectRow(id);
     },
 
-    closeRecord: () =>
+    closeRecord: () => {
+      inspectorRequest += 1;
       set({
         selectedId: null,
         bundle: null,
+        bundleTable: null,
         inspectorOpen: false,
         historyOpen: false,
         recordHistory: [],
-      }),
+      });
+    },
 
     refreshBundle: async () => {
       const state = get();
       if (!state.activeTable || state.selectedId === null) return;
+      const table = state.activeTable;
+      const id = state.selectedId;
+      const token = inspectorRequest;
       try {
-        const record = await api.readRecord(state.activeTable, state.selectedId);
-        set({ bundle: { record, portals: {} } });
+        const record = await api.readRecord(table, id);
+        if (token !== inspectorRequest) return;
+        const current = get();
+        if (current.activeTable !== table || current.selectedId !== id) return;
+        set({ bundle: { record, portals: {} }, bundleTable: table });
       } catch (error) {
+        if (token !== inspectorRequest) return;
         if (!isCancelledError(error)) notifyError(error);
       }
     },
 
-    beginCreate: () => set({ creating: true, selectedId: null, bundle: null, inspectorOpen: true }),
+    beginCreate: () => {
+      inspectorRequest += 1;
+      set({
+        creating: true,
+        selectedId: null,
+        bundle: null,
+        bundleTable: null,
+        inspectorOpen: true,
+      });
+    },
 
     cancelCreate: () => set({ creating: false }),
 
     updateCell: async (table, id, column, value) => {
-      const state = get();
       try {
         const record = await api.updateRow(table, id, { [column]: value });
         const undoState = await api.undoState();
-        if (state.activeTable === table) {
-          set((current) => ({
-            rows: current.rows.map((row) => (row.id === id ? record : row)),
+        // Check the *current* table after the round trip. A pre-await snapshot
+        // would still claim the old table and splice a foreign record into the
+        // new table's rows under a colliding id.
+        const current = get();
+        if (current.activeTable === table) {
+          set((latest) => ({
+            rows: latest.rows.map((row) => (row.id === id ? record : row)),
             undoState,
-            saveTick: current.saveTick + 1,
+            saveTick: latest.saveTick + 1,
           }));
         } else {
-          set({ undoState, saveTick: state.saveTick + 1 });
+          set({ undoState, saveTick: current.saveTick + 1 });
         }
         await get().refreshBundle();
         const info = await api.workspaceInfo();
@@ -699,13 +776,43 @@ export const useStore = create<AppStore>((set, get) => {
     insertRecord: async (values) => {
       const state = get();
       if (!state.activeTable) return false;
+      const table = state.activeTable;
+      const token = inspectorRequest;
       try {
-        const record = await api.insertRow(state.activeTable, values);
-        set({ creating: false, selectedId: record.id, inspectorOpen: true });
-        await loadFirstPage();
-        const bundle = { record, portals: {} };
+        const record = await api.insertRow(table, values);
         const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        set({ bundle, undoState, info: info ?? state.info, saveTick: state.saveTick + 1 });
+        if (get().activeTable !== table || token !== inspectorRequest) {
+          // The user moved to another table or selected another row while the
+          // insert was in flight. Commit the row, refresh what is on screen,
+          // but do not hijack the inspector.
+          set({
+            creating: false,
+            undoState,
+            info: info ?? get().info,
+            saveTick: get().saveTick + 1,
+          });
+          await loadFirstPage();
+          notify("success", "Record created");
+          return true;
+        }
+        const claim = ++inspectorRequest;
+        set({
+          creating: false,
+          selectedId: record.id,
+          inspectorOpen: true,
+          undoState,
+          info: info ?? get().info,
+          saveTick: get().saveTick + 1,
+        });
+        await loadFirstPage();
+        if (
+          claim !== inspectorRequest ||
+          get().activeTable !== table ||
+          get().selectedId !== record.id
+        ) {
+          return true;
+        }
+        set({ bundle: { record, portals: {} }, bundleTable: table });
         notify("success", "Record created");
         return true;
       } catch (error) {
@@ -717,14 +824,30 @@ export const useStore = create<AppStore>((set, get) => {
     deleteRecord: async (id) => {
       const state = get();
       if (!state.activeTable) return;
+      const table = state.activeTable;
       try {
-        await api.deleteRow(state.activeTable, id);
+        await api.deleteRow(table, id);
         const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
+        const current = get();
+        if (current.activeTable !== table) {
+          set({ undoState, info: info ?? current.info });
+          return;
+        }
+        if (current.selectedId !== id) {
+          // The user selected another row, or opened a draft, while the delete
+          // was in flight. Leave that selection alone.
+          set({ undoState, info: info ?? current.info });
+          await loadFirstPage();
+          notify("success", "Record deleted");
+          return;
+        }
+        inspectorRequest += 1;
         set({
           selectedId: null,
           bundle: null,
+          bundleTable: null,
           undoState,
-          info: info ?? state.info,
+          info: info ?? current.info,
           inspectorOpen: false,
         });
         await loadFirstPage();
@@ -815,6 +938,7 @@ export const useStore = create<AppStore>((set, get) => {
             hasMore: true,
             selectedId: null,
             bundle: null,
+            bundleTable: null,
             creating: false,
             inspectorOpen: false,
           });
@@ -852,6 +976,7 @@ export const useStore = create<AppStore>((set, get) => {
           hasMore: true,
           selectedId: null,
           bundle: null,
+          bundleTable: null,
           creating: false,
           inspectorOpen: false,
         });
@@ -978,15 +1103,16 @@ export const useStore = create<AppStore>((set, get) => {
     setPrintOpen: (open) => set({ printOpen: open }),
 
     updatePortalRow: async (table, id, column, value) => {
-      const state = get();
       try {
         const record = await api.updateRow(table, id, { [column]: value });
         const undoState = await api.undoState();
-        set({ undoState, saveTick: state.saveTick + 1 });
+        const current = get();
+        set({ undoState, saveTick: current.saveTick + 1 });
         await get().refreshBundle();
-        if (state.activeTable === table) {
-          set((current) => ({
-            rows: current.rows.map((row) => (row.id === id ? record : row)),
+        // Compare the live table, not a snapshot taken before the await.
+        if (get().activeTable === table) {
+          set((latest) => ({
+            rows: latest.rows.map((row) => (row.id === id ? record : row)),
           }));
         }
         const info = await api.workspaceInfo();

@@ -30,6 +30,17 @@ import { valueText } from "./types";
 
 export type FixtureMode = "full" | "empty" | "stress";
 
+declare global {
+  interface Window {
+    /** Test-only one-shot latency injection for async race coverage. */
+    __slabFixtureDelay?: {
+      command: string;
+      ms: number;
+      once?: boolean;
+    };
+  }
+}
+
 interface FixtureSnapshot {
   schema: Schema;
   rows: Record<string, SlabRecord[]>;
@@ -440,6 +451,16 @@ export async function fixtureCall<T>(
 ): Promise<T> {
   const state = stateFor(initialMode);
   const payload = argsOf(args);
+
+  if (typeof window !== "undefined") {
+    const delay = window.__slabFixtureDelay;
+    if (delay && delay.command === command && delay.ms > 0) {
+      if (delay.once) window.__slabFixtureDelay = undefined;
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, delay.ms);
+      });
+    }
+  }
 
   switch (command) {
     case "workspace_info":

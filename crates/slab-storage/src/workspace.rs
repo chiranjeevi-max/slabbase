@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -102,11 +103,26 @@ const UNDO_LIMIT: usize = 200;
 const READER_POOL_SIZE: usize = 4;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// A shared handle that lets the shell interrupt a superseded interactive
-/// query without taking the writer lock.
+/// Identifies one registered query so it can only retire its own entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelRegistration(u64);
+
+#[derive(Default)]
+struct QueryCancelState {
+    next_token: AtomicU64,
+    active: Mutex<Vec<(u64, InterruptHandle)>>,
+}
+
+/// A shared handle that lets the shell interrupt superseded interactive
+/// queries without taking the writer lock.
+///
+/// Several reads can be in flight on different reader replicas at once, so
+/// registrations form a set rather than a single slot. A finishing query
+/// removes exactly its own token, and an interrupt reaches every query that is
+/// still registered on *this* cancel.
 #[derive(Clone, Default)]
 pub struct QueryCancel {
-    active: Arc<Mutex<Option<InterruptHandle>>>,
+    state: Arc<QueryCancelState>,
 }
 
 impl QueryCancel {
@@ -115,34 +131,42 @@ impl QueryCancel {
         Self::default()
     }
 
-    /// Interrupts the active query if one is running.
+    /// Interrupts every query currently registered on this handle.
     pub fn interrupt(&self) -> bool {
-        match self.active.lock() {
-            Ok(guard) => match guard.as_ref() {
-                Some(handle) => {
+        match self.state.active.lock() {
+            Ok(guard) => {
+                for (_, handle) in guard.iter() {
                     handle.interrupt();
-                    true
                 }
-                None => false,
-            },
+                !guard.is_empty()
+            }
             Err(_) => false,
         }
     }
 
-    /// Registers the active connection interrupt handle.
+    /// Registers a connection interrupt handle and returns its ownership token.
     ///
     /// Storage calls this around interactive reads; it is exposed so tests and
     /// alternate shells can exercise cancellation without a private hook.
-    pub fn register(&self, handle: InterruptHandle) {
-        if let Ok(mut guard) = self.active.lock() {
-            *guard = Some(handle);
+    pub fn register(&self, handle: InterruptHandle) -> CancelRegistration {
+        let token = self.state.next_token.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = self.state.active.lock() {
+            guard.push((token, handle));
+        }
+        CancelRegistration(token)
+    }
+
+    /// Removes one registration after its query finishes.
+    pub fn clear_registration(&self, registration: CancelRegistration) {
+        if let Ok(mut guard) = self.state.active.lock() {
+            guard.retain(|(token, _)| *token != registration.0);
         }
     }
 
-    /// Clears the active handle after a query finishes.
+    /// Removes every registration. Used when a workspace is torn down.
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.active.lock() {
-            *guard = None;
+        if let Ok(mut guard) = self.state.active.lock() {
+            guard.clear();
         }
     }
 }
@@ -185,6 +209,7 @@ pub struct Workspace {
     pub(crate) policy: Arc<dyn PolicyHook>,
     pub(crate) name: String,
     pub(crate) cancel: Arc<QueryCancel>,
+    pub(crate) search_cancel: Arc<QueryCancel>,
     pub(crate) read_only: bool,
 }
 
@@ -257,6 +282,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         };
         workspace.validate_schema()?;
@@ -337,10 +363,43 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name,
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         };
         workspace.validate_schema()?;
+        // Rollup state is a derived cache. The file can be edited by an
+        // external SQLite client between sessions, so a cached total is not
+        // trustworthy until a mutation through this engine refreshes it.
+        // Dropping the cache here is cheap: reads rebuild lazily.
+        rollup::clear(&workspace.conn)?;
+        workspace.repair_fts_if_pending()?;
         Ok(workspace)
+    }
+
+    /// Rebuilds the derived full-text index when a restored SQL export asks
+    /// for it.
+    ///
+    /// The export omits `_slab_fts` so a plain `sqlite3` can restore the
+    /// script without an FTS5 build. The marker is consumed here, once, in a
+    /// single transaction.
+    fn repair_fts_if_pending(&mut self) -> Result<(), StorageError> {
+        if self.read_only || self.path.is_none() {
+            return Ok(());
+        }
+        if read_meta(&self.conn, "fts_pending")?.as_deref() != Some("1") {
+            return Ok(());
+        }
+        let schema = self.schema()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM _slab_fts", [])?;
+        for table in &schema.tables {
+            rebuild_fts_for_table(&tx, table)?;
+        }
+        tx.execute("DELETE FROM _slab_meta WHERE key = 'fts_pending'", [])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Opens an existing workspace in read-only mode for a concurrent reader.
@@ -402,6 +461,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name,
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: true,
         };
         workspace.validate_schema()?;
@@ -428,6 +488,7 @@ impl Workspace {
             policy: Arc::new(slab_core::NoopPolicy),
             name: name.to_owned(),
             cancel: Arc::new(QueryCancel::new()),
+            search_cancel: Arc::new(QueryCancel::new()),
             read_only: false,
         })
     }
@@ -452,14 +513,27 @@ impl Workspace {
         self.policy = policy;
     }
 
-    /// Shares the cancellation handle exposed to the shell.
+    /// Shares the page cancellation handle exposed to the shell.
     pub fn set_cancel_handle(&mut self, cancel: Arc<QueryCancel>) {
         self.cancel = cancel;
     }
 
-    /// Interrupts the active interactive query, if any.
+    /// Shares the search cancellation handle exposed to the shell.
+    pub fn set_search_cancel_handle(&mut self, cancel: Arc<QueryCancel>) {
+        self.search_cancel = cancel;
+    }
+
+    /// Interrupts the active page query, if any.
     pub fn cancel_query(&self) -> bool {
         self.cancel.interrupt()
+    }
+
+    /// Interrupts the active full-text search, if any.
+    ///
+    /// Search has its own handle so superseding a palette query cannot
+    /// interrupt a grid or portal page that is still loading.
+    pub fn cancel_search_query(&self) -> bool {
+        self.search_cancel.interrupt()
     }
 
     /// Returns a pooled read-only connection, or the writer for an in-memory
@@ -652,7 +726,14 @@ impl Workspace {
     }
 
     /// Writes a portable SQL script containing user tables and SlabBase
-    /// metadata. The full-text index and audit log are excluded.
+    /// metadata.
+    ///
+    /// The audit log is excluded, so its `_slab_meta` chain anchors are
+    /// excluded too; a restored file starts a fresh genesis chain instead of
+    /// claiming a head that has no entries. The derived full-text index is
+    /// omitted as well: a plain `sqlite3` must be able to restore the script
+    /// without an FTS5 build. A pending marker rebuilds the index once on the
+    /// next SlabBase open.
     pub fn export_sql(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
         let schema = self.schema()?;
         let file = File::create(path)?;
@@ -682,7 +763,17 @@ impl Workspace {
             };
             writeln!(out, "DROP TABLE IF EXISTS {};", quote_ident(table_name))?;
             writeln!(out, "{create};")?;
-            let sql = format!("SELECT * FROM {}", quote_ident(table_name));
+            let sql = if table_name == "_slab_meta" {
+                // The audit log is not part of this dump. Carrying its head
+                // anchors would make every restored file look tampered.
+                format!(
+                    "SELECT * FROM {} WHERE key NOT IN
+                        ('audit_head_hash', 'audit_head_id', 'fts_pending')",
+                    quote_ident(table_name)
+                )
+            } else {
+                format!("SELECT * FROM {}", quote_ident(table_name))
+            };
             let mut stmt = self.conn.prepare(&sql)?;
             let column_count = stmt.column_count();
             let columns: Vec<String> = stmt.column_names().map(quote_ident).collect();
@@ -702,14 +793,34 @@ impl Workspace {
                 )?;
             }
         }
+        writeln!(
+            out,
+            "INSERT INTO {} ({}, {}) VALUES ('fts_pending', '1');",
+            quote_ident("_slab_meta"),
+            quote_ident("key"),
+            quote_ident("value")
+        )?;
+        // Emit every explicit index on an exported user table: advisor indexes
+        // (`slab_idx_*`), relation indexes (`slab_ix_*`), and the unique index
+        // that `add_column` creates for a late `UNIQUE` column (`slab_uq_*`).
+        let exported: BTreeSet<&str> = schema
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect();
         let mut indexes = self.conn.prepare(
-            "SELECT sql FROM sqlite_master
-             WHERE type = 'index' AND name LIKE 'slab_idx_%' AND sql IS NOT NULL
+            "SELECT sql, tbl_name FROM sqlite_master
+             WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
              ORDER BY name",
         )?;
-        let index_sql = indexes.query_map([], |row| row.get::<_, String>(0))?;
+        let index_sql = indexes.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for statement in index_sql {
-            writeln!(out, "{};", statement?)?;
+            let (statement, table) = statement?;
+            if exported.contains(table.as_str()) {
+                writeln!(out, "{statement};")?;
+            }
         }
         writeln!(out, "COMMIT;")?;
         out.flush()?;
@@ -719,18 +830,9 @@ impl Workspace {
     /// Writes a consistent snapshot with `VACUUM INTO` after checkpointing.
     pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
         let path = path.as_ref();
-        if path.exists() {
-            return Err(StorageError::Workspace(format!(
-                "{} already exists",
-                path.display()
-            )));
-        }
+        ensure_absent(path)?;
         self.checkpoint_for_snapshot()?;
-        let target = path
-            .to_str()
-            .ok_or_else(|| StorageError::Workspace("backup path is not valid UTF-8".into()))?;
-        self.conn.execute("VACUUM INTO ?1", params![target])?;
-        Ok(())
+        self.vacuum_into_atomic(path)
     }
 
     /// Produces a snapshot, preferring an atomic APFS copy-on-write clone on
@@ -753,12 +855,7 @@ impl Workspace {
         path: &Path,
         prefer_clone: bool,
     ) -> Result<SnapshotReport, StorageError> {
-        if path.exists() {
-            return Err(StorageError::Workspace(format!(
-                "{} already exists",
-                path.display()
-            )));
-        }
+        ensure_absent(path)?;
         let started = std::time::Instant::now();
         let clean = self.checkpoint_for_snapshot()?;
         if prefer_clone
@@ -768,11 +865,49 @@ impl Workspace {
         {
             return snapshot_report(SnapshotKind::ApfsClone, path, started);
         }
-        let target = path
-            .to_str()
-            .ok_or_else(|| StorageError::Workspace("snapshot path is not valid UTF-8".into()))?;
-        self.conn.execute("VACUUM INTO ?1", params![target])?;
+        self.vacuum_into_atomic(path)?;
         snapshot_report(SnapshotKind::VacuumInto, path, started)
+    }
+
+    /// Runs `VACUUM INTO` against a private sibling and publishes the finished
+    /// file with an atomic no-replace link.
+    ///
+    /// Writing directly to the caller's path would leave a partial database if
+    /// SQLite or the process failed mid-copy, and every later attempt would
+    /// then see a non-empty file and refuse. The temporary file is removed on
+    /// every error path.
+    fn vacuum_into_atomic(&self, path: &Path) -> Result<(), StorageError> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let (temporary, file) = create_temporary_sibling(parent)?;
+        drop(file);
+        let Some(target) = temporary.to_str() else {
+            // A non-UTF-8 parent produces a valid Unix path that `VACUUM INTO`
+            // cannot receive as a Rust string. Remove the scratch file before
+            // returning so failed snapshots do not accumulate residue.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(StorageError::Workspace(
+                "snapshot path is not valid UTF-8".into(),
+            ));
+        };
+        let outcome = self.conn.execute("VACUUM INTO ?1", params![target]);
+        if let Err(error) = outcome {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        // `hard_link` refuses to replace an existing entry, so a concurrent
+        // writer can never be clobbered by the publish step.
+        let published = std::fs::hard_link(&temporary, path);
+        let _ = std::fs::remove_file(&temporary);
+        match published {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+                StorageError::Workspace(format!("{} already exists", path.display())),
+            ),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn checkpoint_for_snapshot(&self) -> Result<bool, StorageError> {
@@ -791,6 +926,12 @@ impl Workspace {
     /// Checkpoints the WAL and consumes the workspace, leaving one
     /// self-contained `.slab` file.
     pub fn close(mut self) -> Result<(), StorageError> {
+        // A caller that abandoned an import must not leave an open transaction
+        // behind. Roll it back before the close checkpoint so the file that
+        // lands on disk contains committed state only.
+        if self.pending_import.take().is_some() || !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
         if self.path.is_some() && !self.read_only {
             // Reader connections must close before the final checkpoint so
             // SQLite can truncate the WAL and delete both sidecars.
@@ -1250,6 +1391,7 @@ impl Workspace {
         table: &str,
         rows: &[RowData],
     ) -> Result<Vec<slab_core::Record>, StorageError> {
+        self.ensure_writer_available()?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1304,11 +1446,12 @@ impl Workspace {
     /// [`Self::rollback_import`] on every error path so a failed import leaves
     /// zero half-committed rows.
     pub fn begin_import(&mut self) -> Result<(), StorageError> {
-        if self.pending_import.is_some() || !self.conn.is_autocommit() {
+        if self.pending_import.is_some() {
             return Err(StorageError::Command(
                 "an import transaction is already active".into(),
             ));
         }
+        self.ensure_writer_available()?;
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         self.pending_import = Some(Vec::new());
         Ok(())
@@ -1433,6 +1576,7 @@ impl Workspace {
 
     /// Deletes a row and captures cascade-deleted children for undo.
     pub fn delete_row(&mut self, table: &str, id: RowId) -> Result<(), StorageError> {
+        self.ensure_writer_available()?;
         let schema = self.schema()?;
         let definition = schema
             .table(table)
@@ -1447,11 +1591,16 @@ impl Workspace {
         capture_cascades(&tx, &schema, table, id, &mut children)?;
         delete_row_tx(&tx, table, id)?;
         delete_fts(&tx, table, id)?;
+        // Remove every contribution before forgetting any parent state. A
+        // grandchild processed after its parent was forgotten would otherwise
+        // recreate a cache row for a parent that no longer exists.
         rollup::maintain_delete(&tx, &schema, table, &row)?;
-        rollup::forget_parent(&tx, table, id)?;
         for child in &children {
             delete_fts(&tx, &child.table, child.row.id)?;
             rollup::maintain_delete(&tx, &schema, &child.table, &child.row)?;
+        }
+        rollup::forget_parent(&tx, table, id)?;
+        for child in &children {
             rollup::forget_parent(&tx, &child.table, child.row.id)?;
         }
         let command = Command::DeleteRow {
@@ -1667,6 +1816,23 @@ impl Workspace {
         self.redo.clear();
     }
 
+    /// Refuses to start a nested transaction.
+    ///
+    /// An import lives in one explicit `BEGIN IMMEDIATE`. If the caller
+    /// abandons it, the connection stays inside that transaction and every
+    /// later write fails with `cannot start a transaction within a
+    /// transaction`. Rolling the abandoned transaction back here turns a
+    /// permanent wedge into one recoverable, typed refusal.
+    fn ensure_writer_available(&mut self) -> Result<(), StorageError> {
+        if self.pending_import.take().is_some() || !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(StorageError::Command(
+                "an abandoned transaction was rolled back; retry the operation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn next_id(&mut self, prefix: &str) -> String {
         self.id_seed = self.id_seed.wrapping_add(1);
         format!("{prefix}_{:x}_{:x}", now_ms(), self.id_seed)
@@ -1686,10 +1852,17 @@ impl Workspace {
         summary: &str,
     ) -> Result<Command, StorageError> {
         match command {
-            Command::CreateRelation { .. } | Command::DropRelation { .. } => self
-                .with_foreign_keys_off(|workspace| {
-                    workspace.apply_command_tx(command, operation, summary)
-                }),
+            // These commands rebuild a table with the drop-and-rename dance.
+            // With foreign keys enabled, `DROP TABLE` performs an implicit
+            // delete and fires ON DELETE CASCADE against every child row. The
+            // final `pragma_foreign_key_check` inside `rebuild_table` validates
+            // the result, so enforcement is suspended only for the rebuild.
+            Command::CreateRelation { .. }
+            | Command::DropRelation { .. }
+            | Command::DropColumn { .. }
+            | Command::RestoreColumn { .. } => self.with_foreign_keys_off(|workspace| {
+                workspace.apply_command_tx(command, operation, summary)
+            }),
             _ => self.apply_command_tx(command, operation, summary),
         }
     }
@@ -1714,6 +1887,7 @@ impl Workspace {
         operation: &str,
         summary: &str,
     ) -> Result<Command, StorageError> {
+        self.ensure_writer_available()?;
         let schema = self.schema()?;
         let hlc = self.clock.now();
         let tx = self
@@ -1776,10 +1950,12 @@ impl Workspace {
                 delete_row_tx(&tx, table, row.id)?;
                 delete_fts(&tx, table, row.id)?;
                 rollup::maintain_delete(&tx, &schema, table, row)?;
-                rollup::forget_parent(&tx, table, row.id)?;
                 for child in &cascaded {
                     delete_fts(&tx, &child.table, child.row.id)?;
                     rollup::maintain_delete(&tx, &schema, &child.table, &child.row)?;
+                }
+                rollup::forget_parent(&tx, table, row.id)?;
+                for child in &cascaded {
                     rollup::forget_parent(&tx, &child.table, child.row.id)?;
                 }
                 command.clone()
@@ -2190,6 +2366,8 @@ fn ensure_audit_columns(conn: &Connection) -> Result<(), StorageError> {
 }
 
 fn ensure_audit_chain(conn: &Connection) -> Result<(), StorageError> {
+    let total: i64 =
+        conn.query_row("SELECT COUNT(*) FROM _slab_audit_log", [], |row| row.get(0))?;
     let missing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM _slab_audit_log
          WHERE prev_hash IS NULL OR prev_hash = '' OR entry_hash IS NULL OR entry_hash = ''",
@@ -2197,7 +2375,15 @@ fn ensure_audit_chain(conn: &Connection) -> Result<(), StorageError> {
         |row| row.get(0),
     )?;
     if missing > 0 {
-        return backfill_audit_chain(conn);
+        // A wholly unhashed log is the legacy v1.0 format only when it also
+        // has no chain anchor. If the head exists, an attacker has NULLed the
+        // hashes of a modern log; backfilling would rewrite a fresh chain over
+        // the altered content.
+        if missing == total && read_meta(conn, "audit_head_hash")?.is_none() {
+            return backfill_audit_chain(conn);
+        }
+        // Leave every other missing hash for `verify_audit_chain` to report.
+        return Ok(());
     }
     if read_meta(conn, "audit_head_hash")?.is_none() {
         let last: Option<(i64, String)> = conn
@@ -2222,8 +2408,12 @@ fn ensure_audit_chain(conn: &Connection) -> Result<(), StorageError> {
 }
 
 fn backfill_audit_chain(conn: &Connection) -> Result<(), StorageError> {
+    // The migration updates every row and both head anchors. A crash midway
+    // must roll the whole backfill back, not leave a half-hashed log that the
+    // next open would have to guess about.
+    let tx = conn.unchecked_transaction()?;
     let rows = {
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT id, hlc, table_name, row_id, operation, summary, schema_change,
                     before_json, after_json
              FROM _slab_audit_log ORDER BY id ASC",
@@ -2258,15 +2448,16 @@ fn backfill_audit_chain(conn: &Connection) -> Result<(), StorageError> {
             after.as_deref(),
         )?;
         let hash = audit_hash(&previous, &hlc, table.as_deref(), row_id, &diff);
-        conn.execute(
+        tx.execute(
             "UPDATE _slab_audit_log SET prev_hash = ?1, entry_hash = ?2 WHERE id = ?3",
             params![previous, hash, id],
         )?;
         previous.clone_from(&hash);
         last_id = id;
     }
-    set_meta(conn, "audit_head_hash", &previous)?;
-    set_meta(conn, "audit_head_id", &last_id.to_string())?;
+    set_meta(&tx, "audit_head_hash", &previous)?;
+    set_meta(&tx, "audit_head_id", &last_id.to_string())?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2411,6 +2602,44 @@ fn verify_audit_chain(conn: &Connection) -> Result<(bool, u64, Option<String>), 
     Ok((true, count, None))
 }
 
+/// Rejects any existing directory entry, including a dangling symlink that
+/// `Path::exists` would report as absent.
+fn ensure_absent(path: &Path) -> Result<(), StorageError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(StorageError::Workspace(format!(
+            "{} already exists",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Creates a uniquely named empty scratch file beside the snapshot target.
+///
+/// `create_new` never follows a symlink and never reuses an entry another
+/// process owns.
+fn create_temporary_sibling(parent: &Path) -> Result<(PathBuf, File), StorageError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..64 {
+        let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".slabbase-snapshot-{}-{serial}.tmp",
+            std::process::id()
+        ));
+        match File::create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(StorageError::Internal(
+        "could not allocate a snapshot scratch file".into(),
+    ))
+}
+
 fn snapshot_report(
     kind: SnapshotKind,
     path: &Path,
@@ -2446,7 +2675,9 @@ fn clone_file(source: &Path, target: &Path) -> Result<bool, StorageError> {
             target.display()
         )));
     }
-    let _ = std::fs::remove_file(target);
+    // Never unlink here. `clonefile` is atomic and does not create the target
+    // on failure, while an unconditional `remove_file` would let a racing
+    // writer's file (or a symlink) be deleted based on an unrelated error.
     if matches!(code, libc::EXDEV | libc::ENOTSUP | libc::EINVAL) {
         return Ok(false);
     }
@@ -3427,15 +3658,23 @@ fn sql_value_literal(value: rusqlite::types::ValueRef<'_>) -> String {
                 "NULL".to_owned()
             }
         }
-        rusqlite::types::ValueRef::Text(bytes) => {
-            format!("'{}'", String::from_utf8_lossy(bytes).replace('\'', "''"))
-        }
-        rusqlite::types::ValueRef::Blob(bytes) => {
-            let mut hex = String::with_capacity(bytes.len() * 2);
-            for byte in bytes {
-                hex.push_str(&format!("{byte:02X}"));
+        rusqlite::types::ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) if !text.contains('\0') => {
+                format!("'{}'", text.replace('\'', "''"))
             }
-            format!("X'{hex}'")
-        }
+            // A raw NUL terminates SQLite's parser and invalid UTF-8 cannot be
+            // represented in a Rust string literal. A hex blob cast back to
+            // TEXT preserves the exact bytes through a restore.
+            _ => format!("CAST(X'{}' AS TEXT)", hex_bytes(bytes)),
+        },
+        rusqlite::types::ValueRef::Blob(bytes) => format!("X'{}'", hex_bytes(bytes)),
     }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02X}"));
+    }
+    hex
 }

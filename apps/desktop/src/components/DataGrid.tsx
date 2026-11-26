@@ -58,6 +58,12 @@ export function DataGrid() {
   } | null>(null);
 
   useEffect(() => {
+    // A delayed inspector select carries a row id from the previous table or
+    // filter. Cancel it before the window changes underneath it.
+    if (selectTimer.current !== null) {
+      window.clearTimeout(selectTimer.current);
+      selectTimer.current = null;
+    }
     setEditing(null);
     setActive(null);
     setScrollTop(0);
@@ -278,7 +284,7 @@ export function DataGrid() {
         data-testid="grid-scroll"
         tabIndex={0}
         onFocus={() => {
-          if (!active && rows.length > 0) {
+          if (!active && rows.length > 0 && !useStore.getState().creating) {
             setActive({ row: 0, column: 0 });
             void selectRow(rows[0]!.id);
           }
@@ -382,7 +388,20 @@ export function DataGrid() {
                             window.clearTimeout(selectTimer.current);
                             selectTimer.current = null;
                           }
-                          useStore.setState({ selectedId: record.id });
+                          const state = useStore.getState();
+                          // An open New Record draft owns the inspector. A grid
+                          // click may start an inline edit, but it must not
+                          // change the selection underneath the draft.
+                          if (!state.creating) {
+                            if (state.inspectorOpen) {
+                              // The panel is already visible; load the row so the
+                              // heading and fields do not blank out after the
+                              // selection changes.
+                              void state.selectRow(record.id);
+                            } else {
+                              useStore.setState({ selectedId: record.id });
+                            }
+                          }
                           setEditing({ id: record.id, column: column.name });
                         }}
                       >

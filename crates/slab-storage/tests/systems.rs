@@ -390,6 +390,11 @@ fn incremental_rollups_match_full_recomputation_over_one_thousand_operations() {
                 "rollup mismatch after step {step} on invoice {invoice}"
             );
         }
+        // Re-warm every parent so the next iteration exercises the incremental
+        // delta path instead of a full recomputation.
+        for invoice in &invoices {
+            let _ = rollup_values(&workspace, *invoice);
+        }
     }
     workspace.close().expect("close");
 }
@@ -982,4 +987,373 @@ fn record_frames_round_trip_named_records() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].get("Name"), Some(&Value::from("one")));
     assert_eq!(records[0].get("Value"), Some(&Value::Integer(1)));
+}
+
+fn rollup_state_dump(
+    path: &std::path::Path,
+    parent_id: i64,
+) -> Vec<(String, String, String, String)> {
+    let connection = Connection::open(path).expect("raw open");
+    let mut stmt = connection
+        .prepare(
+            "SELECT relation_name, child_column, aggregate, state_json FROM _slab_rollups
+             WHERE parent_table = 'Invoices' AND parent_id = ?1
+             ORDER BY relation_name, child_column, aggregate",
+        )
+        .expect("prepare dump");
+    let rows = stmt
+        .query_map(rusqlite::params![parent_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("dump rows");
+    rows.map(|row| row.expect("dump row")).collect()
+}
+
+/// Extremum ties, NULL transitions, undo/redo, and a parent move must keep both
+/// the visible aggregates and the serialized `_slab_rollups` state identical to
+/// a fresh scan after every step.
+#[test]
+fn extremum_ties_nulls_undo_redo_and_moves_match_a_fresh_scan() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let (path, mut workspace) = rollup_workspace(&directory);
+    let first = workspace
+        .insert_row("Invoices", &row(&[("Number", Value::from("TIES-A"))]))
+        .expect("invoice")
+        .id;
+    let second = workspace
+        .insert_row("Invoices", &row(&[("Number", Value::from("TIES-B"))]))
+        .expect("invoice")
+        .id;
+
+    let mut ids = Vec::new();
+    for (label, amount) in [("a", 500), ("b", 500), ("c", 100), ("d", 10)] {
+        ids.push(
+            workspace
+                .insert_row(
+                    "Items",
+                    &row(&[
+                        ("Invoice", Value::Integer(first)),
+                        ("Label", Value::from(label)),
+                        ("Amount", Value::Integer(amount)),
+                        ("Qty", Value::Integer(1)),
+                    ]),
+                )
+                .expect("child")
+                .id,
+        );
+    }
+
+    let mut step = 0;
+    let check = |workspace: &Workspace, step: &mut i32| {
+        for invoice in [first, second] {
+            let maintained = rollup_values(workspace, invoice);
+            let maintained_state = rollup_state_dump(&path, invoice);
+            clear_cache(&path);
+            let fresh = rollup_values(workspace, invoice);
+            let fresh_state = rollup_state_dump(&path, invoice);
+            assert_eq!(
+                maintained, fresh,
+                "aggregate mismatch after step {step} on invoice {invoice}"
+            );
+            assert_eq!(
+                maintained_state, fresh_state,
+                "cached state mismatch after step {step} on invoice {invoice}"
+            );
+        }
+        // Re-warm both parents. Without this, every mutation below would find
+        // an empty cache and recompute, which would hide a broken delta path.
+        for invoice in [first, second] {
+            let _ = rollup_values(workspace, invoice);
+        }
+        *step += 1;
+    };
+    check(&workspace, &mut step);
+
+    workspace
+        .delete_row("Items", ids[0])
+        .expect("delete tied max");
+    check(&workspace, &mut step);
+
+    workspace
+        .update_row("Items", ids[1], &row(&[("Amount", Value::Null)]))
+        .expect("null the remaining max");
+    check(&workspace, &mut step);
+
+    workspace.undo().expect("undo null");
+    check(&workspace, &mut step);
+
+    workspace.undo().expect("undo delete");
+    check(&workspace, &mut step);
+
+    workspace.redo().expect("redo delete");
+    check(&workspace, &mut step);
+
+    workspace.redo().expect("redo null");
+    check(&workspace, &mut step);
+
+    // A non-extreme child that becomes NULL still changes the count. The
+    // visible MIN/MAX are unaffected, so only the serialized state can catch a
+    // missing count adjustment.
+    let middle = workspace
+        .insert_row(
+            "Items",
+            &row(&[
+                ("Invoice", Value::Integer(first)),
+                ("Label", Value::from("middle")),
+                ("Amount", Value::Integer(50)),
+                ("Qty", Value::Integer(1)),
+            ]),
+        )
+        .expect("middle child")
+        .id;
+    check(&workspace, &mut step);
+    workspace
+        .update_row("Items", middle, &row(&[("Amount", Value::Null)]))
+        .expect("null a non-extreme child");
+    let max_state = rollup_state_dump(&path, first)
+        .into_iter()
+        .find(|entry| entry.2 == "max")
+        .map(|entry| entry.3)
+        .expect("max state");
+    assert!(
+        max_state.contains("\"count\":2"),
+        "stale extremum count after a non-extreme NULL update: {max_state}"
+    );
+    check(&workspace, &mut step);
+
+    // Relabelling a child keeps COUNT unchanged but still runs the update
+    // path for the counted column. A COUNT state must keep its unused sum slot
+    // empty so the cache stays byte-identical to a fresh scan.
+    workspace
+        .update_row(
+            "Items",
+            ids[2],
+            &row(&[("Label", Value::from("relabelled"))]),
+        )
+        .expect("relabel a counted child");
+    check(&workspace, &mut step);
+
+    // `d` holds the MIN. Its MAX sibling (`c`) is not the changed value, so a
+    // delta path that forgets to adjust the non-extreme count leaves stale
+    // state behind even though the visible MAX is right.
+    workspace
+        .update_row(
+            "Items",
+            ids[3],
+            &row(&[("Invoice", Value::Integer(second))]),
+        )
+        .expect("move the MIN-holding child to the other parent");
+    check(&workspace, &mut step);
+
+    let moved = rollup_values(&workspace, second);
+    assert_eq!(moved[0], Value::Integer(10));
+    assert_eq!(moved[3], Value::Integer(10));
+    assert_eq!(moved[4], Value::Integer(10));
+    let remaining = rollup_values(&workspace, first);
+    assert_eq!(remaining[3], Value::Integer(100));
+    assert_eq!(remaining[4], Value::Integer(100));
+}
+
+/// An import that touches parent rollups and is then rolled back must restore
+/// both the visible totals and the cached state, with no audit residue.
+#[test]
+fn rollback_import_restores_rollups_and_audit() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let (_path, mut workspace) = rollup_workspace(&directory);
+    let invoice = workspace
+        .insert_row("Invoices", &row(&[("Number", Value::from("IMPORT"))]))
+        .expect("invoice")
+        .id;
+    workspace
+        .insert_row(
+            "Items",
+            &row(&[
+                ("Invoice", Value::Integer(invoice)),
+                ("Label", Value::from("seed")),
+                ("Amount", Value::Integer(100)),
+                ("Qty", Value::Integer(1)),
+            ]),
+        )
+        .expect("seed");
+    let before = rollup_values(&workspace, invoice);
+    assert_eq!(before[0], Value::Integer(100));
+    let audit_before = workspace.audit_entries(1_000, 0).expect("audit").len();
+
+    workspace.begin_import().expect("begin");
+    workspace
+        .insert_import_rows(
+            "Items",
+            &[
+                row(&[
+                    ("Invoice", Value::Integer(invoice)),
+                    ("Label", Value::from("import a")),
+                    ("Amount", Value::Integer(50)),
+                    ("Qty", Value::Integer(1)),
+                ]),
+                row(&[
+                    ("Invoice", Value::Integer(invoice)),
+                    ("Label", Value::from("import b")),
+                    ("Amount", Value::Integer(75)),
+                    ("Qty", Value::Integer(1)),
+                ]),
+            ],
+        )
+        .expect("import rows");
+    workspace.rollback_import().expect("rollback");
+
+    assert_eq!(rollup_values(&workspace, invoice), before);
+    assert_eq!(
+        workspace.audit_entries(1_000, 0).expect("audit").len(),
+        audit_before,
+        "rollback left audit entries behind"
+    );
+    assert!(workspace.integrity_check().expect("integrity").audit_chain);
+
+    workspace.begin_import().expect("begin again");
+    workspace
+        .insert_import_rows(
+            "Items",
+            &[row(&[
+                ("Invoice", Value::Integer(invoice)),
+                ("Label", Value::from("committed")),
+                ("Amount", Value::Integer(25)),
+                ("Qty", Value::Integer(1)),
+            ])],
+        )
+        .expect("import rows");
+    workspace.commit_import().expect("commit");
+    assert_eq!(rollup_values(&workspace, invoice)[0], Value::Integer(125));
+}
+
+/// A lookup over a formula child column is evaluated from live rows. It must
+/// keep working across renames of the source column and the formula column, and
+/// it must never create a cache entry because there is no physical column.
+#[test]
+fn computed_child_extrema_survive_column_renames() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let path = directory.path().join("computed-extrema.slab");
+    let mut workspace =
+        Workspace::create(&path, "Computed", Box::new(TestClock::new())).expect("create");
+    workspace
+        .create_table(&TableDraft {
+            name: "Invoices".into(),
+            columns: vec![text("Number")],
+        })
+        .expect("invoices");
+    workspace
+        .create_table(&TableDraft {
+            name: "Items".into(),
+            columns: vec![integer("Invoice"), integer("Qty"), integer("Price")],
+        })
+        .expect("items");
+    workspace
+        .create_relation(&RelationDraft {
+            name: "Items".into(),
+            parent_table: "Invoices".into(),
+            child_table: "Items".into(),
+            child_column: "Invoice".into(),
+            on_delete: DeleteAction::Cascade,
+        })
+        .expect("relation");
+    workspace
+        .add_column(
+            "Items",
+            &ColumnDraft {
+                name: "Line Total".into(),
+                ty: ColumnType::Formula {
+                    expression: "Qty * Price".into(),
+                },
+                required: false,
+                unique: false,
+                default: None,
+            },
+        )
+        .expect("formula");
+    workspace
+        .add_column(
+            "Invoices",
+            &lookup("Largest Line", "Items", "Line Total", Aggregate::Max),
+        )
+        .expect("max lookup");
+    workspace
+        .add_column(
+            "Invoices",
+            &lookup("Smallest Line", "Items", "Line Total", Aggregate::Min),
+        )
+        .expect("min lookup");
+
+    let invoice = workspace
+        .insert_row("Invoices", &row(&[("Number", Value::from("INV-C"))]))
+        .expect("invoice")
+        .id;
+    let first = workspace
+        .insert_row(
+            "Items",
+            &row(&[
+                ("Invoice", Value::Integer(invoice)),
+                ("Qty", Value::Integer(2)),
+                ("Price", Value::Integer(100)),
+            ]),
+        )
+        .expect("item")
+        .id;
+    workspace
+        .insert_row(
+            "Items",
+            &row(&[
+                ("Invoice", Value::Integer(invoice)),
+                ("Qty", Value::Integer(3)),
+                ("Price", Value::Integer(50)),
+            ]),
+        )
+        .expect("item");
+
+    let extrema = |workspace: &Workspace| {
+        let record = workspace
+            .read_record("Invoices", invoice)
+            .expect("parent read");
+        (
+            record.get("Largest Line").cloned().unwrap_or(Value::Null),
+            record.get("Smallest Line").cloned().unwrap_or(Value::Null),
+        )
+    };
+    assert_eq!(
+        extrema(&workspace),
+        (Value::Integer(200), Value::Integer(150))
+    );
+
+    workspace
+        .rename_column("Items", "Price", "Unit Price")
+        .expect("rename source");
+    assert_eq!(
+        extrema(&workspace),
+        (Value::Integer(200), Value::Integer(150))
+    );
+
+    workspace
+        .update_row("Items", first, &row(&[("Qty", Value::Integer(4))]))
+        .expect("update qty");
+    assert_eq!(
+        extrema(&workspace),
+        (Value::Integer(400), Value::Integer(150))
+    );
+
+    workspace
+        .rename_column("Items", "Line Total", "Extended")
+        .expect("rename formula");
+    assert_eq!(
+        extrema(&workspace),
+        (Value::Integer(400), Value::Integer(150))
+    );
+
+    let connection = Connection::open(&path).expect("raw open");
+    let cached: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM _slab_rollups
+             WHERE child_column IN ('Line Total', 'Extended')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("cached count");
+    assert_eq!(cached, 0, "a virtual child column was cached");
 }
