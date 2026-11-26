@@ -5,15 +5,17 @@ use std::time::Instant;
 use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use slab_core::{
-    Aggregate, Column, ColumnType, Cursor, FilterOp, IndexHint, MAX_PAGE_SIZE, Page, PageQuery,
-    PortalPage, PortalQuery, Record, RecordBundle, RowData, RowId, Schema, SearchHit,
-    SortDirection, Table, Value,
+    Aggregate, Column, ColumnType, Cursor, Decimal, FilterOp, IndexHint, MAX_PAGE_SIZE, Money,
+    Page, PageQuery, PortalPage, PortalQuery, Record, RecordBundle, RoundingMode, RowData, RowId,
+    Schema, SearchHit, SlabDate, SlabTimestamp, SortDirection, Table, Value,
 };
 use slab_formula::{EvalContext, FormulaDag, FormulaError, evaluate_expression, parse};
 
 use crate::error::StorageError;
 use crate::rollup;
-use crate::sql::{decode_value, encode_value, quote_ident, stored_columns};
+use crate::sql::{
+    decode_value, encode_value, normalize_value, quote_ident, quote_literal, stored_columns,
+};
 use crate::workspace::{Workspace, now_ms, read_stored_record};
 
 impl Workspace {
@@ -24,9 +26,12 @@ impl Workspace {
             .table(table_name)
             .ok_or_else(|| StorageError::NotFound(table_name.to_owned()))?;
         self.check_policy(table_name)?;
-        let mut record = read_stored_record(self.read_conn(), table, id)?
+        let conn = self.read_conn();
+        let cache_conn = self.cache_conn();
+        let mut record = read_stored_record(conn, table, id)?
             .ok_or_else(|| StorageError::NotFound(format!("{table_name} #{id}")))?;
-        self.compute_record(&schema, table, &mut record)?;
+        let dag = FormulaDag::build(&schema)?;
+        Self::compute_record_with_dag(conn, cache_conn, &schema, table, &mut record, &dag)?;
         self.redact_record(table, &mut record);
         Ok(record)
     }
@@ -179,6 +184,7 @@ impl Workspace {
         bound.push(SqlValue::Integer(i64::from(limit) + 1));
         let explain_bound = bound.clone();
         let conn = self.read_conn();
+        let cache_conn = self.cache_conn();
         let _active = ActiveQuery::begin(self.cancel.as_ref(), conn.get_interrupt_handle());
         let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(bound))?;
@@ -204,7 +210,7 @@ impl Workspace {
                 values.get(sort_column).cloned().unwrap_or(Value::Null)
             };
             let mut record = Record { id, values };
-            self.compute_record_with_dag(&schema, table, &mut record, &dag)?;
+            Self::compute_record_with_dag(conn, cache_conn, &schema, table, &mut record, &dag)?;
             self.redact_record(table, &mut record);
             records.push(record);
             sort_values.push(sort_value);
@@ -288,16 +294,31 @@ impl Workspace {
             return Ok(Vec::new());
         }
         let limit = i64::from(limit.clamp(1, 200));
+        let schema = self.schema()?;
+        let readable: Vec<String> = schema
+            .tables
+            .iter()
+            .filter(|table| self.policy.can_read_table(&table.name))
+            .map(|table| quote_literal(&table.name))
+            .collect();
+        if readable.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.read_conn();
         let _active = ActiveQuery::begin(self.search_cancel.as_ref(), conn.get_interrupt_handle());
-        let sql = "SELECT table_name, CAST(row_id AS INTEGER),
-                          snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
-                          bm25(_slab_fts)
-                   FROM _slab_fts
-                   WHERE _slab_fts MATCH ?1
-                   ORDER BY bm25(_slab_fts)
-                   LIMIT ?2";
-        let mut stmt = conn.prepare_cached(sql)?;
+        // Push the table policy into SQL so denied hits neither consume the
+        // page nor force a scan of the entire ranked result.
+        let sql = format!(
+            "SELECT table_name, CAST(row_id AS INTEGER),
+                    snippet(_slab_fts, 2, '<mark>', '</mark>', '…', 12),
+                    bm25(_slab_fts)
+             FROM _slab_fts
+             WHERE _slab_fts MATCH ?1 AND table_name IN ({})
+             ORDER BY bm25(_slab_fts)
+             LIMIT ?2",
+            readable.join(", ")
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![fts_query(term), limit], |row| {
             Ok(SearchHit {
                 table: row.get(0)?,
@@ -313,7 +334,7 @@ impl Workspace {
         Ok(hits)
     }
 
-    fn check_policy(&self, table: &str) -> Result<(), StorageError> {
+    pub(crate) fn check_policy(&self, table: &str) -> Result<(), StorageError> {
         if self.policy.can_read_table(table) {
             Ok(())
         } else {
@@ -323,7 +344,7 @@ impl Workspace {
         }
     }
 
-    fn redact_record(&self, table: &Table, record: &mut Record) {
+    pub(crate) fn redact_record(&self, table: &Table, record: &mut Record) {
         for (name, value) in &mut record.values {
             if let Some(replacement) = self.policy.redact(&table.name, name, value) {
                 *value = replacement;
@@ -331,18 +352,9 @@ impl Workspace {
         }
     }
 
-    fn compute_record(
-        &self,
-        schema: &Schema,
-        table: &Table,
-        record: &mut Record,
-    ) -> Result<(), StorageError> {
-        let dag = FormulaDag::build(schema)?;
-        self.compute_record_with_dag(schema, table, record, &dag)
-    }
-
     pub(crate) fn compute_record_with_dag(
-        &self,
+        read_conn: &rusqlite::Connection,
+        cache_conn: Option<&rusqlite::Connection>,
         schema: &Schema,
         table: &Table,
         record: &mut Record,
@@ -356,7 +368,9 @@ impl Workspace {
                 aggregate,
             } = &column.ty
             {
-                let value = self.aggregate_in(
+                let value = Self::aggregate_in(
+                    read_conn,
+                    cache_conn,
                     schema,
                     &table.name,
                     record.id,
@@ -378,7 +392,7 @@ impl Workspace {
             let parsed = parse(expression)?;
             let value = {
                 let context = RowContext {
-                    workspace: self,
+                    read_conn,
                     schema,
                     table: &table.name,
                     record_id: record.id,
@@ -401,7 +415,11 @@ impl Workspace {
         aggregate: Aggregate,
     ) -> Result<Value, StorageError> {
         let schema = self.schema()?;
-        self.aggregate_in(
+        let conn = self.read_conn();
+        let cache_conn = self.cache_conn();
+        Self::aggregate_in(
+            conn,
+            cache_conn,
             &schema,
             parent_table,
             parent_id,
@@ -411,8 +429,13 @@ impl Workspace {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the aggregate target fields are inherently positional"
+    )]
     fn aggregate_in(
-        &self,
+        read_conn: &rusqlite::Connection,
+        cache_conn: Option<&rusqlite::Connection>,
         schema: &Schema,
         parent_table: &str,
         parent_id: RowId,
@@ -420,7 +443,9 @@ impl Workspace {
         child_column: &str,
         aggregate: Aggregate,
     ) -> Result<Value, StorageError> {
-        self.aggregate_in_mode(
+        Self::aggregate_in_mode(
+            read_conn,
+            cache_conn,
             schema,
             AggregateTarget {
                 parent_table,
@@ -437,7 +462,7 @@ impl Workspace {
     /// intentionally uncached so an arbitrary formula aggregate can never read
     /// a rollup entry that no declared lookup column maintains.
     fn aggregate_scan_in(
-        &self,
+        read_conn: &rusqlite::Connection,
         schema: &Schema,
         parent_table: &str,
         parent_id: RowId,
@@ -445,7 +470,9 @@ impl Workspace {
         child_column: &str,
         aggregate: Aggregate,
     ) -> Result<Value, StorageError> {
-        self.aggregate_in_mode(
+        Self::aggregate_in_mode(
+            read_conn,
+            None,
             schema,
             AggregateTarget {
                 parent_table,
@@ -459,7 +486,8 @@ impl Workspace {
     }
 
     fn aggregate_in_mode(
-        &self,
+        read_conn: &rusqlite::Connection,
+        cache_conn: Option<&rusqlite::Connection>,
         schema: &Schema,
         target: AggregateTarget<'_>,
         use_cache: bool,
@@ -490,7 +518,7 @@ impl Workspace {
         })?;
         if use_cache
             && let Some(state) = rollup::cached_state(
-                self.read_conn(),
+                read_conn,
                 parent_table,
                 parent_id,
                 relation_name,
@@ -500,12 +528,16 @@ impl Workspace {
         {
             return rollup::finalize_state(&state, aggregate, column);
         }
-        let state =
-            self.compute_aggregate_state(schema, relation, child, column, parent_id, aggregate)?;
+        let state = Self::compute_aggregate_state(
+            read_conn, cache_conn, schema, relation, child, column, parent_id, aggregate,
+        )?;
         let value = rollup::finalize_state(&state, aggregate, column)?;
-        if use_cache && column.ty.is_stored() && !self.read_only {
+        if use_cache
+            && column.ty.is_stored()
+            && let Some(cache_conn) = cache_conn
+        {
             rollup::store_computed(
-                self.write_conn(),
+                cache_conn,
                 parent_table,
                 parent_id,
                 relation_name,
@@ -517,8 +549,13 @@ impl Workspace {
         Ok(value)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the aggregate target fields are inherently positional"
+    )]
     fn compute_aggregate_state(
-        &self,
+        read_conn: &rusqlite::Connection,
+        cache_conn: Option<&rusqlite::Connection>,
         schema: &Schema,
         relation: &slab_core::Relation,
         child: &Table,
@@ -527,7 +564,7 @@ impl Workspace {
         aggregate: Aggregate,
     ) -> Result<rollup::RollupState, StorageError> {
         let where_clause = format!("{} = ?1", quote_ident(&relation.child_column));
-        let conn = self.read_conn();
+        let conn = read_conn;
         if aggregate == Aggregate::Count && column.ty.is_stored() {
             let sql = format!(
                 "SELECT COUNT({}) FROM {} WHERE {} AND {} IS NOT NULL",
@@ -607,7 +644,14 @@ impl Workspace {
                 let Some(mut record) = read_stored_record(conn, child, id)? else {
                     continue;
                 };
-                self.compute_record_with_dag(schema, child, &mut record, &child_dag)?;
+                Self::compute_record_with_dag(
+                    read_conn,
+                    cache_conn,
+                    schema,
+                    child,
+                    &mut record,
+                    &child_dag,
+                )?;
                 let value = record
                     .values
                     .get(&column.name)
@@ -735,7 +779,7 @@ impl Drop for ActiveQuery<'_> {
 }
 
 struct RowContext<'a> {
-    workspace: &'a Workspace,
+    read_conn: &'a rusqlite::Connection,
     schema: &'a Schema,
     table: &'a str,
     record_id: RowId,
@@ -753,16 +797,16 @@ impl EvalContext for RowContext<'_> {
         column: &str,
         aggregate: Aggregate,
     ) -> Result<Value, FormulaError> {
-        self.workspace
-            .aggregate_scan_in(
-                self.schema,
-                self.table,
-                self.record_id,
-                relation,
-                column,
-                aggregate,
-            )
-            .map_err(|error| FormulaError::Eval(error.to_string()))
+        Workspace::aggregate_scan_in(
+            self.read_conn,
+            self.schema,
+            self.table,
+            self.record_id,
+            relation,
+            column,
+            aggregate,
+        )
+        .map_err(|error| FormulaError::Eval(error.to_string()))
     }
 
     fn today(&self) -> slab_core::SlabDate {
@@ -858,10 +902,13 @@ fn append_filter(
                 return Err(StorageError::Query("text filters require a value".into()));
             };
             let text = value.display_string();
+            // Match what the grid shows, not the physical representation:
+            // decimals are stored as minor units and booleans as 0/1.
+            let display = display_expression(column);
             match filter.op {
                 FilterOp::Contains => {
                     predicates.push(format!(
-                        "instr(lower(CAST({identifier} AS TEXT)), lower(?{})) > 0",
+                        "instr(lower({display}), lower(?{})) > 0",
                         bound.len() + 1
                     ));
                     bound.push(SqlValue::Text(text));
@@ -869,14 +916,14 @@ fn append_filter(
                 FilterOp::StartsWith => {
                     let position = bound.len() + 1;
                     predicates.push(format!(
-                        "substr(lower(CAST({identifier} AS TEXT)), 1, length(?{position})) = lower(?{position})"
+                        "substr(lower({display}), 1, length(?{position})) = lower(?{position})"
                     ));
                     bound.push(SqlValue::Text(text.clone()));
                 }
                 _ => {
                     let position = bound.len() + 1;
                     predicates.push(format!(
-                        "substr(lower(CAST({identifier} AS TEXT)), -length(?{position})) = lower(?{position})"
+                        "substr(lower({display}), -length(?{position})) = lower(?{position})"
                     ));
                     bound.push(SqlValue::Text(text));
                 }
@@ -902,7 +949,8 @@ fn append_filter(
                     )),
                 };
             }
-            let encoded = encode_value(value, &column.ty)?;
+            let value = filter_value(column, value)?;
+            let encoded = encode_value(&value, &column.ty)?;
             let placeholder = format!("?{}", bound.len() + 1);
             let comparison = match filter.op {
                 FilterOp::Eq => "=",
@@ -932,4 +980,123 @@ fn fts_query(term: &str) -> String {
         return "\"\"".to_owned();
     }
     format!("\"{}\"", cleaned.replace('"', "\"\""))
+}
+
+/// Coerces a filter value into the column's stored type.
+///
+/// The shell may send the text a user typed (`12.34`, `Yes`, `USD 1.20`) for
+/// an `=`, `!=`, or ordering filter. Comparing that text directly to minor
+/// units or 0/1 silently returned no rows; parse it and reject malformed input
+/// with a typed query error instead. Typed values are normalized without
+/// rounding, so a filter with more precision than the column is rejected
+/// rather than answering a different question.
+fn filter_value(column: &Column, value: &Value) -> Result<Value, StorageError> {
+    let Value::Text(text) = value else {
+        let normalized = normalize_value(value, &column.ty).map_err(|error| {
+            StorageError::Query(format!(
+                "filter value does not fit column {}: {error}",
+                column.name
+            ))
+        })?;
+        let exact = match (value, &normalized) {
+            (Value::Decimal(left), Value::Decimal(right)) => left == right,
+            (Value::Integer(left), Value::Decimal(right)) => Decimal::from_integer(*left) == *right,
+            (Value::Currency(left), Value::Currency(right)) => left == right,
+            _ => normalized == *value,
+        };
+        if !exact {
+            return Err(StorageError::Query(format!(
+                "filter value has more precision than column {}",
+                column.name
+            )));
+        }
+        return Ok(normalized);
+    };
+    let trimmed = text.trim();
+    let parsed: Result<Value, ()> = match &column.ty {
+        ColumnType::Text | ColumnType::Select { .. } | ColumnType::AttachmentRef => {
+            return Ok(value.clone());
+        }
+        ColumnType::Integer => trimmed.parse::<i64>().map(Value::Integer).map_err(|_| ()),
+        ColumnType::Decimal { scale } => Decimal::parse(trimmed)
+            .and_then(|decimal| {
+                let normalized = decimal.rescale(*scale, RoundingMode::HalfEven)?;
+                if normalized != decimal {
+                    return Err(slab_core::CoreError::InvalidDecimal {
+                        input: trimmed.to_owned(),
+                    });
+                }
+                Ok(Value::Decimal(normalized))
+            })
+            .map_err(|_| ()),
+        ColumnType::Currency { currency } => Money::parse_exact(trimmed, *currency)
+            .map(Value::Currency)
+            .map_err(|_| ()),
+        ColumnType::Boolean => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Ok(Value::Boolean(true)),
+            "false" | "no" | "0" => Ok(Value::Boolean(false)),
+            _ => Err(()),
+        },
+        ColumnType::Date => SlabDate::parse(trimmed).map(Value::Date).map_err(|_| ()),
+        ColumnType::Timestamp => SlabTimestamp::parse(trimmed)
+            .map(Value::Timestamp)
+            .map_err(|_| ()),
+        ColumnType::Formula { .. } | ColumnType::Lookup { .. } => {
+            return Ok(value.clone());
+        }
+    };
+    let parsed = parsed.map_err(|()| {
+        StorageError::Query(format!(
+            "filter value {trimmed:?} does not fit column {}",
+            column.name
+        ))
+    })?;
+    normalize_value(&parsed, &column.ty).map_err(|error| {
+        StorageError::Query(format!(
+            "filter value {trimmed:?} does not fit column {}: {error}",
+            column.name
+        ))
+    })
+}
+
+/// The canonical text used for `contains`/`startsWith`/`endsWith`.
+///
+/// This matches the grid cell for text, select, decimal, currency, and boolean
+/// columns; booleans are `Yes`/`No`, not `Value::display_string`'s
+/// `true`/`false`. Integers match their ungrouped decimal form, while the grid
+/// may add locale grouping. Timestamps use ISO-8601 here while the grid renders
+/// a locale short date, so a locale-formatted value is not matched.
+fn display_expression(column: &Column) -> String {
+    let identifier = quote_ident(&column.name);
+    match &column.ty {
+        ColumnType::Boolean => format!(
+            "CASE WHEN {identifier} IS NULL THEN NULL \
+             WHEN {identifier} = 0 THEN 'No' ELSE 'Yes' END"
+        ),
+        ColumnType::Decimal { scale } => decimal_display(&identifier, *scale),
+        ColumnType::Currency { currency } => decimal_display(&identifier, currency.default_scale()),
+        ColumnType::Timestamp => format!(
+            "strftime('%Y-%m-%dT%H:%M:%fZ', \
+             MIN(MAX({identifier}, {}), {}) / 1000.0, 'unixepoch')",
+            slab_core::date::MIN_SUPPORTED_MILLIS,
+            slab_core::date::MAX_SUPPORTED_MILLIS
+        ),
+        _ => format!("CAST({identifier} AS TEXT)"),
+    }
+}
+
+fn decimal_display(identifier: &str, scale: u8) -> String {
+    if scale == 0 {
+        return format!("CAST({identifier} AS TEXT)");
+    }
+    let factor = 10_i64.pow(u32::from(scale));
+    // Integer division truncates toward zero, so derive the sign separately
+    // and format the magnitude. Take `abs` of the quotient and remainder, not
+    // of the whole value: SQLite's `abs(i64::MIN)` raises integer overflow.
+    // `substr(..., -scale)` keeps leading zeros.
+    format!(
+        "((CASE WHEN {identifier} < 0 THEN '-' ELSE '' END) \
+         || CAST(abs({identifier} / {factor}) AS TEXT) || '.' \
+         || substr('000000000' || CAST(abs({identifier} % {factor}) AS TEXT), -{scale}))"
+    )
 }

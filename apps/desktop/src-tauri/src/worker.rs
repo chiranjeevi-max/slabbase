@@ -78,20 +78,28 @@ impl DbHandle {
         self.search_cancel_handle().interrupt()
     }
 
-    fn install_cancels(
-        &self,
-        cancel: Arc<QueryCancel>,
-        search_cancel: Arc<QueryCancel>,
-    ) -> Result<(), ApiError> {
-        *self
-            .cancel
-            .lock()
-            .map_err(|_| ApiError::internal("cancel lock is poisoned"))? = cancel;
-        *self
-            .search_cancel
-            .lock()
-            .map_err(|_| ApiError::internal("search cancel lock is poisoned"))? = search_cancel;
-        Ok(())
+    fn install_cancels(&self, cancel: Arc<QueryCancel>, search_cancel: Arc<QueryCancel>) {
+        *lock(&self.cancel) = cancel;
+        *lock(&self.search_cancel) = search_cancel;
+    }
+
+    /// Installs a replacement writer and closes the outgoing one.
+    ///
+    /// The replacement is already built and its info was read; a failed
+    /// checkpoint on the old workspace must not discard it or leave the path
+    /// pointing at a writer-less workspace.
+    fn replace_writer(&self, workspace: Workspace) {
+        // The switch must succeed even when the outgoing checkpoint fails, and
+        // the shell has no logger; stderr is the only non-fatal channel.
+        let previous = lock(&self.writer).replace(workspace);
+        if let Some(previous) = previous
+            && let Err(error) = previous.close()
+        {
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!("SlabBase could not checkpoint the previous workspace: {error}\n"),
+            );
+        }
     }
 
     /// Opens a workspace, replacing any current one.
@@ -108,17 +116,9 @@ impl DbHandle {
         workspace.set_search_cancel_handle(Arc::clone(&search_cancel));
         let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
         self.clear_readers();
-        close_writer(&self.writer)?;
-        *self
-            .path
-            .lock()
-            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
-            Some(PathBuf::from(&path));
-        self.install_cancels(Arc::clone(&cancel), Arc::clone(&search_cancel))?;
-        *self
-            .writer
-            .lock()
-            .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
+        *lock(&self.path) = Some(PathBuf::from(&path));
+        self.install_cancels(Arc::clone(&cancel), Arc::clone(&search_cancel));
+        self.replace_writer(workspace);
         self.fill_readers(Path::new(&path), &cancel, &search_cancel);
         Ok(info)
     }
@@ -129,12 +129,9 @@ impl DbHandle {
             .lifecycle
             .write()
             .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
-        self.clear_readers();
-        close_writer(&self.writer)?;
-        *self
-            .path
-            .lock()
-            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? = None;
+        // Build the replacement before tearing down the current workspace. A
+        // refused create (an existing non-empty file, a bad directory) must
+        // leave the workspace on screen open and usable.
         let mut workspace =
             Workspace::create(&path, &name, Box::new(HybridLogicalClock::new("desktop")))
                 .map_err(ApiError::from)?;
@@ -143,16 +140,10 @@ impl DbHandle {
         workspace.set_cancel_handle(Arc::clone(&cancel));
         workspace.set_search_cancel_handle(Arc::clone(&search_cancel));
         let info = WorkspaceInfoDto::from(workspace.info().map_err(ApiError::from)?);
-        *self
-            .path
-            .lock()
-            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? =
-            Some(PathBuf::from(&path));
-        self.install_cancels(Arc::clone(&cancel), Arc::clone(&search_cancel))?;
-        *self
-            .writer
-            .lock()
-            .map_err(|_| ApiError::internal("writer lock is poisoned"))? = Some(workspace);
+        self.clear_readers();
+        *lock(&self.path) = Some(PathBuf::from(&path));
+        self.install_cancels(Arc::clone(&cancel), Arc::clone(&search_cancel));
+        self.replace_writer(workspace);
         self.fill_readers(Path::new(&path), &cancel, &search_cancel);
         Ok(info)
     }
@@ -165,11 +156,8 @@ impl DbHandle {
             .map_err(|_| ApiError::internal("workspace lifecycle lock is poisoned"))?;
         self.clear_readers();
         close_writer(&self.writer)?;
-        *self
-            .path
-            .lock()
-            .map_err(|_| ApiError::internal("workspace path lock is poisoned"))? = None;
-        self.install_cancels(Arc::new(QueryCancel::new()), Arc::new(QueryCancel::new()))?;
+        *lock(&self.path) = None;
+        self.install_cancels(Arc::new(QueryCancel::new()), Arc::new(QueryCancel::new()));
         Ok(())
     }
 
@@ -342,14 +330,23 @@ impl DbHandle {
 }
 
 fn close_writer(slot: &Mutex<Option<Workspace>>) -> Result<(), ApiError> {
-    let workspace = slot
-        .lock()
-        .map_err(|_| ApiError::internal("writer lock is poisoned"))?
-        .take();
+    let workspace = lock(slot).take();
     if let Some(workspace) = workspace {
         workspace.close().map_err(ApiError::from)?;
     }
     Ok(())
+}
+
+/// Locks a mutex, recovering the data and clearing poison if a previous
+/// holder panicked.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// Bounds concurrent read leases so the reader pool never grows past four.
@@ -401,5 +398,28 @@ impl Drop for ReadPermit<'_> {
 impl Drop for DbHandle {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock;
+    use std::sync::Mutex;
+
+    #[test]
+    fn lock_clears_poison_after_a_panic() {
+        let mutex = Mutex::new(1);
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().expect("lock");
+            panic!("poison the mutex");
+        });
+        assert!(poisoned.is_err());
+        assert!(mutex.is_poisoned());
+        {
+            let mut guard = lock(&mutex);
+            *guard = 2;
+        }
+        assert!(!mutex.is_poisoned());
+        assert_eq!(*mutex.lock().expect("recovered"), 2);
     }
 }

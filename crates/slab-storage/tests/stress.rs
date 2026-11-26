@@ -167,7 +167,7 @@ fn reserved_keyword_identifiers_survive_the_whole_lifecycle() {
 }
 
 #[test]
-fn hostile_identifiers_are_rejected_without_touching_the_workspace() {
+fn invalid_identifiers_are_rejected_without_touching_the_workspace() {
     let mut workspace = workspace();
     workspace
         .create_table(&TableDraft {
@@ -178,7 +178,7 @@ fn hostile_identifiers_are_rejected_without_touching_the_workspace() {
     let before = workspace.schema().expect("schema");
     let audit_before = workspace.audit_entries(100, 0).expect("audit").len();
 
-    let hostile = [
+    let invalid = [
         "\"quoted\"",
         "o'reilly",
         "a; DROP TABLE Clients; --",
@@ -193,18 +193,18 @@ fn hostile_identifiers_are_rejected_without_touching_the_workspace() {
         "",
         &"x".repeat(65),
     ];
-    for name in hostile {
+    for name in invalid {
         let create = workspace.create_table(&TableDraft {
             name: name.into(),
             columns: vec![text("Name")],
         });
-        assert!(create.is_err(), "create accepted hostile name {name:?}");
+        assert!(create.is_err(), "create accepted invalid name {name:?}");
         let rename = workspace.rename_table("Clients", name);
-        assert!(rename.is_err(), "rename accepted hostile name {name:?}");
+        assert!(rename.is_err(), "rename accepted invalid name {name:?}");
         let column = workspace.rename_column("Clients", "Name", name);
         assert!(
             column.is_err(),
-            "column rename accepted hostile name {name:?}"
+            "column rename accepted invalid name {name:?}"
         );
     }
 
@@ -252,7 +252,7 @@ fn fts_search_never_returns_a_raw_sqlite_syntax_error() {
         )
         .expect("row");
 
-    let hostile = [
+    let invalid = [
         "C++",
         "foo-bar",
         "northlight*",
@@ -274,7 +274,7 @@ fn fts_search_never_returns_a_raw_sqlite_syntax_error() {
         "north\0light",
         &"a".repeat(1_000),
     ];
-    for term in hostile {
+    for term in invalid {
         let result = workspace.search(term, 20);
         assert!(result.is_ok(), "search {term:?} failed: {result:?}");
     }
@@ -664,7 +664,7 @@ fn concurrent_external_writer_and_reader_keep_audit_and_integrity() {
 }
 
 #[test]
-fn hostile_workspace_files_fail_cleanly_without_mutation() {
+fn malformed_workspace_files_fail_cleanly_without_mutation() {
     let directory = tempfile::tempdir().expect("tempdir");
 
     let empty_path = directory.path().join("empty.slab");
@@ -758,7 +758,7 @@ fn hostile_workspace_files_fail_cleanly_without_mutation() {
 }
 
 #[test]
-fn deep_hostile_path_round_trips_workspace_backup_and_rows() {
+fn deep_path_round_trips_workspace_backup_and_rows() {
     let directory = tempfile::tempdir().expect("tempdir");
     let deep: PathBuf = directory
         .path()

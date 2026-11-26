@@ -652,6 +652,9 @@ fn collect_rows_bounded(
 struct ExportTemp {
     path: PathBuf,
     published: bool,
+    /// Device/inode captured when the scratch file was created, so a path
+    /// swap before publish is detected on Unix.
+    identity: Option<(u64, u64)>,
 }
 
 impl ExportTemp {
@@ -679,10 +682,20 @@ impl ExportTemp {
             ));
             match options.open(&path) {
                 Ok(file) => {
+                    #[cfg(unix)]
+                    let identity = {
+                        use std::os::unix::fs::MetadataExt;
+                        file.metadata()
+                            .ok()
+                            .map(|metadata| (metadata.dev(), metadata.ino()))
+                    };
+                    #[cfg(not(unix))]
+                    let identity = None;
                     return Ok((
                         Self {
                             path,
                             published: false,
+                            identity,
                         },
                         file,
                     ));
@@ -697,6 +710,15 @@ impl ExportTemp {
     }
 
     fn publish(mut self, target: &str) -> Result<(), ApiError> {
+        if let Some(expected) = self.identity {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&self.path)?;
+            if (metadata.dev(), metadata.ino()) != expected {
+                return Err(ApiError::internal(
+                    "the export scratch file was replaced before publishing",
+                ));
+            }
+        }
         // `rename` replaces the inode, which would otherwise replace a private
         // destination's permissions with the scratch file's default mode.
         if let Ok(metadata) = std::fs::metadata(target) {
@@ -728,10 +750,7 @@ fn csv_cell(value: &Value) -> String {
         value,
         Value::Text(_) | Value::Select(_) | Value::AttachmentRef(_)
     );
-    let formula_like = text
-        .chars()
-        .next()
-        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r' | '\n'));
+    let formula_like = slab_import::spreadsheet_guard_needed(&text);
     if text_like && formula_like {
         format!("'{text}")
     } else {
@@ -824,7 +843,12 @@ fn export_json_to(workspace: &Workspace, path: &str, mut query: PageQuery) -> Re
             let mut object = serde_json::Map::new();
             object.insert("id".into(), serde_json::Value::from(record.id));
             for (name, value) in &record.values {
-                object.insert(name.clone(), serde_json::to_value(value)?);
+                let encoded = if value.is_null() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::to_value(value)?
+                };
+                object.insert(name.clone(), encoded);
             }
             serde_json::to_writer(&mut out, &serde_json::Value::Object(object))?;
         }
@@ -839,13 +863,17 @@ fn export_json_to(workspace: &Workspace, path: &str, mut query: PageQuery) -> Re
     temporary.publish(path)
 }
 
+/// Dumps the workspace through the same scratch-and-publish contract as the
+/// CSV and JSON exports, so a failed dump cannot truncate an existing file.
+fn export_sql_to(workspace: &Workspace, path: &str) -> Result<(), ApiError> {
+    let (temporary, file) = ExportTemp::create(path)?;
+    workspace.export_sql_to(file)?;
+    temporary.publish(path)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn export_sql(state: State<'_, AppState>, path: String) -> Result<(), ApiError> {
-    run_read(&state, move |workspace| {
-        workspace.export_sql(&path)?;
-        Ok(())
-    })
-    .await
+    run_read(&state, move |workspace| export_sql_to(workspace, &path)).await
 }
 
 fn layout_for(schema: &Schema, table: &Table, layout_id: Option<&str>) -> Result<Layout, ApiError> {
@@ -1047,6 +1075,7 @@ mod tests {
                 ("Plus".to_owned(), Value::from("+1+1")),
                 ("At".to_owned(), Value::from("@SUM(A1)")),
                 ("Newline".to_owned(), Value::from("\n=SUM(A1)")),
+                ("Apostrophe".to_owned(), Value::from("'=1+1")),
             ]),
         };
         let columns = vec![
@@ -1055,6 +1084,7 @@ mod tests {
             "Plus".to_owned(),
             "At".to_owned(),
             "Newline".to_owned(),
+            "Apostrophe".to_owned(),
         ];
         let row = csv_record(&record, &columns);
         assert_eq!(row[0], "7");
@@ -1063,6 +1093,7 @@ mod tests {
         assert_eq!(row[3], "'+1+1");
         assert_eq!(row[4], "'@SUM(A1)");
         assert_eq!(row[5], "'\n=SUM(A1)");
+        assert_eq!(row[6], "''=1+1", "a literal apostrophe is doubled");
     }
 
     #[test]
@@ -1188,5 +1219,57 @@ mod permission_tests {
             0,
             "the scratch file for a private export is readable by others: {mode:o}"
         );
+    }
+
+    #[test]
+    fn sql_export_does_not_truncate_when_the_scratch_cannot_be_created() {
+        let workspace =
+            Workspace::open_in_memory("Export", Box::new(HybridLogicalClock::new("test")))
+                .expect("workspace");
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let parent = directory.path().join("locked");
+        fs::create_dir(&parent).expect("locked dir");
+        let target = parent.join("export.sql");
+        fs::write(&target, "keep me").expect("seed export");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).expect("lock dir");
+
+        let outcome = export_sql_to(&workspace, target.to_str().expect("path"));
+        // Make the directory removable again before any assertion can panic.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("unlock dir");
+
+        assert!(
+            outcome.is_err(),
+            "a scratch file in a read-only directory must fail"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("read export"),
+            "keep me",
+            "a failed SQL export truncated the previous file"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod scratch_identity_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn publishing_refuses_a_replaced_scratch_path() {
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let target = directory.path().join("export.csv");
+        let (temporary, file) =
+            ExportTemp::create(target.to_str().expect("path")).expect("scratch");
+        let scratch = temporary.path.clone();
+        drop(file);
+        std::fs::remove_file(&scratch).expect("unlink scratch");
+        let other = directory.path().join("other");
+        std::fs::write(&other, "attacker").expect("other file");
+        symlink(&other, &scratch).expect("symlink");
+        assert!(
+            temporary.publish(target.to_str().expect("path")).is_err(),
+            "a replaced scratch path was published"
+        );
+        assert!(!target.exists());
     }
 }

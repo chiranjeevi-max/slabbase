@@ -6,8 +6,19 @@ use crate::ast::{BinaryOp, Expr, UnaryOp};
 use crate::error::FormulaError;
 use crate::lexer::{Token, TokenKind, tokenize};
 
+/// Hard ceiling on formula source size. The parser is iterative, but a huge
+/// flat chain still allocates a token and node per operator before the depth
+/// check runs; reject it before tokenizing.
+const MAX_FORMULA_BYTES: usize = 16 * 1024;
+
 /// Parses a formula into an expression tree.
 pub fn parse(input: &str) -> Result<Expr, FormulaError> {
+    if input.len() > MAX_FORMULA_BYTES {
+        return Err(FormulaError::Parse {
+            message: format!("formula exceeds {MAX_FORMULA_BYTES} bytes"),
+            position: MAX_FORMULA_BYTES,
+        });
+    }
     let tokens = tokenize(input)?;
     let mut parser = Parser {
         tokens,
@@ -19,6 +30,24 @@ pub fn parse(input: &str) -> Result<Expr, FormulaError> {
         return Err(FormulaError::Parse {
             message: format!("unexpected {}", parser.peek().describe()),
             position: parser.position(),
+        });
+    }
+    // Parenthesis and unary nesting is bounded while parsing, but a flat
+    // operator chain (`1+1+…`) builds a left-deep tree iteratively. Enforce
+    // the same depth bound on the finished tree before any recursive consumer
+    // (typecheck, eval, rendering) or the drop path sees it.
+    if expression.expression_depth() > MAX_EXPRESSION_DEPTH {
+        return Err(FormulaError::Depth {
+            limit: MAX_EXPRESSION_DEPTH,
+        });
+    }
+    // Rendering escapes newlines and tabs, so a source that fits can render
+    // larger than the limit and then fail to re-parse as its own canonical
+    // form. Keep the round-trip inside the same ceiling.
+    if expression.to_string().len() > MAX_FORMULA_BYTES {
+        return Err(FormulaError::Parse {
+            message: format!("formula exceeds {MAX_FORMULA_BYTES} bytes when rendered"),
+            position: MAX_FORMULA_BYTES,
         });
     }
     Ok(expression)

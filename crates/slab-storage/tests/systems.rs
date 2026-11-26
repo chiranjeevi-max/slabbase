@@ -118,6 +118,10 @@ fn committed_fixture_migrates_and_verifies() {
     assert_eq!(report.integrity, "ok");
     assert!(report.audit_chain, "fixture audit chain did not migrate");
     assert!(report.audit_entries > 0);
+    assert_eq!(
+        workspace.info().expect("info").format_version,
+        slab_core::FORMAT_VERSION
+    );
     workspace.close().expect("close");
 }
 

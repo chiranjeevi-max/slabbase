@@ -123,7 +123,6 @@ impl Expr {
             _ => None,
         }
     }
-
     /// Collects bare (unqualified) column references in first-seen order.
     pub fn bare_columns(&self) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
@@ -158,40 +157,96 @@ impl Expr {
     /// Rewrites column references in place. `table` is `None` for bare
     /// references and `Some(relation)` for aggregate references.
     pub fn rewrite_column(&mut self, table: Option<&str>, from: &str, to: &str) {
-        match self {
-            Self::Column { table: owner, name } => {
-                if owner.as_deref() == table && name == from {
-                    *name = to.to_owned();
+        let mut stack: Vec<&mut Expr> = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Column { table: owner, name } => {
+                    if owner.as_deref() == table && name == from {
+                        *name = to.to_owned();
+                    }
                 }
-            }
-            Self::Unary { expr, .. } => expr.rewrite_column(table, from, to),
-            Self::Binary { left, right, .. } => {
-                left.rewrite_column(table, from, to);
-                right.rewrite_column(table, from, to);
-            }
-            Self::Call { args, .. } => {
-                for arg in args {
-                    arg.rewrite_column(table, from, to);
+                Self::Unary { expr, .. } => stack.push(expr),
+                Self::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
                 }
+                Self::Call { args, .. } => stack.extend(args.iter_mut()),
+                Self::Literal(_) => {}
             }
-            Self::Literal(_) => {}
         }
     }
 
     fn walk(&self, visit: &mut impl FnMut(&Expr)) {
-        visit(self);
-        match self {
-            Self::Literal(_) | Self::Column { .. } => {}
-            Self::Unary { expr, .. } => expr.walk(visit),
-            Self::Binary { left, right, .. } => {
-                left.walk(visit);
-                right.walk(visit);
+        // Iterative so a formula with a long operator chain cannot overflow
+        // the stack while collecting references.
+        let mut stack: Vec<&Expr> = vec![self];
+        while let Some(node) = stack.pop() {
+            visit(node);
+            match node {
+                Self::Literal(_) | Self::Column { .. } => {}
+                Self::Unary { expr, .. } => stack.push(expr),
+                Self::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+                Self::Call { args, .. } => stack.extend(args.iter().rev()),
             }
-            Self::Call { args, .. } => {
-                for arg in args {
-                    arg.walk(visit);
+        }
+    }
+
+    /// The maximum node depth of the tree, computed without recursion.
+    pub(crate) fn expression_depth(&self) -> u32 {
+        let mut maximum = 0;
+        let mut stack: Vec<(&Expr, u32)> = vec![(self, 1)];
+        while let Some((node, depth)) = stack.pop() {
+            maximum = maximum.max(depth);
+            let child_depth = depth.saturating_add(1);
+            match node {
+                Self::Literal(_) | Self::Column { .. } => {}
+                Self::Unary { expr, .. } => stack.push((expr, child_depth)),
+                Self::Binary { left, right, .. } => {
+                    stack.push((right, child_depth));
+                    stack.push((left, child_depth));
+                }
+                Self::Call { args, .. } => {
+                    for arg in args {
+                        stack.push((arg, child_depth));
+                    }
                 }
             }
+        }
+        maximum
+    }
+
+    /// Detaches every child into `stack`, leaving this node childless.
+    fn drain_children(&mut self, stack: &mut Vec<Expr>) {
+        match self {
+            Self::Unary { expr, .. } => {
+                stack.push(std::mem::replace(&mut **expr, Self::Literal(Value::Null)));
+            }
+            Self::Binary { left, right, .. } => {
+                stack.push(std::mem::replace(&mut **left, Self::Literal(Value::Null)));
+                stack.push(std::mem::replace(&mut **right, Self::Literal(Value::Null)));
+            }
+            Self::Call { args, .. } => stack.extend(std::mem::take(args)),
+            Self::Literal(_) | Self::Column { .. } => {}
+        }
+    }
+}
+
+/// Drops the tree iteratively.
+///
+/// A flat expression such as `1+1+…` is built as a left-deep tree. The derived
+/// recursive drop would exhaust the stack for a long formula (the parser is
+/// iterative, so parsing itself succeeds). Dismantling the tree with an
+/// explicit work list keeps drop O(n) and stack-constant; each node is dropped
+/// only after its children have been detached, so its own drop is shallow.
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        self.drain_children(&mut stack);
+        while let Some(mut node) = stack.pop() {
+            node.drain_children(&mut stack);
         }
     }
 }

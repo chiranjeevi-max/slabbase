@@ -212,7 +212,7 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | Portal density alignment | `portal rows keep density alignment during rapid appearance changes` |
 | Destructive error and recovery | `dropping a formula column reports an inline error and keeps state`, `relation-protected table drop, relation drop, and undo restore everything` |
 | Overlay focus return | `every overlay returns focus to its opener after Escape` |
-| Keyboard-only traversal | `keyboard-only navigation, hostile search, and undo routing` |
+| Keyboard-only traversal | `keyboard-only navigation, malformed search, and undo routing` |
 | IME and bidi safety | `IME composition Enter does not commit inline or inspector editors`, `mixed RTL and LTR text round-trips without clipping` |
 | App zoom and scaling | `125% and 150% app zoom keep every chrome surface contained` |
 | High contrast tokens | `high contrast preference strengthens borders and text contrast` |

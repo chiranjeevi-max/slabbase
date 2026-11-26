@@ -48,6 +48,46 @@ fn eval(expression: &str, context: &Context) -> Result<Value, FormulaError> {
 }
 
 #[test]
+fn money_division_rounds_once_at_the_money_scale() {
+    let context = Context::new(vec![(
+        "Price",
+        Value::Currency(
+            Money::from_minor(CurrencyCode::parse("USD").expect("usd"), 3).expect("money"),
+        ),
+    )]);
+    assert_eq!(
+        eval("[Price] / 2.000000001", &context).expect("divide"),
+        Value::Currency(
+            Money::from_minor(CurrencyCode::parse("USD").expect("usd"), 1).expect("money")
+        )
+    );
+}
+
+#[test]
+fn rejects_a_flat_operator_chain_beyond_the_depth_limit() {
+    // Parsing is iterative, but the resulting tree is left-deep. Without a
+    // depth check the recursive drop/typecheck consumers overflow the stack.
+    let expression = std::iter::repeat_n("1", 200).collect::<Vec<_>>().join("+");
+    let error = parse(&expression).expect_err("deep chain must be rejected");
+    assert!(
+        matches!(error, FormulaError::Depth { limit } if limit == slab_core::MAX_EXPRESSION_DEPTH),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn rejects_an_oversized_formula_source() {
+    let expression = std::iter::repeat_n("1", 20_000)
+        .collect::<Vec<_>>()
+        .join("+");
+    let error = parse(&expression).expect_err("oversized formula must be rejected");
+    assert!(
+        error.to_string().contains("exceeds"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn integer_boundaries_are_structured_errors_not_wraps() {
     let context = Context::new(vec![
         ("max", Value::Integer(i64::MAX)),
@@ -191,7 +231,7 @@ proptest! {
     }
 
     #[test]
-    fn adversarial_punctuation_never_panics(input in "[\\[\\](){}.,;:'\"*+\\-/%<>=!&|^_a-zA-Z0-9 ]{0,256}") {
+    fn arbitrary_punctuation_never_panics(input in "[\\[\\](){}.,;:'\"*+\\-/%<>=!&|^_a-zA-Z0-9 ]{0,256}") {
         let context = Context::new(vec![("a", Value::Integer(1))]);
         let _ = evaluate(&input, &context);
     }
@@ -258,4 +298,27 @@ fn renaming_back_to_a_bare_name_restores_the_bare_spelling() {
     .expect("rewrite");
     assert_eq!(qualified, "[Items].Price");
     assert!(slab_formula::parse(&qualified).is_ok());
+}
+
+#[test]
+fn attachment_refs_compare_as_text() {
+    let context = Context::new(vec![("Path", Value::AttachmentRef("/tmp/x".into()))]);
+    assert_eq!(
+        eval("[Path] = \"/tmp/x\"", &context).expect("equals"),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        eval("[Path] < \"/tmp/y\"", &context).expect("ordering"),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn rejects_source_that_renders_larger_than_the_limit() {
+    let source = format!("\"{}\"", "\n".repeat(9_000));
+    assert!(source.len() <= 16 * 1024);
+    assert!(
+        parse(&source).is_err(),
+        "an escaped literal must not exceed the limit when rendered"
+    );
 }

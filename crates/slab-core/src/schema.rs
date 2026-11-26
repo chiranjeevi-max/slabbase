@@ -545,6 +545,15 @@ impl Schema {
                     reason: format!("relation {}: child column must be stored", relation.name),
                 });
             }
+            if relation.on_delete == DeleteAction::SetNull {
+                // `create_relation` refuses SET NULL, and undo cannot restore
+                // the child foreign keys a SET NULL delete rewrites. Reject a
+                // foreign or hand-edited schema that contains one instead of
+                // silently producing an inexact undo.
+                return Err(CoreError::InvalidColumn {
+                    reason: format!("relation {}: SET NULL is not supported", relation.name),
+                });
+            }
         }
         for table in &self.tables {
             for column in &table.columns {
@@ -704,6 +713,30 @@ mod tests {
             layouts: Vec::new(),
         };
         assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_set_null_relations() {
+        let clients = table("Clients", &["Name"]);
+        let mut projects = table("Projects", &["Client"]);
+        projects.columns[0].ty = ColumnType::Integer;
+        let relation = Relation {
+            id: "r_set_null".into(),
+            name: "Client Projects".into(),
+            parent_table: "Clients".into(),
+            child_table: "Projects".into(),
+            child_column: "Client".into(),
+            on_delete: DeleteAction::SetNull,
+        };
+        let schema = Schema {
+            tables: vec![clients, projects],
+            relations: vec![relation],
+            layouts: Vec::new(),
+        };
+        assert!(
+            schema.validate().is_err(),
+            "SET NULL is not supported and must be rejected before a delete can mis-restore it"
+        );
     }
 
     #[test]

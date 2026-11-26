@@ -93,7 +93,7 @@ The release binary and bundle are `target/release/slabbase-desktop` and `target/
 
 - A bug fix needs a regression test that fails before the fix.
 - New behavior needs a focused unit or integration test; storage behavior also needs the release pagination/systems coverage.
-- Formula changes must keep the property tests, adversarial tests, and cycle ordering green.
+- Formula changes must keep the property tests, hardening tests, and cycle ordering green.
 - Storage changes must keep the external `sqlite3` integrity, foreign-key, audit-chain, and undo parity checks green.
 - UI changes must pass `test:ui` at the contract viewports, including reduced motion, high contrast, Glass opacity, and air-gapped boot.
 - Tests must not depend on the network, a real user workspace, or a machine-specific path. Use temporary directories and explicit fixtures.

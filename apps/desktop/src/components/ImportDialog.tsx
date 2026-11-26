@@ -5,6 +5,7 @@ import { api } from "../api";
 import { useFocusTrap } from "../focus";
 import { usePresence } from "../presence";
 import { errorText, useStore } from "../store";
+import { isComputedColumn } from "../types";
 import { Icon } from "./Icons";
 
 function defaultOptions(): ImportOptionsDto {
@@ -78,7 +79,9 @@ export function ImportDialog() {
     if (!table) return next;
     for (const source of sourceColumns) {
       const match = table.columns.find(
-        (column) => column.name.toLowerCase() === source.toLowerCase(),
+        (column) =>
+          !isComputedColumn(column) &&
+          column.name.toLowerCase() === source.toLowerCase(),
       );
       if (match) next[source] = match.name;
     }
@@ -346,7 +349,7 @@ export function ImportDialog() {
                       >
                         <option value="">Skip</option>
                         {targetDefinition?.columns
-                          .filter((candidate) => candidate.ty.kind !== "formula")
+                          .filter((candidate) => !isComputedColumn(candidate))
                           .map((candidate) => (
                             <option key={candidate.name} value={candidate.name}>
                               {candidate.name}

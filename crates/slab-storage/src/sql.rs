@@ -94,6 +94,44 @@ pub(crate) fn normalize_value(
     }
 }
 
+/// Checks that a policy replacement can still be stored in the column.
+///
+/// The read path may return a display-only replacement, but an export has to
+/// write a value the restored table can decode and its CHECK constraints can
+/// accept.
+pub(crate) fn ensure_value_fits(
+    value: &Value,
+    column_type: &ColumnType,
+) -> Result<(), StorageError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let fits = matches!(
+        (column_type, value),
+        (ColumnType::Text, Value::Text(_))
+            | (ColumnType::Select { .. }, Value::Select(_))
+            | (ColumnType::AttachmentRef, Value::AttachmentRef(_))
+            | (ColumnType::Integer, Value::Integer(_))
+            | (ColumnType::Boolean, Value::Boolean(_))
+            | (
+                ColumnType::Decimal { .. },
+                Value::Decimal(_) | Value::Integer(_)
+            )
+            | (ColumnType::Currency { .. }, Value::Currency(_))
+            | (ColumnType::Date, Value::Date(_))
+            | (ColumnType::Timestamp, Value::Timestamp(_))
+    );
+    if fits {
+        Ok(())
+    } else {
+        Err(StorageError::Query(format!(
+            "redacted value of type {} does not fit column type {}",
+            value.type_name(),
+            column_type.name()
+        )))
+    }
+}
+
 /// Encodes a normalized value as a bound SQLite parameter.
 pub(crate) fn encode_value(
     value: &Value,
@@ -151,9 +189,17 @@ pub(crate) fn decode_value(
     column_type: &ColumnType,
 ) -> Result<Value, StorageError> {
     match column_type {
-        ColumnType::Text | ColumnType::Select { .. } | ColumnType::AttachmentRef => {
+        ColumnType::Text => {
             let value: Option<String> = row.get(index)?;
             Ok(value.map_or(Value::Null, Value::Text))
+        }
+        ColumnType::Select { .. } => {
+            let value: Option<String> = row.get(index)?;
+            Ok(value.map_or(Value::Null, Value::Select))
+        }
+        ColumnType::AttachmentRef => {
+            let value: Option<String> = row.get(index)?;
+            Ok(value.map_or(Value::Null, Value::AttachmentRef))
         }
         ColumnType::Integer => {
             let value: Option<i64> = row.get(index)?;

@@ -27,6 +27,16 @@ const POW10: [i128; 10] = [
     1_000_000_000,
 ];
 
+/// Raises ten to `exponent`, rejecting values that do not fit an `i128`.
+fn pow10(exponent: u32) -> Result<i128, CoreError> {
+    if exponent > 38 {
+        return Err(CoreError::NumericOverflow {
+            operation: "scaling by a power of ten",
+        });
+    }
+    Ok(10_i128.pow(exponent))
+}
+
 /// How a rounded division resolves the discarded remainder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -227,11 +237,12 @@ impl Decimal {
     /// Checked addition. The result uses the larger input scale.
     pub fn checked_add(self, other: Self) -> Result<Self, CoreError> {
         let scale = self.scale.max(other.scale);
-        let left = i128::from(self.rescale(scale, RoundingMode::HalfEven)?.units);
-        let right = i128::from(other.rescale(scale, RoundingMode::HalfEven)?.units);
-        let sum = left.checked_add(right).ok_or(CoreError::NumericOverflow {
-            operation: "adding decimals",
-        })?;
+        let sum = self
+            .aligned_units(scale)?
+            .checked_add(other.aligned_units(scale)?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "adding decimals",
+            })?;
         Ok(Self {
             units: i64::try_from(sum).map_err(|_| CoreError::NumericOverflow {
                 operation: "adding decimals",
@@ -242,15 +253,28 @@ impl Decimal {
 
     /// Checked subtraction. The result uses the larger input scale.
     pub fn checked_sub(self, other: Self) -> Result<Self, CoreError> {
-        self.checked_add(Self {
-            units: other
-                .units
-                .checked_neg()
-                .ok_or(CoreError::NumericOverflow {
-                    operation: "negating a decimal",
-                })?,
-            scale: other.scale,
+        let scale = self.scale.max(other.scale);
+        let difference = self
+            .aligned_units(scale)?
+            .checked_sub(other.aligned_units(scale)?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "subtracting decimals",
+            })?;
+        Ok(Self {
+            units: i64::try_from(difference).map_err(|_| CoreError::NumericOverflow {
+                operation: "subtracting decimals",
+            })?,
+            scale,
         })
+    }
+
+    /// This coefficient widened to `scale` without rounding.
+    fn aligned_units(self, scale: u8) -> Result<i128, CoreError> {
+        i128::from(self.units)
+            .checked_mul(pow10(u32::from(scale - self.scale))?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "aligning decimal scales",
+            })
     }
 
     /// Checked multiplication. The result scale is the sum of input scales,
@@ -296,13 +320,26 @@ impl Decimal {
             return Err(CoreError::DivisionByZero);
         }
         let result_scale = self.scale.saturating_add(4).max(other.scale).min(MAX_SCALE);
-        let exponent = i32::from(self.scale) - i32::from(other.scale) - i32::from(result_scale);
+        let exponent = i32::from(other.scale) + i32::from(result_scale) - i32::from(self.scale);
+        let factor = pow10(exponent.unsigned_abs())?;
         let (numerator, denominator) = if exponent >= 0 {
-            let factor = POW10[usize::try_from(exponent).unwrap_or(0)];
-            (i128::from(self.units), i128::from(other.units) * factor)
+            (
+                i128::from(self.units)
+                    .checked_mul(factor)
+                    .ok_or(CoreError::NumericOverflow {
+                        operation: "dividing decimals",
+                    })?,
+                i128::from(other.units),
+            )
         } else {
-            let factor = POW10[usize::try_from(-exponent).unwrap_or(0)];
-            (i128::from(self.units) * factor, i128::from(other.units))
+            (
+                i128::from(self.units),
+                i128::from(other.units)
+                    .checked_mul(factor)
+                    .ok_or(CoreError::NumericOverflow {
+                        operation: "dividing decimals",
+                    })?,
+            )
         };
         let rounded = div_round(numerator, denominator, RoundingMode::HalfEven)?;
         Ok(Self {
@@ -319,12 +356,13 @@ impl Decimal {
             return Err(CoreError::DivisionByZero);
         }
         let scale = self.scale.max(other.scale);
-        let left = self.rescale(scale, RoundingMode::HalfEven)?;
-        let right = other.rescale(scale, RoundingMode::HalfEven)?;
-        Ok(Self {
-            units: left.units % right.units,
-            scale,
-        })
+        // Widen before aligning. Rescaling into an `i64` first rejected
+        // representable remainders (and panicked on `i64::MIN % -1`).
+        let units = i64::try_from(self.aligned_units(scale)? % other.aligned_units(scale)?)
+            .map_err(|_| CoreError::NumericOverflow {
+                operation: "taking a decimal remainder",
+            })?;
+        Ok(Self { units, scale })
     }
 
     /// Checked negation.
@@ -363,8 +401,7 @@ impl std::str::FromStr for Decimal {
 
 impl PartialEq for Decimal {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp_value(*other)
-            .is_some_and(|ordering| ordering.is_eq())
+        self.cmp_value(*other).is_eq()
     }
 }
 
@@ -378,16 +415,20 @@ impl PartialOrd for Decimal {
 
 impl Ord for Decimal {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cmp_value(*other).unwrap_or(std::cmp::Ordering::Equal)
+        self.cmp_value(*other)
     }
 }
 
 impl Decimal {
-    fn cmp_value(self, other: Self) -> Option<std::cmp::Ordering> {
+    fn cmp_value(self, other: Self) -> std::cmp::Ordering {
+        // Both coefficients are exact `i64` values aligned by at most nine
+        // decimal places, so the widened comparison always fits an `i128`.
+        // Rescaling into an `i64` first silently reported equal values when
+        // the aligned coefficient overflowed.
         let scale = self.scale.max(other.scale);
-        let left = i128::from(self.rescale(scale, RoundingMode::HalfEven).ok()?.units);
-        let right = i128::from(other.rescale(scale, RoundingMode::HalfEven).ok()?.units);
-        Some(left.cmp(&right))
+        let left = i128::from(self.units) * POW10[usize::from(scale - self.scale)];
+        let right = i128::from(other.units) * POW10[usize::from(scale - other.scale)];
+        left.cmp(&right)
     }
 }
 
@@ -642,6 +683,46 @@ impl Money {
         })
     }
 
+    /// Parses `Value::Currency` display text: `"USD 123.45"` or `"123.45"`,
+    /// rounded to the currency's minor-unit scale.
+    pub fn parse(text: &str, currency: CurrencyCode) -> Result<Self, CoreError> {
+        Self::from_decimal(currency, Self::parse_amount(text, currency)?)
+    }
+
+    /// Parses display text and rejects precision beyond the currency scale.
+    ///
+    /// Import rounds to the currency scale; a filter must not, because
+    /// `12.304` is not `12.30` for an equality or range test.
+    pub fn parse_exact(text: &str, currency: CurrencyCode) -> Result<Self, CoreError> {
+        let amount = Self::parse_amount(text, currency)?;
+        let money = Self::from_decimal(currency, amount)?;
+        if money.amount() != amount {
+            return Err(CoreError::InvalidDecimal {
+                input: text.to_owned(),
+            });
+        }
+        Ok(money)
+    }
+
+    fn parse_amount(text: &str, currency: CurrencyCode) -> Result<Decimal, CoreError> {
+        let trimmed = text.trim();
+        let amount = match trimmed.split_once(char::is_whitespace) {
+            Some((code, rest))
+                if code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_alphabetic()) =>
+            {
+                if !code.eq_ignore_ascii_case(currency.as_str()) {
+                    return Err(CoreError::CurrencyMismatch {
+                        left: code.to_ascii_uppercase(),
+                        right: currency.to_string(),
+                    });
+                }
+                rest.trim()
+            }
+            _ => trimmed,
+        };
+        Decimal::parse(amount)
+    }
+
     /// Converts a decimal to money at the currency's default scale, rounding
     /// half to even.
     pub fn from_decimal(currency: CurrencyCode, amount: Decimal) -> Result<Self, CoreError> {
@@ -691,10 +772,55 @@ impl Money {
 
     /// Multiplies by an exact decimal quantity and rounds to the money scale.
     pub fn checked_mul_decimal(self, quantity: Decimal) -> Result<Self, CoreError> {
-        let product = self.amount.checked_mul(quantity)?;
+        // Round once at the money scale. Going through `Decimal::checked_mul`
+        // first round-trips via MAX_SCALE and can turn 0.01499999997 into
+        // 0.02 instead of 0.01 (and falsely overflow a representable result).
+        let product = i128::from(self.amount.units())
+            .checked_mul(i128::from(quantity.units()))
+            .ok_or(CoreError::NumericOverflow {
+                operation: "multiplying money",
+            })?;
+        let rounded = div_round(
+            product,
+            pow10(u32::from(quantity.scale()))?,
+            RoundingMode::HalfEven,
+        )?;
         Ok(Self {
             currency: self.currency,
-            amount: product.rescale(self.amount.scale(), RoundingMode::HalfEven)?,
+            amount: Decimal::new(
+                i64::try_from(rounded).map_err(|_| CoreError::NumericOverflow {
+                    operation: "multiplying money",
+                })?,
+                self.amount.scale(),
+            )?,
+        })
+    }
+
+    /// Divides by an exact decimal quantity and rounds to the money scale.
+    pub fn checked_div_decimal(self, divisor: Decimal) -> Result<Self, CoreError> {
+        if divisor.is_zero() {
+            return Err(CoreError::DivisionByZero);
+        }
+        // Round once at the money scale: (units / 10^scale) ÷ (du / 10^ds)
+        // at the same scale is `units * 10^ds / du`.
+        let numerator = i128::from(self.amount.units())
+            .checked_mul(pow10(u32::from(divisor.scale()))?)
+            .ok_or(CoreError::NumericOverflow {
+                operation: "dividing money",
+            })?;
+        let rounded = div_round(
+            numerator,
+            i128::from(divisor.units()),
+            RoundingMode::HalfEven,
+        )?;
+        Ok(Self {
+            currency: self.currency,
+            amount: Decimal::new(
+                i64::try_from(rounded).map_err(|_| CoreError::NumericOverflow {
+                    operation: "dividing money",
+                })?,
+                self.amount.scale(),
+            )?,
         })
     }
 
@@ -773,16 +899,21 @@ impl Money {
         }
         let mut result = Vec::with_capacity(shares.len());
         for share in shares {
-            let magnitude = i64::try_from(share).map_err(|_| CoreError::Allocation {
+            // A single ratio can own the whole amount, including i64::MIN.
+            // Apply the sign in i128 before narrowing once.
+            let magnitude = i128::try_from(share).map_err(|_| CoreError::Allocation {
                 reason: "share out of range".into(),
             })?;
-            let units = if negative {
+            let signed = if negative {
                 magnitude.checked_neg().ok_or(CoreError::Allocation {
                     reason: "share out of range".into(),
                 })?
             } else {
                 magnitude
             };
+            let units = i64::try_from(signed).map_err(|_| CoreError::Allocation {
+                reason: "share out of range".into(),
+            })?;
             result.push(Self {
                 currency: self.currency,
                 amount: Decimal::new(units, self.amount.scale())?,

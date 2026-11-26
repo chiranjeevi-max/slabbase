@@ -61,8 +61,8 @@
 - Form PDF fields are single-line and truncate with an ellipsis; multi-paragraph notes do not flow across pages in v1.0.
 - Dropping a table that participates in a relation is blocked until the relation is dropped; undo restores the table and then the relation.
 - `MIN`/`MAX` rollups over a computed child column refresh lazily for the affected parent; stored child columns use the full incremental path.
-- The audit chain is tamper-evident, not tamper-proof against an attacker who rewrites the whole chain; SQLCipher and external anchoring are the v1.2 hardening step.
+- The audit chain is tamper-evident, not tamper-proof against an attacker who rewrites the whole chain or its format metadata; SQLCipher and external anchoring are the v1.2 hardening step.
 
 ## Compatibility policy
 
-Workspace format changes are additive within a major version. A newer build may add `_slab_*` tables or columns, but it will not rename or reinterpret existing user tables. An older build opens a file when the file's `format_version` is less than or equal to the build's supported version. A newer format is rejected rather than opened read-only, because silently hiding metadata leads to incomplete forms.
+Workspace format changes are additive within a major version. A newer build may add `_slab_*` tables or columns, but it will not rename or reinterpret existing user tables. An older build opens a file when the file's `format_version` is less than or equal to the build's supported version. A newer format is rejected rather than opened read-only, because silently hiding metadata leads to incomplete forms. Format 2 adds the audit hash scheme columns and is upgraded in one transaction on the first writable open; an older build refuses it.

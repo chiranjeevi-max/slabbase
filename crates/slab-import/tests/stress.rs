@@ -131,7 +131,7 @@ fn csv_bom_is_stripped_before_header_mapping() {
 }
 
 #[test]
-fn fifty_thousand_hostile_csv_rows_stream_in_bounded_batches() {
+fn fifty_thousand_quoted_csv_rows_stream_in_bounded_batches() {
     let mut source = String::with_capacity(8_000_000);
     source.push('\u{FEFF}');
     source.push_str("Name,Seats,Notes\r\n");

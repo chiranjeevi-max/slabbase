@@ -139,9 +139,6 @@ pub fn render_html(
     html.push_str("</div><div class=\"meta\">");
     let record_label = record_title(schema, table, &bundle.record);
     let _ = writeln!(html, "{}", escape_html(&record_label));
-    if let Some(subtitle) = &options.subtitle {
-        let _ = writeln!(html, "<div>{}</div>", escape_html(subtitle));
-    }
     html.push_str("</div></header>\n");
     html.push_str("<div class=\"grid\">\n");
     for item in layout.ordered_items() {
@@ -323,12 +320,13 @@ pub fn render_table_html_with_status(
         }
         html.push_str("</tr>");
     }
+    html.push_str("</tbody></table>");
     if truncated {
         html.push_str(
             "<p style=\"margin:14px 0 0;padding:8px 10px;border:1px solid #a23b2a;color:#a23b2a;font-size:9pt\">Export stopped at 25,000 rows. Filter the table to continue.</p>",
         );
     }
-    html.push_str("</tbody></table></body></html>");
+    html.push_str("</body></html>");
     Ok(html)
 }
 
@@ -381,15 +379,18 @@ pub fn render_pdf(
             continue;
         }
         // Group fields and labels that share a row so they render side by side.
+        // Stop at any other item on the same row (a portal or section): the
+        // outer loop must still draw it, not swallow it into this group.
         let row_y = item.y;
         let mut group: Vec<&LayoutItem> = Vec::new();
-        while index < ordered.len() && ordered[index].y == row_y {
-            if matches!(
+        while index < ordered.len()
+            && ordered[index].y == row_y
+            && matches!(
                 ordered[index].kind,
                 LayoutItemKind::Field { .. } | LayoutItemKind::Label { .. }
-            ) {
-                group.push(ordered[index]);
-            }
+            )
+        {
+            group.push(ordered[index]);
             index += 1;
         }
         if group.is_empty() {
@@ -889,6 +890,8 @@ fn write_pdf(page_width: f64, page_height: f64, pages: &[String]) -> Result<Vec<
         objects.push(format!(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width:.2} {page_height:.2}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {content_id} 0 R >>"
         ));
+        // `String::len` is the byte length, and every content byte is ASCII
+        // (non-WinAnsi text is octal-escaped), so this is the PDF stream size.
         objects.push(format!(
             "<< /Length {} >>\nstream\n{page}endstream",
             page.len()
@@ -1030,38 +1033,77 @@ const HELVETICA_WIDTHS: [u16; 95] = [
     222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
 ];
 
+/// Helvetica advance widths for the WinAnsi 0x80..0x9F block.
+const WINANSI_WIDTHS: [u16; 32] = [
+    556, 556, 222, 556, 333, 1000, 556, 556, 333, 1000, 667, 333, 1000, 556, 611, 556, 556, 222,
+    222, 333, 333, 350, 556, 1000, 333, 1000, 556, 333, 944, 556, 500, 667,
+];
+
+/// Helvetica advance widths for the WinAnsi Latin-1 block, 0xA0..=0xFF.
+const WINANSI_LATIN1_WIDTHS: [u16; 96] = [
+    278, 333, 556, 556, 556, 556, 260, 556, 333, 737, 370, 556, 584, 333, 737, 333, 400, 584, 333,
+    333, 333, 556, 537, 278, 333, 333, 365, 556, 834, 834, 834, 611, 667, 667, 667, 667, 667, 667,
+    1000, 722, 667, 667, 667, 667, 278, 278, 278, 278, 722, 722, 778, 778, 778, 778, 778, 584, 778,
+    722, 722, 722, 722, 667, 667, 611, 556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556,
+    278, 278, 278, 278, 556, 556, 556, 556, 556, 556, 556, 584, 611, 556, 556, 556, 556, 500, 556,
+    500,
+];
+
 fn count_to_f64(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
+fn byte_width(byte: u8) -> u64 {
+    if (32..=126).contains(&byte) {
+        u64::from(HELVETICA_WIDTHS[(byte - 32) as usize])
+    } else if (0x80..=0x9F).contains(&byte) {
+        u64::from(WINANSI_WIDTHS[(byte - 0x80) as usize])
+    } else if (0xA0..=0xFF).contains(&byte) {
+        u64::from(WINANSI_LATIN1_WIDTHS[(byte - 0xA0) as usize])
+    } else {
+        556
+    }
+}
+
+/// The rendered width of one source character after WinAnsi encoding or the
+/// deterministic ASCII fallback. A fallback such as `₹` → `INR` occupies
+/// three glyphs, not one.
+fn char_width(ch: char) -> u64 {
+    if let Some(byte) = winansi_byte(ch) {
+        return byte_width(byte);
+    }
+    if let Some(fallback) = ascii_fallback(ch) {
+        return fallback.bytes().map(byte_width).sum();
+    }
+    byte_width(b'?')
+}
+
 fn text_width(value: &str, size: f64) -> f64 {
-    let total: u32 = value
-        .chars()
-        .map(|ch| {
-            let code = ch as u32;
-            if (32..=126).contains(&code) {
-                u32::from(HELVETICA_WIDTHS[(code - 32) as usize])
-            } else {
-                556
-            }
-        })
-        .sum();
-    f64::from(total) * size / 1000.0
+    // Sum in u64: a single oversized token can exceed u32 in glyph units and
+    // wrap (or panic in debug) before the size is applied.
+    let total: u64 = value.chars().map(char_width).sum();
+    total as f64 * size / 1000.0
 }
 
 fn fit_text(value: &str, width: f64, size: f64) -> String {
     if width <= 0.0 || text_width(value, size) <= width {
         return value.to_owned();
     }
+    // Accumulate widths instead of rebuilding and re-measuring the growing
+    // candidate for every character; zero-width glyphs would otherwise force
+    // a full prefix rescan per character.
+    let ellipsis = text_width("…", size);
     let mut output = String::new();
+    let mut used = 0.0;
     for ch in value.chars() {
-        let candidate = format!("{output}{ch}…");
-        if text_width(&candidate, size) > width {
-            break;
+        let glyph = char_width(ch) as f64 * size / 1000.0;
+        if used + glyph + ellipsis > width {
+            output.push('…');
+            return output;
         }
         output.push(ch);
+        used += glyph;
     }
-    output.push('…');
     output
 }
 
@@ -1223,5 +1265,193 @@ mod tests {
         let money =
             Money::from_decimal(currency, Decimal::parse("12.50").expect("amount")).expect("money");
         assert_eq!(Value::Currency(money).display_string(), "USD 12.50");
+    }
+
+    #[test]
+    fn a_portal_sharing_a_row_with_a_field_is_not_dropped() {
+        use slab_core::{Column, ColumnType, DeleteAction, Relation};
+
+        let mut schema = Schema::default();
+        schema.tables.push(Table {
+            id: "t_invoices".into(),
+            name: "Invoices".into(),
+            columns: vec![Column {
+                id: "c_number".into(),
+                table: "Invoices".into(),
+                name: "Number".into(),
+                ty: ColumnType::Text,
+                required: false,
+                unique: false,
+                default: None,
+                position: 0,
+            }],
+            created_at: 0,
+        });
+        schema.tables.push(Table {
+            id: "t_items".into(),
+            name: "Items".into(),
+            columns: vec![
+                Column {
+                    id: "c_label".into(),
+                    table: "Items".into(),
+                    name: "Label".into(),
+                    ty: ColumnType::Text,
+                    required: false,
+                    unique: false,
+                    default: None,
+                    position: 0,
+                },
+                Column {
+                    id: "c_invoice".into(),
+                    table: "Items".into(),
+                    name: "Invoice".into(),
+                    ty: ColumnType::Integer,
+                    required: false,
+                    unique: false,
+                    default: None,
+                    position: 1,
+                },
+            ],
+            created_at: 0,
+        });
+        schema.relations.push(Relation {
+            id: "r_lines".into(),
+            name: "Invoice Items".into(),
+            parent_table: "Invoices".into(),
+            child_table: "Items".into(),
+            child_column: "Invoice".into(),
+            on_delete: DeleteAction::Cascade,
+        });
+        let layout = Layout {
+            id: "l".into(),
+            name: "Invoice".into(),
+            table: "Invoices".into(),
+            grid: GridSpec::default(),
+            items: vec![
+                LayoutItem {
+                    id: "field".into(),
+                    kind: LayoutItemKind::Field {
+                        column: "Number".into(),
+                    },
+                    x: 0,
+                    y: 0,
+                    w: 6,
+                    h: 2,
+                },
+                LayoutItem {
+                    id: "portal".into(),
+                    kind: LayoutItemKind::Portal {
+                        relation: "Invoice Items".into(),
+                        columns: vec!["Label".into()],
+                        rows: 3,
+                    },
+                    x: 6,
+                    y: 0,
+                    w: 6,
+                    h: 4,
+                },
+            ],
+            updated_at: 0,
+        };
+        let mut bundle = RecordBundle::new(Record {
+            id: 1,
+            values: [("Number".to_owned(), Value::Text("INV-1".into()))]
+                .into_iter()
+                .collect(),
+        });
+        bundle.portals.insert(
+            "Invoice Items".into(),
+            vec![Record {
+                id: 1,
+                values: [("Label".to_owned(), Value::Text("Line A".into()))]
+                    .into_iter()
+                    .collect(),
+            }],
+        );
+        let pdf = render_pdf(&schema, &layout, &bundle, &PrintOptions::default()).expect("pdf");
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("Invoice Items"), "portal heading is missing");
+        assert!(text.contains("Line A"), "portal row is missing");
+    }
+
+    #[test]
+    fn a_huge_token_does_not_overflow_width_arithmetic() {
+        let width = text_width(&"@".repeat(8_000_000), 9.0);
+        assert!(width > 1.0e7);
+    }
+
+    #[test]
+    fn fitting_text_keeps_a_value_that_exactly_fits() {
+        let value = "AAAA";
+        let width = text_width(value, 9.0);
+        assert_eq!(fit_text(value, width, 9.0), value);
+    }
+
+    #[test]
+    fn winansi_punctuation_uses_its_rendered_width() {
+        assert_eq!(char_width('–'), 556);
+        assert_eq!(char_width('—'), 1000);
+    }
+
+    #[test]
+    fn winansi_latin1_uses_its_rendered_width() {
+        assert_eq!(char_width('\u{A0}'), 278);
+        assert_eq!(char_width('é'), 556);
+        assert_eq!(char_width('æ'), 889);
+        assert_eq!(char_width('ÿ'), 500);
+    }
+
+    #[test]
+    fn fitting_zero_width_text_terminates_and_truncates() {
+        let value = format!("{}{}", "\u{200B}".repeat(50_000), "@".repeat(50_000));
+        let started = std::time::Instant::now();
+        let fitted = fit_text(&value, 200.0, 9.0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(fitted.ends_with('…'));
+        assert!(text_width(&fitted, 9.0) <= 200.0 + 10.0);
+    }
+
+    #[test]
+    fn a_subtitle_is_rendered_once() {
+        let (schema, layout, bundle) = schema_and_bundle();
+        let options = PrintOptions {
+            subtitle: Some("Quarterly".into()),
+            ..PrintOptions::default()
+        };
+        let html = render_html(&schema, &layout, &bundle, &options).expect("html");
+        assert_eq!(html.matches("Quarterly").count(), 1);
+    }
+
+    #[test]
+    fn a_truncation_notice_is_outside_the_table_body() {
+        let mut schema = Schema::default();
+        schema.tables.push(Table {
+            id: "t_items".into(),
+            name: "Items".into(),
+            columns: vec![Column {
+                id: "c_name".into(),
+                table: "Items".into(),
+                name: "Name".into(),
+                ty: slab_core::ColumnType::Text,
+                required: false,
+                unique: false,
+                default: None,
+                position: 0,
+            }],
+            created_at: 0,
+        });
+        let rows = vec![Record {
+            id: 1,
+            values: [("Name".to_owned(), Value::Text("Only".into()))]
+                .into_iter()
+                .collect(),
+        }];
+        let html =
+            render_table_html_with_status(&schema, "Items", &rows, &PrintOptions::default(), true)
+                .expect("html");
+        let notice = html.find("Export stopped").expect("notice");
+        let close_body = html.find("</tbody>").expect("tbody");
+        let close_table = html.find("</table>").expect("table");
+        assert!(notice > close_body && notice > close_table);
     }
 }
