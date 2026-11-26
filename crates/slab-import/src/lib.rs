@@ -22,11 +22,29 @@ use slab_core::{
 /// Characters a spreadsheet treats as the start of a formula.
 pub const SPREADSHEET_PREFIXES: [char; 7] = ['=', '+', '-', '@', '\t', '\r', '\n'];
 
-/// Removes the apostrophe `csv_cell` adds to a spreadsheet-formula prefix.
+/// Whether `csv_cell` must prefix `text` with an apostrophe.
+///
+/// A literal leading apostrophe is doubled so the guard stays reversible even
+/// when the original text already begins with one.
+pub fn spreadsheet_guard_needed(text: &str) -> bool {
+    text.trim_start_matches('\'')
+        .starts_with(&SPREADSHEET_PREFIXES[..])
+}
+
+/// Removes the single apostrophe `csv_cell` adds to a spreadsheet-formula
+/// prefix. Text that was not guarded is returned unchanged.
 pub fn unguard_spreadsheet_text(text: &str) -> &str {
-    text.strip_prefix('\'')
-        .filter(|rest| rest.starts_with(&SPREADSHEET_PREFIXES[..]))
-        .unwrap_or(text)
+    let Some(rest) = text.strip_prefix('\'') else {
+        return text;
+    };
+    if rest
+        .trim_start_matches('\'')
+        .starts_with(&SPREADSHEET_PREFIXES[..])
+    {
+        rest
+    } else {
+        text
+    }
 }
 
 /// Supported import formats.
@@ -897,7 +915,9 @@ fn convert_row(
             {
                 Ok(Value::Null)
             }
-            Some(SourceValue::Text(text)) => convert_value(text, &column.ty),
+            Some(SourceValue::Text(text)) => {
+                convert_value(text, &column.ty, row.empty_text_is_null)
+            }
             Some(SourceValue::Json(json)) => convert_json(json, &column.ty),
         };
         let value = match converted {
@@ -949,7 +969,7 @@ fn convert_json(value: &serde_json::Value, column_type: &ColumnType) -> Result<V
         _ => None,
     };
     if let Some(text) = scalar {
-        return convert_value(&text, column_type);
+        return convert_value(&text, column_type, false);
     }
     let text_like = matches!(
         column_type,
@@ -958,7 +978,7 @@ fn convert_json(value: &serde_json::Value, column_type: &ColumnType) -> Result<V
     match serde_json::from_value::<Value>(value.clone()) {
         Ok(typed) if typed.is_null() => Ok(Value::Null),
         Ok(typed) if column_type.accepts(&typed) => Ok(typed),
-        _ if text_like => convert_value(&value.to_string(), column_type),
+        _ if text_like => convert_value(&value.to_string(), column_type, false),
         Ok(_) => Err(format!(
             "value {value} does not fit column type {}",
             column_type.name()
@@ -970,22 +990,27 @@ fn convert_json(value: &serde_json::Value, column_type: &ColumnType) -> Result<V
     }
 }
 
-fn convert_value(text: &str, column_type: &ColumnType) -> Result<Value, String> {
+fn convert_value(text: &str, column_type: &ColumnType, spreadsheet: bool) -> Result<Value, String> {
     let trimmed = text.trim();
+    let unguard = |value: &str| {
+        if spreadsheet {
+            unguard_spreadsheet_text(value).to_owned()
+        } else {
+            value.to_owned()
+        }
+    };
     match column_type {
-        ColumnType::Text => Ok(Value::Text(text.to_owned())),
-        ColumnType::AttachmentRef => Ok(Value::AttachmentRef(
-            unguard_spreadsheet_text(text).to_owned(),
-        )),
+        ColumnType::Text => Ok(Value::Text(unguard(text))),
+        ColumnType::AttachmentRef => Ok(Value::AttachmentRef(unguard(text))),
         ColumnType::Select { options } => {
             // A select option that starts with a spreadsheet-formula
             // character was protected with an apostrophe on export. Try the
             // unguarded text first, then the literal text (an option may
             // itself start with an apostrophe).
-            let candidate = unguard_spreadsheet_text(trimmed);
+            let candidate = unguard(trimmed);
             if let Some(option) = options
                 .iter()
-                .find(|option| *option == candidate || *option == trimmed)
+                .find(|option| **option == candidate || (spreadsheet && *option == trimmed))
             {
                 Ok(Value::Select(option.clone()))
             } else {
@@ -1105,6 +1130,21 @@ mod tests {
             ],
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn spreadsheet_guards_are_reversible() {
+        for text in ["=1+1", "'=1+1", "''=1+1", "'hello", "plain"] {
+            let guarded = if spreadsheet_guard_needed(text) {
+                format!("'{text}")
+            } else {
+                text.to_owned()
+            };
+            assert_eq!(unguard_spreadsheet_text(&guarded), text);
+        }
+        assert!(!spreadsheet_guard_needed("hello"));
+        assert!(spreadsheet_guard_needed("=1+1"));
+        assert!(spreadsheet_guard_needed("'=1+1"));
     }
 
     #[test]

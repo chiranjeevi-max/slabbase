@@ -71,16 +71,15 @@ fn a_csv_currency_export_can_be_imported_back() {
         created_at: 0,
     };
     let mapping = std::collections::BTreeMap::from([("Amount".to_owned(), "Amount".to_owned())]);
-    let report = slab_import::validate(
-        &mut CsvAdapter,
-        &mut "Amount\nUSD 123.45\n".as_bytes(),
-        &ImportOptions::default(),
-        &table,
-        &mapping,
-    )
-    .expect("validate");
-    assert_eq!(report.rows, 1);
-    assert_eq!(report.valid_rows, 1, "issues: {:?}", report.issues);
+    let rows = apply_rows(&mut CsvAdapter, "Amount\nUSD 123.45\n", &table, &mapping);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("Amount"),
+        Some(&Value::Currency(
+            slab_core::Money::from_minor(CurrencyCode::parse("USD").expect("usd"), 12_345,)
+                .expect("money"),
+        ))
+    );
 }
 
 #[test]
@@ -337,6 +336,28 @@ fn a_guarded_csv_select_and_attachment_round_trip() {
     assert_eq!(
         rows[0].get("Path"),
         Some(&Value::AttachmentRef("=file.pdf".into()))
+    );
+}
+
+#[test]
+fn csv_text_guards_round_trip_exactly() {
+    let table = single_text_table(false);
+    let source = "Body\n'=1+1\n''=1+1\n'''=1+1\n'hello\n";
+    let rows = apply_rows(
+        &mut CsvAdapter,
+        source,
+        &table,
+        &std::collections::BTreeMap::from([("Body".to_owned(), "Body".to_owned())]),
+    );
+    let values: Vec<&Value> = rows.iter().filter_map(|row| row.get("Body")).collect();
+    assert_eq!(
+        values,
+        vec![
+            &Value::Text("=1+1".into()),
+            &Value::Text("'=1+1".into()),
+            &Value::Text("''=1+1".into()),
+            &Value::Text("'hello".into()),
+        ]
     );
 }
 

@@ -750,7 +750,7 @@ fn csv_cell(value: &Value) -> String {
         value,
         Value::Text(_) | Value::Select(_) | Value::AttachmentRef(_)
     );
-    let formula_like = text.starts_with(&slab_import::SPREADSHEET_PREFIXES[..]);
+    let formula_like = slab_import::spreadsheet_guard_needed(&text);
     if text_like && formula_like {
         format!("'{text}")
     } else {
@@ -1075,6 +1075,7 @@ mod tests {
                 ("Plus".to_owned(), Value::from("+1+1")),
                 ("At".to_owned(), Value::from("@SUM(A1)")),
                 ("Newline".to_owned(), Value::from("\n=SUM(A1)")),
+                ("Apostrophe".to_owned(), Value::from("'=1+1")),
             ]),
         };
         let columns = vec![
@@ -1083,6 +1084,7 @@ mod tests {
             "Plus".to_owned(),
             "At".to_owned(),
             "Newline".to_owned(),
+            "Apostrophe".to_owned(),
         ];
         let row = csv_record(&record, &columns);
         assert_eq!(row[0], "7");
@@ -1091,6 +1093,7 @@ mod tests {
         assert_eq!(row[3], "'+1+1");
         assert_eq!(row[4], "'@SUM(A1)");
         assert_eq!(row[5], "'\n=SUM(A1)");
+        assert_eq!(row[6], "''=1+1", "a literal apostrophe is doubled");
     }
 
     #[test]
