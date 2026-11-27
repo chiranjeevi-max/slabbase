@@ -213,26 +213,46 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{Column, ColumnType, DeleteAction, Relation, Table};
 
-    #[test]
-    fn rejects_items_outside_the_grid() {
-        let mut schema = Schema::default();
-        schema.tables.push(crate::schema::Table {
-            id: "t".into(),
-            name: "Clients".into(),
-            columns: vec![crate::schema::Column {
-                id: "c".into(),
-                table: "Clients".into(),
-                name: "Name".into(),
-                ty: crate::schema::ColumnType::Text,
+    fn table(name: &str, column: &str, ty: ColumnType) -> Table {
+        Table {
+            id: format!("t_{name}"),
+            name: name.into(),
+            columns: vec![Column {
+                id: format!("c_{column}"),
+                table: name.into(),
+                name: column.into(),
+                ty,
                 required: false,
                 unique: false,
                 default: None,
                 position: 0,
             }],
             created_at: 0,
-        });
-        let layout = Layout {
+        }
+    }
+
+    fn schema() -> Schema {
+        Schema {
+            tables: vec![
+                table("Clients", "Name", ColumnType::Text),
+                table("Projects", "Client", ColumnType::Integer),
+            ],
+            relations: vec![Relation {
+                id: "r".into(),
+                name: "Client Projects".into(),
+                parent_table: "Clients".into(),
+                child_table: "Projects".into(),
+                child_column: "Client".into(),
+                on_delete: DeleteAction::Cascade,
+            }],
+            layouts: Vec::new(),
+        }
+    }
+
+    fn layout() -> Layout {
+        Layout {
             id: "l".into(),
             name: "Client".into(),
             table: "Clients".into(),
@@ -244,11 +264,137 @@ mod tests {
                 },
                 x: 10,
                 y: 0,
-                w: 4,
+                w: 2,
                 h: 1,
             }],
             updated_at: 0,
+        }
+    }
+
+    fn assert_invalid(result: Result<(), CoreError>, expected: &str) {
+        match result.expect_err(expected) {
+            CoreError::InvalidLayout { reason } => assert_eq!(reason, expected),
+            other => panic!("expected invalid layout for {expected}, got {other}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_zero_grid_dimension() {
+        let schema = schema();
+        for (columns, row_height) in [(0, 28), (12, 0)] {
+            let mut layout = layout();
+            layout.grid = GridSpec {
+                columns,
+                row_height,
+            };
+            assert_invalid(
+                layout.validate(&schema),
+                "grid must have at least one column and one row unit",
+            );
+        }
+    }
+
+    #[test]
+    fn validates_item_size_and_right_edge() {
+        let schema = schema();
+        layout()
+            .validate(&schema)
+            .expect("item may end at the grid edge");
+
+        for (x, w, h, reason) in [
+            (10, 0, 1, "item i has zero size"),
+            (10, 2, 0, "item i has zero size"),
+            (10, 4, 1, "item i exceeds 12 grid columns"),
+            (0, 13, 1, "item i exceeds 12 grid columns"),
+        ] {
+            let mut layout = layout();
+            let item = &mut layout.items[0];
+            item.x = x;
+            item.w = w;
+            item.h = h;
+            assert_invalid(layout.validate(&schema), reason);
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_item_ids() {
+        let mut layout = layout();
+        layout.items.push(layout.items[0].clone());
+        assert_invalid(layout.validate(&schema()), "duplicate item id i");
+    }
+
+    #[test]
+    fn validates_static_text() {
+        let schema = schema();
+        for (kind, reason) in [
+            (
+                LayoutItemKind::Label {
+                    text: "Clients".into(),
+                },
+                None,
+            ),
+            (
+                LayoutItemKind::Section {
+                    title: "Details".into(),
+                },
+                None,
+            ),
+            (
+                LayoutItemKind::Label { text: " \t".into() },
+                Some("item i has an empty label"),
+            ),
+            (
+                LayoutItemKind::Section {
+                    title: " \t".into(),
+                },
+                Some("item i has an empty section title"),
+            ),
+        ] {
+            let mut layout = layout();
+            layout.items[0].kind = kind;
+            match reason {
+                None => layout.validate(&schema).expect("nonblank static text"),
+                Some(reason) => assert_invalid(layout.validate(&schema), reason),
+            }
+        }
+    }
+
+    #[test]
+    fn portal_must_use_a_relation_owned_by_the_forms_table() {
+        let schema = schema();
+        let mut layout = layout();
+        layout.items[0].kind = LayoutItemKind::Portal {
+            relation: "Client Projects".into(),
+            columns: vec!["Client".into()],
+            rows: 3,
         };
-        assert!(layout.validate(&schema).is_err());
+        layout.validate(&schema).expect("portal on parent table");
+
+        layout.table = "Projects".into();
+        assert_invalid(
+            layout.validate(&schema),
+            "item i: relation Client Projects does not belong to Projects",
+        );
+    }
+
+    #[test]
+    fn orders_items_by_row_column_and_id() {
+        let mut layout = layout();
+        let field = layout.items[0].clone();
+        layout.items = [("bottom", 1, 0), ("right", 0, 2), ("b", 0, 0), ("a", 0, 0)]
+            .into_iter()
+            .map(|(id, y, x)| LayoutItem {
+                id: id.into(),
+                y,
+                x,
+                ..field.clone()
+            })
+            .collect();
+        let ordered: Vec<_> = layout
+            .ordered_items()
+            .into_iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ordered, ["a", "b", "right", "bottom"]);
     }
 }

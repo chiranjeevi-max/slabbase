@@ -216,4 +216,111 @@ mod tests {
         let decoded: Value = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, value);
     }
+
+    #[test]
+    fn cell_values_keep_stable_names_and_display_strings() {
+        let decimal = Decimal::parse("12.50").expect("decimal");
+        let eur = crate::CurrencyCode::parse("EUR").expect("currency");
+        let money = Money::from_minor(eur, -1_250).expect("money");
+        let date = SlabDate::parse("2026-11-27").expect("date");
+        let timestamp = SlabTimestamp::from_millis(-1);
+
+        for (value, type_name, display) in [
+            (Value::Null, "null", ""),
+            (Value::from("Jones"), "text", "Jones"),
+            (Value::Integer(1_375), "integer", "1375"),
+            (Value::Decimal(decimal), "decimal", "12.50"),
+            (Value::Currency(money), "currency", "EUR -12.50"),
+            (Value::Boolean(true), "boolean", "true"),
+            (Value::Boolean(false), "boolean", "false"),
+            (Value::Date(date), "date", "2026-11-27"),
+            (
+                Value::Timestamp(timestamp),
+                "timestamp",
+                "1969-12-31T23:59:59.999Z",
+            ),
+            (Value::Select("open".into()), "select", "open"),
+            (
+                Value::AttachmentRef("invoice.pdf".into()),
+                "attachment",
+                "invoice.pdf",
+            ),
+        ] {
+            assert_eq!(value.type_name(), type_name);
+            assert_eq!(value.display_string(), display);
+            assert_eq!(value.is_null(), value == Value::Null);
+        }
+    }
+
+    #[test]
+    fn typed_accessors_preserve_values_and_widen_only_integers() {
+        let decimal = Decimal::parse("12.50").expect("decimal");
+        let eur = crate::CurrencyCode::parse("EUR").expect("currency");
+        let money = Money::from_minor(eur, 1_250).expect("money");
+        let date = SlabDate::parse("2026-11-27").expect("date");
+        let timestamp = SlabTimestamp::from_millis(1_000);
+        let integer = Value::Integer(-42);
+
+        assert_eq!(Value::from("Jones").as_text(), Some("Jones"));
+        assert_eq!(Value::Select("open".into()).as_text(), Some("open"));
+        assert_eq!(
+            Value::AttachmentRef("invoice.pdf".into()).as_text(),
+            Some("invoice.pdf")
+        );
+        assert_eq!(integer.as_integer(), Some(-42));
+        assert_eq!(integer.as_decimal(), Some(Decimal::from_integer(-42)));
+        assert_eq!(Value::Boolean(true).as_boolean(), Some(true));
+        assert_eq!(Value::Boolean(false).as_boolean(), Some(false));
+        assert_eq!(Value::Decimal(decimal).as_decimal(), Some(decimal));
+        assert_eq!(Value::Currency(money).as_decimal(), None);
+        assert_eq!(Value::Currency(money).as_money(), Some(money));
+        assert_eq!(Value::Date(date).as_date(), Some(date));
+        assert_eq!(Value::Timestamp(timestamp).as_timestamp(), Some(timestamp));
+
+        assert_eq!(Value::Null.as_text(), None);
+        assert_eq!(Value::Null.as_integer(), None);
+        assert_eq!(Value::Null.as_decimal(), None);
+        assert_eq!(Value::Null.as_boolean(), None);
+        assert_eq!(Value::Null.as_money(), None);
+        assert_eq!(Value::Null.as_date(), None);
+        assert_eq!(Value::Null.as_timestamp(), None);
+    }
+
+    #[test]
+    fn formula_truthiness_respects_zero_and_empty_values() {
+        let eur = crate::CurrencyCode::parse("EUR").expect("currency");
+        let zero = Decimal::parse("0.00").expect("decimal");
+        let negative = Decimal::parse("-0.01").expect("decimal");
+
+        for (value, expected) in [
+            (Value::Null, false),
+            (Value::Boolean(false), false),
+            (Value::Boolean(true), true),
+            (Value::Integer(0), false),
+            (Value::Integer(-1), true),
+            (Value::Decimal(zero), false),
+            (Value::Decimal(negative), true),
+            (
+                Value::Currency(Money::from_minor(eur, 0).expect("money")),
+                false,
+            ),
+            (
+                Value::Currency(Money::from_minor(eur, -1).expect("money")),
+                true,
+            ),
+            (Value::from(""), false),
+            (Value::from("Jones"), true),
+            (Value::Select(String::new()), false),
+            (Value::Select("open".into()), true),
+            (Value::AttachmentRef(String::new()), false),
+            (Value::AttachmentRef("invoice.pdf".into()), true),
+            (
+                Value::Date(SlabDate::from_days_since_epoch(0).expect("date")),
+                true,
+            ),
+            (Value::Timestamp(SlabTimestamp::from_millis(0)), true),
+        ] {
+            assert_eq!(value.is_truthy(), expected, "{value:?}");
+        }
+    }
 }

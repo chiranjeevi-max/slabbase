@@ -43,8 +43,7 @@ impl SlabDate {
 
     /// Builds a date from days since 1970-01-01.
     pub fn from_days_since_epoch(days: i32) -> Result<Self, CoreError> {
-        let (year, _, _) = civil_from_days(i64::from(days));
-        if !(1..=9999).contains(&year) {
+        if !(MIN_SUPPORTED_DAYS..=MAX_SUPPORTED_DAYS).contains(&i64::from(days)) {
             return Err(CoreError::InvalidDate("date out of range".into()));
         }
         Ok(Self { days })
@@ -160,7 +159,7 @@ impl SlabTimestamp {
         self.millis
     }
 
-    /// Builds a timestamp from calendar fields. Millis are clamped to 0..=999.
+    /// Builds a timestamp from calendar fields, rejecting invalid clock fields.
     pub fn from_parts(
         year: i32,
         month: u8,
@@ -383,8 +382,10 @@ const fn days_in_month(year: i32, month: u8) -> u8 {
 }
 
 fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    // Validated years begin at 1, so shifting January and February cannot
+    // make the year negative.
     let year = i64::from(year) - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let era = year / 400;
     let year_of_era = year - era * 400;
     let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
@@ -393,12 +394,9 @@ fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
 }
 
 fn civil_from_days(days: i64) -> (i32, u8, u8) {
+    // The supported era begins on 0001-01-01, after the algorithm's origin.
     let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
+    let era = shifted / 146_097;
     let day_of_era = shifted - era * 146_097;
     let year_of_era =
         (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
@@ -454,6 +452,35 @@ mod tests {
     }
 
     #[test]
+    fn calendar_boundaries_match_unix_days() {
+        for (input, days) in [
+            ("0001-01-01", -719_162),
+            ("0400-02-29", -573_372),
+            ("1600-12-31", -134_775),
+            ("1900-02-28", -25_509),
+            ("2000-03-01", 11_017),
+            ("9999-12-31", 2_932_896),
+        ] {
+            let date = SlabDate::parse(input).expect("date");
+            assert_eq!(date.days_since_epoch(), days, "{input}");
+            assert_eq!(SlabDate::from_days_since_epoch(days).expect("date"), date);
+            assert_eq!(date.to_string(), input);
+        }
+        assert!(SlabDate::from_days_since_epoch(-719_163).is_err());
+        assert!(SlabDate::from_days_since_epoch(2_932_897).is_err());
+    }
+
+    #[test]
+    fn calendar_parse_requires_both_hyphens() {
+        for invalid in ["2024/02-29", "2024-02/29", "2024-02"] {
+            assert!(matches!(
+                SlabDate::parse(invalid),
+                Err(CoreError::InvalidDate(_))
+            ));
+        }
+    }
+
+    #[test]
     fn timestamp_round_trip() {
         let stamp = SlabTimestamp::parse("2026-11-25T09:12:44.017Z").expect("stamp");
         assert_eq!(stamp.iso(), "2026-11-25T09:12:44.017Z");
@@ -465,6 +492,48 @@ mod tests {
     fn negative_timestamps_are_utc_correct() {
         let stamp = SlabTimestamp::from_millis(-1);
         assert_eq!(stamp.iso(), "1969-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn timestamp_validates_each_clock_field() {
+        let last = SlabTimestamp::from_parts(1970, 1, 1, 23, 59, 59, 999).expect("timestamp");
+        assert_eq!(last.millis(), 86_399_999);
+        assert_eq!(last.to_string(), "1970-01-01T23:59:59.999Z");
+        assert_eq!(last.display_minute(), "1970-01-01 23:59");
+        for (hour, minute, second, millis) in [
+            (24, 0, 0, 0),
+            (0, 60, 0, 0),
+            (0, 0, 60, 0),
+            (0, 0, 0, 1_000),
+        ] {
+            assert!(matches!(
+                SlabTimestamp::from_parts(1970, 1, 1, hour, minute, second, millis),
+                Err(CoreError::InvalidDate(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn timestamp_rejects_incorrect_clock_separators() {
+        for invalid in [
+            "1970-01-01_23:59:59Z",
+            "1970-01-01T23-59:59Z",
+            "1970-01-01T23:59-59Z",
+        ] {
+            assert!(matches!(
+                SlabTimestamp::parse(invalid),
+                Err(CoreError::InvalidDate(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn date_and_timestamp_report_expected_json_string_formats() {
+        let date = serde_json::from_str::<SlabDate>("0").expect_err("date must be a string");
+        let stamp =
+            serde_json::from_str::<SlabTimestamp>("0").expect_err("timestamp must be a string");
+        assert!(date.to_string().contains("YYYY-MM-DD"));
+        assert!(stamp.to_string().contains("RFC 3339"));
     }
 
     #[test]

@@ -32,10 +32,10 @@ jobs:
           toolchain: stable
       - name: Cache Rust build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Install audit and mutation tools
+      - name: Install cargo-deny
         uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2
         with:
-          tool: cargo-deny,cargo-mutants
+          tool: cargo-deny
       - name: Audit dependencies
         run: cargo deny check
       - name: High-iteration formula fuzzing
@@ -46,14 +46,37 @@ jobs:
       - name: Run systems benchmarks
         timeout-minutes: 30
         run: cargo run --release -p slab-storage --example systems_bench
+
+  mutation:
+    name: Mutation tests (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2
+        with:
+          tool: cargo-mutants
       - name: Run mutation tests
         timeout-minutes: 120
-        run: cargo mutants --package slab-core --package slab-formula --timeout 180 --jobs 2
+        env:
+          # A mutant can allocate indefinitely. Bound each test process so the runner survives.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=1073741824 --core=0 --
+        run: cargo mutants --package slab-core --package slab-formula --timeout 180 --jobs 1 --shard ${{ matrix.shard }}/4
       - name: Upload mutation report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mutants
+          name: mutants-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: mutants.out
           if-no-files-found: ignore
           retention-days: 14

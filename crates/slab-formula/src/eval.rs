@@ -65,30 +65,16 @@ fn eval(expression: &Expr, context: &dyn EvalContext, depth: u32) -> Result<Valu
                 UnaryOp::Not => Ok(Value::Boolean(!value.is_truthy())),
             }
         }
-        Expr::Binary {
-            op: BinaryOp::And,
-            left,
-            right,
-        } => {
-            if !eval(left, context, depth + 1)?.is_truthy() {
-                return Ok(Value::Boolean(false));
-            }
-            Ok(Value::Boolean(eval(right, context, depth + 1)?.is_truthy()))
-        }
-        Expr::Binary {
-            op: BinaryOp::Or,
-            left,
-            right,
-        } => {
-            if eval(left, context, depth + 1)?.is_truthy() {
-                return Ok(Value::Boolean(true));
-            }
-            Ok(Value::Boolean(eval(right, context, depth + 1)?.is_truthy()))
-        }
         Expr::Binary { op, left, right } => {
             let left = eval(left, context, depth + 1)?;
-            let right = eval(right, context, depth + 1)?;
-            apply_binary(*op, &left, &right)
+            match op {
+                BinaryOp::And if !left.is_truthy() => Ok(Value::Boolean(false)),
+                BinaryOp::Or if left.is_truthy() => Ok(Value::Boolean(true)),
+                _ => {
+                    let right = eval(right, context, depth + 1)?;
+                    apply_binary(*op, &left, &right)
+                }
+            }
         }
         Expr::Call { name, args } => eval_call(name, args, context, depth),
     }
@@ -308,7 +294,6 @@ fn apply_binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, Form
 fn equals(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Null, Value::Null) => true,
-        (Value::Null, _) | (_, Value::Null) => false,
         _ => compare(left, right)
             .ok()
             .flatten()
@@ -319,12 +304,12 @@ fn equals(left: &Value, right: &Value) -> bool {
 fn compare(left: &Value, right: &Value) -> Result<Option<Ordering>, FormulaError> {
     match (left, right) {
         (Value::Integer(left), Value::Integer(right)) => Ok(Some(left.cmp(right))),
-        (Value::Decimal(left), Value::Decimal(right)) => Ok(Some(compare_decimals(*left, *right))),
+        (Value::Decimal(left), Value::Decimal(right)) => Ok(Some(left.cmp(right))),
         (Value::Integer(left), Value::Decimal(right)) => {
-            Ok(Some(compare_integer_decimal(*left, *right)))
+            Ok(Some(Decimal::from_integer(*left).cmp(right)))
         }
         (Value::Decimal(left), Value::Integer(right)) => {
-            Ok(Some(compare_integer_decimal(*right, *left).reverse()))
+            Ok(Some(left.cmp(&Decimal::from_integer(*right))))
         }
         (Value::Currency(left), Value::Currency(right)) => {
             if left.currency() != right.currency() {
@@ -333,7 +318,7 @@ fn compare(left: &Value, right: &Value) -> Result<Option<Ordering>, FormulaError
                     right: right.currency().to_string(),
                 }));
             }
-            Ok(Some(compare_decimals(left.amount(), right.amount())))
+            Ok(Some(left.amount().cmp(&right.amount())))
         }
         (
             Value::Text(left) | Value::Select(left) | Value::AttachmentRef(left),
@@ -344,18 +329,6 @@ fn compare(left: &Value, right: &Value) -> Result<Option<Ordering>, FormulaError
         (Value::Timestamp(left), Value::Timestamp(right)) => Ok(Some(left.cmp(right))),
         _ => Ok(None),
     }
-}
-
-fn compare_decimals(left: Decimal, right: Decimal) -> Ordering {
-    let scale = left.scale().max(right.scale());
-    let left = i128::from(left.units()) * 10_i128.pow(u32::from(scale - left.scale()));
-    let right = i128::from(right.units()) * 10_i128.pow(u32::from(scale - right.scale()));
-    left.cmp(&right)
-}
-
-fn compare_integer_decimal(integer: i64, decimal: Decimal) -> Ordering {
-    let scaled = i128::from(integer) * 10_i128.pow(u32::from(decimal.scale()));
-    scaled.cmp(&i128::from(decimal.units()))
 }
 
 enum Number {
@@ -749,10 +722,29 @@ mod tests {
 
     #[test]
     fn evaluates_aggregates() {
-        let value = evaluate("SUM([Lines].[Amount])", &context()).expect("eval");
+        let mut context = context();
+        for (aggregate, value) in [
+            (Aggregate::Avg, 1250),
+            (Aggregate::Min, 500),
+            (Aggregate::Max, 2000),
+        ] {
+            context.aggregates.insert(
+                ("Lines".into(), "Amount".into(), aggregate),
+                Value::Currency(money_from_minor("USD", value).expect("money")),
+            );
+        }
+        for (formula, expected) in [
+            ("SUM([Lines].[Amount])", 3750),
+            ("AVG([Lines].[Amount])", 1250),
+            ("MIN([Lines].[Amount])", 500),
+            ("MAX([Lines].[Amount])", 2000),
+        ] {
+            let expected = Value::Currency(money_from_minor("USD", expected).expect("money"));
+            assert_eq!(evaluate(formula, &context).expect(formula), expected);
+        }
         assert_eq!(
-            value,
-            Value::Currency(money_from_minor("USD", 3750).expect("money"))
+            evaluate("COUNT([Lines].[Amount])", &context).expect("count"),
+            Value::Integer(3)
         );
     }
 
@@ -773,6 +765,10 @@ mod tests {
         assert_eq!(
             evaluate("CONCAT(UPPER([Name]), \" / \", LEN([Name]))", &context()).expect("eval"),
             Value::Text("ADA / 3".into())
+        );
+        assert_eq!(
+            evaluate("LOWER(TRIM('  ÉADA  '))", &context()).expect("eval"),
+            Value::Text("éada".into())
         );
     }
 
@@ -799,6 +795,203 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_converts_utc_text() {
+        let value =
+            evaluate("TIMESTAMP('1969-12-31T23:59:59.999Z')", &context()).expect("timestamp");
+        assert_eq!(value, Value::Timestamp(SlabTimestamp::from_millis(-1)));
+    }
+
+    #[test]
+    fn temporal_functions_return_dates_and_utc_clock_values() {
+        let context = context();
+        let date = SlabDate::parse("2026-11-25").expect("date");
+        let midnight = SlabTimestamp::parse("2026-11-25T00:00:00Z").expect("midnight");
+        for (formula, expected) in [
+            ("DATE('2026-11-25')", Value::Date(date)),
+            ("DATE(TODAY())", Value::Date(date)),
+            ("DATE(NOW())", Value::Date(date)),
+            ("NOW()", Value::Timestamp(context.now)),
+            ("TIMESTAMP(NOW())", Value::Timestamp(context.now)),
+            ("TIMESTAMP(TODAY())", Value::Timestamp(midnight)),
+            ("MONTH(NOW())", Value::Integer(11)),
+            ("DAY(TODAY())", Value::Integer(25)),
+        ] {
+            assert_eq!(evaluate(formula, &context).expect(formula), expected);
+        }
+    }
+
+    #[test]
+    fn boolean_operators_skip_only_the_unneeded_operand() {
+        let context = context();
+        for (formula, expected) in [
+            ("FALSE AND [Missing]", false),
+            ("TRUE OR [Missing]", true),
+            ("TRUE AND FALSE", false),
+            ("FALSE OR TRUE", true),
+            ("FALSE OR FALSE", false),
+        ] {
+            assert_eq!(
+                evaluate(formula, &context).expect(formula),
+                Value::Boolean(expected)
+            );
+        }
+        for formula in ["TRUE AND [Missing]", "FALSE OR [Missing]"] {
+            assert!(matches!(
+                evaluate(formula, &context),
+                Err(FormulaError::UnknownColumn(name)) if name == "Missing"
+            ));
+        }
+    }
+
+    #[test]
+    fn numeric_operators_preserve_exact_results_and_nulls() {
+        let context = context();
+        for (formula, expected) in [
+            ("[Qty] + 2", Value::Integer(5)),
+            ("[Qty] - 2", Value::Integer(1)),
+            ("[Qty] * 2", Value::Integer(6)),
+            ("[Qty] % 2", Value::Integer(1)),
+            ("-[Qty]", Value::Integer(-3)),
+            ("ABS(-3)", Value::Integer(3)),
+            ("ROUND(3, 0)", Value::Integer(3)),
+            (
+                "[Subtotal] - [Tax]",
+                Value::Currency(money_from_minor("USD", 3450).expect("money")),
+            ),
+            (
+                "2 * [Tax]",
+                Value::Currency(money_from_minor("USD", 600).expect("money")),
+            ),
+            (
+                "-[Tax]",
+                Value::Currency(money_from_minor("USD", -300).expect("money")),
+            ),
+            (
+                "ABS(-[Tax])",
+                Value::Currency(money_from_minor("USD", 300).expect("money")),
+            ),
+        ] {
+            assert_eq!(evaluate(formula, &context).expect(formula), expected);
+        }
+        for (formula, expected) in [
+            ("[Price] + 0.25", "12.75"),
+            ("[Price] - 2", "10.50"),
+            ("[Price] * 2", "25.00"),
+            ("[Price] / 2", "6.25"),
+            ("[Price] % 2", "0.50"),
+            ("[Subtotal] / [Tax]", "12.5"),
+            ("ABS(-[Price])", "12.50"),
+        ] {
+            let expected = Value::Decimal(Decimal::parse(expected).expect("decimal"));
+            assert_eq!(evaluate(formula, &context).expect(formula), expected);
+        }
+        for formula in [
+            "2 + NULL",
+            "NULL - 2",
+            "2 - NULL",
+            "2 * NULL",
+            "NULL % 2",
+            "2 % NULL",
+            "-NULL",
+            "ABS(NULL)",
+            "ROUND(NULL, 2)",
+            "COALESCE(NULL, NULL)",
+        ] {
+            assert_eq!(evaluate(formula, &context).expect(formula), Value::Null);
+        }
+    }
+
+    #[test]
+    fn compares_numeric_and_temporal_values_without_losing_precision() {
+        let context = context();
+        for (formula, expected) in [
+            ("2 < 3", true),
+            ("3 < 3", false),
+            ("3 <= 3", true),
+            ("3 <= 2", false),
+            ("3 > 2", true),
+            ("3 > 3", false),
+            ("3 >= 3", true),
+            ("2 >= 3", false),
+            ("3 = 3.00", true),
+            ("3.01 > 3", true),
+            ("2.90 < 3.0", true),
+            ("3.0 > 2.90", true),
+            ("3 != 3", false),
+            ("NULL = NULL", true),
+            ("NULL != 0", true),
+            ("0 = NULL", false),
+            ("TRUE = FALSE", false),
+            ("TRUE = TRUE", true),
+            ("[Tax] < [Subtotal]", true),
+            ("[Start] < TODAY()", true),
+            ("TIMESTAMP(TODAY()) < NOW()", true),
+        ] {
+            assert_eq!(
+                evaluate(formula, &context).expect(formula),
+                Value::Boolean(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_incompatible_currency_operations_and_preserves_rounding_scale() {
+        let mut context = context();
+        context.columns.insert(
+            "Foreign".into(),
+            Value::Currency(money_from_minor("EUR", 300).expect("money")),
+        );
+        for formula in ["[Tax] < [Foreign]", "[Tax] / [Foreign]"] {
+            let error = evaluate(formula, &context).expect_err(formula);
+            assert!(matches!(
+                error,
+                FormulaError::Core(slab_core::CoreError::CurrencyMismatch { left, right })
+                    if left == "USD" && right == "EUR"
+            ));
+        }
+        for (formula, expected) in [
+            ("[Tax] * [Foreign]", "cannot multiply currency by currency"),
+            ("[Name] * [Tax]", "cannot multiply text by currency"),
+            ("[Tax] / [Name]", "cannot divide currency by text"),
+        ] {
+            assert!(matches!(
+                evaluate(formula, &context),
+                Err(FormulaError::Eval(message)) if message == expected
+            ));
+        }
+        let rounded = evaluate("ROUND([Tax], 1)", &context).expect("rounded amount");
+        assert!(matches!(
+            rounded,
+            Value::Currency(amount) if amount.amount().units() == 30 && amount.scale() == 1
+        ));
+    }
+
+    #[test]
+    fn reports_wrong_argument_counts_before_evaluating_functions() {
+        let context = context();
+        for formula in [
+            "IF()",
+            "COALESCE()",
+            "CONCAT()",
+            "SUM()",
+            "LEN()",
+            "TRIM()",
+            "ABS()",
+            "ROUND(1)",
+            "DATE()",
+            "TIMESTAMP()",
+            "TODAY(1)",
+            "NOW(1)",
+            "YEAR()",
+        ] {
+            assert!(
+                matches!(evaluate(formula, &context), Err(FormulaError::Arity { .. })),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
     fn comparisons_and_boolean_logic_work() {
         assert_eq!(
             evaluate("[Qty] >= 3 AND [Active]", &context()).expect("logic"),
@@ -808,5 +1001,82 @@ mod tests {
             evaluate("NOT ([Name] = \"Ada\")", &context()).expect("logic"),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn evaluation_accepts_the_depth_limit_and_rejects_the_next_level() {
+        let mut expression = Expr::Literal(Value::Integer(2));
+        for _ in 0..slab_core::MAX_EXPRESSION_DEPTH {
+            expression = Expr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(expression),
+            };
+        }
+        let context = context();
+        assert_eq!(
+            evaluate_expression(&expression, &context).expect("at depth limit"),
+            Value::Integer(2)
+        );
+        let deeper = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(expression),
+        };
+        assert!(matches!(
+            evaluate_expression(&deeper, &context),
+            Err(FormulaError::Depth { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_operator_and_function_operands_count_toward_evaluation_depth() {
+        let integer = |value| Expr::Literal(Value::Integer(value));
+        let boolean = |value| Expr::Literal(Value::Boolean(value));
+        let deep = |mut expression, op| {
+            for _ in 0..slab_core::MAX_EXPRESSION_DEPTH {
+                expression = Expr::Unary {
+                    op,
+                    expr: Box::new(expression),
+                };
+            }
+            expression
+        };
+        let deep_number = || deep(integer(1), UnaryOp::Neg);
+        let binary = |op, left, right| Expr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let call = |name: &str, args| Expr::Call {
+            name: name.into(),
+            args,
+        };
+        let context = context();
+        for expression in [
+            binary(BinaryOp::Add, deep_number(), integer(1)),
+            binary(BinaryOp::Add, integer(1), deep_number()),
+            binary(
+                BinaryOp::And,
+                boolean(true),
+                deep(boolean(true), UnaryOp::Not),
+            ),
+            binary(
+                BinaryOp::Or,
+                boolean(false),
+                deep(boolean(true), UnaryOp::Not),
+            ),
+            call(
+                "IF",
+                vec![deep(boolean(true), UnaryOp::Not), integer(1), integer(0)],
+            ),
+            call("IF", vec![boolean(true), deep_number(), integer(0)]),
+            call("IF", vec![boolean(false), integer(1), deep_number()]),
+            call("COALESCE", vec![deep_number()]),
+            call("ABS", vec![deep_number()]),
+        ] {
+            assert!(matches!(
+                evaluate_expression(&expression, &context),
+                Err(FormulaError::Depth { .. })
+            ));
+        }
     }
 }

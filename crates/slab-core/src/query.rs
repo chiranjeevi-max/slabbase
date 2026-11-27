@@ -397,3 +397,66 @@ pub struct TableSummary {
     /// Approximate row count from the storage engine.
     pub row_count: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_page_uses_requested_table_and_limit() {
+        assert_eq!(
+            PageQuery::first("invoices", 25),
+            PageQuery {
+                table: "invoices".into(),
+                limit: 25,
+                cursor: None,
+                sort: Vec::new(),
+                filters: Vec::new(),
+                search: None,
+            }
+        );
+    }
+
+    #[test]
+    fn portal_frame_rebuilds_named_records_in_tuple_order() {
+        let frame = PortalFrame {
+            columns: vec!["units".into(), "description".into()],
+            rows: vec![
+                RowTuple {
+                    id: 9,
+                    values: vec![Value::Integer(3), Value::from("Paper")],
+                },
+                RowTuple {
+                    id: 7,
+                    values: vec![Value::Integer(1), Value::Null],
+                },
+            ],
+            next_cursor: None,
+            total_rows: 2,
+            elapsed_ms: 0.0,
+            index_hint: None,
+        };
+
+        assert_eq!(
+            frame.records(),
+            vec![
+                Record {
+                    id: 9,
+                    values: [
+                        ("description".into(), Value::from("Paper")),
+                        ("units".into(), Value::Integer(3)),
+                    ]
+                    .into(),
+                },
+                Record {
+                    id: 7,
+                    values: [
+                        ("description".into(), Value::Null),
+                        ("units".into(), Value::Integer(1)),
+                    ]
+                    .into(),
+                },
+            ]
+        );
+    }
+}

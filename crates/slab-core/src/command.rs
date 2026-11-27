@@ -412,6 +412,30 @@ mod tests {
     }
 
     #[test]
+    fn audit_metadata_identifies_row_and_schema_commands() {
+        let update = Command::UpdateRow {
+            table: "Clients".into(),
+            before: Record::new(7),
+            after: Record::new(7),
+        };
+        assert_eq!(update.table_name(), Some("Clients"));
+        assert_eq!(update.row_id(), Some(7));
+        assert_eq!(update.operation(), "update");
+        assert_eq!(update.label(), "Update Clients #7");
+        assert!(!update.is_schema_change());
+
+        let rename = Command::RenameTable {
+            old_name: "Clients".into(),
+            new_name: "Customers".into(),
+        };
+        assert_eq!(rename.table_name(), Some("Clients"));
+        assert_eq!(rename.row_id(), None);
+        assert_eq!(rename.operation(), "rename_table");
+        assert_eq!(rename.label(), "Rename table to Customers");
+        assert!(rename.is_schema_change());
+    }
+
+    #[test]
     fn layout_inverse_matches_creation() {
         let layout = Layout {
             id: "l".into(),

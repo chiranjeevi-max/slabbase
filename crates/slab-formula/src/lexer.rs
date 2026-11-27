@@ -1,5 +1,8 @@
 //! Tokenizer for the formula language.
 
+use std::iter::{Enumerate, Peekable};
+use std::str::Bytes;
+
 use crate::error::FormulaError;
 
 /// One lexical token.
@@ -71,190 +74,87 @@ impl TokenKind {
     }
 }
 
+type SourceBytes<'a> = Peekable<Enumerate<Bytes<'a>>>;
+
 /// Converts source text into tokens, ending with `Eof`.
 pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, FormulaError> {
-    let bytes = input.as_bytes();
+    let mut bytes = input.bytes().enumerate().peekable();
     let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte.is_ascii_whitespace() {
-            index += 1;
-            continue;
-        }
-        let start = index;
+    while let Some((start, byte)) = bytes.next() {
         let kind = match byte {
-            b'(' => {
-                index += 1;
-                TokenKind::LParen
-            }
-            b')' => {
-                index += 1;
-                TokenKind::RParen
-            }
+            byte if byte.is_ascii_whitespace() => continue,
+            b'(' => TokenKind::LParen,
+            b')' => TokenKind::RParen,
             b'[' => {
-                index += 1;
-                let name_start = index;
-                while index < bytes.len() && bytes[index] != b']' {
-                    index += 1;
-                }
-                if index >= bytes.len() {
+                let Some((end, _)) = bytes.find(|&(_, byte)| byte == b']') else {
                     return Err(FormulaError::Parse {
                         message: "unterminated [column] reference".into(),
                         position: start,
                     });
-                }
-                let name = input[name_start..index].to_owned();
-                index += 1;
+                };
+                let name = &input[start + 1..end];
                 if name.is_empty() {
                     return Err(FormulaError::Parse {
                         message: "empty [column] reference".into(),
                         position: start,
                     });
                 }
-                TokenKind::Ident(name)
+                TokenKind::Ident(name.to_owned())
             }
-            b',' => {
-                index += 1;
-                TokenKind::Comma
-            }
-            b'.' => {
-                index += 1;
-                TokenKind::Dot
-            }
-            b'+' => {
-                index += 1;
-                TokenKind::Plus
-            }
-            b'-' => {
-                index += 1;
-                TokenKind::Minus
-            }
-            b'*' => {
-                index += 1;
-                TokenKind::Star
-            }
-            b'/' => {
-                index += 1;
-                TokenKind::Slash
-            }
-            b'%' => {
-                index += 1;
-                TokenKind::Percent
-            }
+            b',' => TokenKind::Comma,
+            b'.' => TokenKind::Dot,
+            b'+' => TokenKind::Plus,
+            b'-' => TokenKind::Minus,
+            b'*' => TokenKind::Star,
+            b'/' => TokenKind::Slash,
+            b'%' => TokenKind::Percent,
             b'=' => {
-                index += 1;
-                if index < bytes.len() && bytes[index] == b'=' {
-                    index += 1;
-                }
+                consume_byte(&mut bytes, b'=');
                 TokenKind::Eq
             }
             b'!' => {
-                index += 1;
-                if index < bytes.len() && bytes[index] == b'=' {
-                    index += 1;
-                    TokenKind::NotEq
-                } else {
+                if !consume_byte(&mut bytes, b'=') {
                     return Err(FormulaError::Parse {
                         message: "expected !=".into(),
                         position: start,
                     });
                 }
+                TokenKind::NotEq
             }
             b'<' => {
-                index += 1;
-                if index < bytes.len() {
-                    match bytes[index] {
-                        b'=' => {
-                            index += 1;
-                            TokenKind::Lte
-                        }
-                        b'>' => {
-                            index += 1;
-                            TokenKind::NotEq
-                        }
-                        _ => TokenKind::Lt,
-                    }
+                if consume_byte(&mut bytes, b'=') {
+                    TokenKind::Lte
+                } else if consume_byte(&mut bytes, b'>') {
+                    TokenKind::NotEq
                 } else {
                     TokenKind::Lt
                 }
             }
             b'>' => {
-                index += 1;
-                if index < bytes.len() && bytes[index] == b'=' {
-                    index += 1;
+                if consume_byte(&mut bytes, b'=') {
                     TokenKind::Gte
                 } else {
                     TokenKind::Gt
                 }
             }
-            b'"' | b'\'' => {
-                let quote = byte;
-                index += 1;
-                let mut value = String::new();
-                let mut segment_start = index;
-                loop {
-                    if index >= bytes.len() {
-                        return Err(FormulaError::Parse {
-                            message: "unterminated string literal".into(),
-                            position: start,
-                        });
-                    }
-                    if bytes[index] == quote {
-                        value.push_str(&input[segment_start..index]);
-                        index += 1;
-                        break;
-                    }
-                    if bytes[index] == b'\\' {
-                        value.push_str(&input[segment_start..index]);
-                        index += 1;
-                        if index >= bytes.len() {
-                            return Err(FormulaError::Parse {
-                                message: "unterminated escape sequence".into(),
-                                position: start,
-                            });
-                        }
-                        let escaped = match bytes[index] {
-                            b'n' => '\n',
-                            b't' => '\t',
-                            b'\\' => '\\',
-                            b'"' => '"',
-                            b'\'' => '\'',
-                            other => {
-                                return Err(FormulaError::Parse {
-                                    message: format!("unsupported escape \\{}", other as char),
-                                    position: index,
-                                });
-                            }
-                        };
-                        value.push(escaped);
-                        index += 1;
-                        segment_start = index;
-                        continue;
-                    }
-                    index += 1;
-                }
-                TokenKind::String(value)
+            quote @ (b'"' | b'\'') => {
+                TokenKind::String(tokenize_string(input, &mut bytes, start, quote)?)
             }
             byte if byte.is_ascii_digit() => {
-                while index < bytes.len() && bytes[index].is_ascii_digit() {
-                    index += 1;
+                while bytes.next_if(|&(_, byte)| byte.is_ascii_digit()).is_some() {}
+                if consume_byte(&mut bytes, b'.') {
+                    while bytes.next_if(|&(_, byte)| byte.is_ascii_digit()).is_some() {}
                 }
-                if index < bytes.len() && bytes[index] == b'.' {
-                    index += 1;
-                    while index < bytes.len() && bytes[index].is_ascii_digit() {
-                        index += 1;
-                    }
-                }
-                TokenKind::Number(input[start..index].to_owned())
+                let end = bytes.peek().map_or(input.len(), |&(index, _)| index);
+                TokenKind::Number(input[start..end].to_owned())
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
-                while index < bytes.len()
-                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-                {
-                    index += 1;
-                }
-                let word = &input[start..index];
+                while bytes
+                    .next_if(|&(_, byte)| byte.is_ascii_alphanumeric() || byte == b'_')
+                    .is_some()
+                {}
+                let end = bytes.peek().map_or(input.len(), |&(index, _)| index);
+                let word = &input[start..end];
                 match word.to_ascii_uppercase().as_str() {
                     "AND" => TokenKind::And,
                     "OR" => TokenKind::Or,
@@ -282,6 +182,55 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, FormulaError> {
         position: input.len(),
     });
     Ok(tokens)
+}
+
+fn consume_byte(bytes: &mut SourceBytes<'_>, expected: u8) -> bool {
+    bytes.next_if(|&(_, byte)| byte == expected).is_some()
+}
+
+fn tokenize_string(
+    input: &str,
+    bytes: &mut SourceBytes<'_>,
+    start: usize,
+    quote: u8,
+) -> Result<String, FormulaError> {
+    let mut value = String::new();
+    let mut segment_start = start + 1;
+    while let Some((position, byte)) = bytes.next() {
+        // The ASCII quote and backslash delimit complete UTF-8 segments.
+        if byte == quote {
+            value.push_str(&input[segment_start..position]);
+            return Ok(value);
+        }
+        if byte == b'\\' {
+            value.push_str(&input[segment_start..position]);
+            let Some((position, escaped)) = bytes.next() else {
+                return Err(FormulaError::Parse {
+                    message: "unterminated escape sequence".into(),
+                    position: start,
+                });
+            };
+            let escaped = match escaped {
+                b'n' => '\n',
+                b't' => '\t',
+                b'\\' => '\\',
+                b'"' => '"',
+                b'\'' => '\'',
+                other => {
+                    return Err(FormulaError::Parse {
+                        message: format!("unsupported escape \\{}", other as char),
+                        position,
+                    });
+                }
+            };
+            value.push(escaped);
+            segment_start = position + 1;
+        }
+    }
+    Err(FormulaError::Parse {
+        message: "unterminated string literal".into(),
+        position: start,
+    })
 }
 
 #[cfg(test)]
@@ -312,5 +261,102 @@ mod tests {
     #[test]
     fn rejects_unterminated_strings() {
         assert!(tokenize("\"abc").is_err());
+    }
+
+    #[test]
+    fn tokenizes_punctuation_and_comparison_operators() {
+        use TokenKind::{
+            Comma, Dot, Eof, Eq, Gt, Gte, LParen, Lt, Lte, Minus, NotEq, Percent, Plus, RParen,
+            Slash, Star,
+        };
+
+        for (input, expected) in [
+            (
+                " ( ) , . + - * / % ",
+                vec![
+                    (1, LParen),
+                    (3, RParen),
+                    (5, Comma),
+                    (7, Dot),
+                    (9, Plus),
+                    (11, Minus),
+                    (13, Star),
+                    (15, Slash),
+                    (17, Percent),
+                ],
+            ),
+            (
+                " = == != < <= <> > >=",
+                vec![
+                    (1, Eq),
+                    (3, Eq),
+                    (6, NotEq),
+                    (9, Lt),
+                    (11, Lte),
+                    (14, NotEq),
+                    (17, Gt),
+                    (19, Gte),
+                ],
+            ),
+            ("=", vec![(0, Eq)]),
+            ("<", vec![(0, Lt)]),
+            (">", vec![(0, Gt)]),
+        ] {
+            let mut expected: Vec<_> = expected
+                .into_iter()
+                .map(|(position, kind)| Token { kind, position })
+                .collect();
+            expected.push(Token {
+                kind: Eof,
+                position: input.len(),
+            });
+            assert_eq!(tokenize(input).expect("tokens"), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn preserves_unicode_bracket_names_strings_and_byte_offsets() {
+        let input = r#"[Café ☕]+"été\n\t\\\"\'fin""#;
+        assert_eq!(
+            tokenize(input).expect("tokens"),
+            vec![
+                Token {
+                    kind: TokenKind::Ident("Café ☕".into()),
+                    position: 0,
+                },
+                Token {
+                    kind: TokenKind::Plus,
+                    position: 11,
+                },
+                Token {
+                    kind: TokenKind::String("été\n\t\\\"'fin".into()),
+                    position: 12,
+                },
+                Token {
+                    kind: TokenKind::Eof,
+                    position: input.len(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn malformed_tokens_report_their_byte_offsets() {
+        for (input, expected_position, expected_message) in [
+            (" [", 1, "unterminated [column] reference"),
+            (" []", 1, "empty [column] reference"),
+            (" !", 1, "expected !="),
+            (" !3", 1, "expected !="),
+            (" 'é", 1, "unterminated string literal"),
+            (" 'é\\", 1, "unterminated escape sequence"),
+            (r" 'é\q'", 5, "unsupported escape \\q"),
+        ] {
+            let error = tokenize(input).expect_err("malformed token");
+            assert!(
+                matches!(error, FormulaError::Parse { position, ref message }
+                    if position == expected_position && message == expected_message),
+                "{input:?} produced {error:?}"
+            );
+        }
     }
 }

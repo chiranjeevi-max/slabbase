@@ -94,3 +94,35 @@ impl RecordBundle {
         self.portals.get(relation).map(Vec::as_slice).unwrap_or(&[])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_lookup_distinguishes_null_from_a_missing_column() {
+        let mut record = Record::new(42);
+        record.values.insert("units".into(), Value::Integer(1_375));
+        record.values.insert("notes".into(), Value::Null);
+
+        assert_eq!(record.get("units"), Some(&Value::Integer(1_375)));
+        assert_eq!(record.get("notes"), Some(&Value::Null));
+        assert_eq!(record.get("missing"), None);
+        assert_eq!(record.display("units"), "1375");
+        assert_eq!(record.display("notes"), "");
+        assert_eq!(record.display("missing"), "");
+    }
+
+    #[test]
+    fn portal_lookup_returns_children_for_the_requested_relation() {
+        let mut bundle = RecordBundle::new(Record::new(42));
+        let line_items = vec![Record::new(3), Record::new(1)];
+        bundle.portals.insert("items".into(), line_items.clone());
+        bundle
+            .portals
+            .insert("payments".into(), vec![Record::new(2)]);
+
+        assert_eq!(bundle.portal("items"), line_items.as_slice());
+        assert!(bundle.portal("missing").is_empty());
+    }
+}
