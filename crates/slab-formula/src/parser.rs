@@ -396,4 +396,74 @@ mod tests {
         let deep = "(".repeat(200) + "1" + &")".repeat(200);
         assert!(parse(&deep).is_err());
     }
+
+    #[test]
+    fn parses_the_source_and_rendered_size_boundary() {
+        let at_limit = format!("\"{}\"", "x".repeat(16_382));
+        assert_eq!(
+            parse(&at_limit).expect("at the limit").to_string(),
+            at_limit
+        );
+
+        let error = parse(&(at_limit + " ")).expect_err("source is too long");
+        assert!(matches!(
+            error,
+            FormulaError::Parse { position: 16_384, message }
+                if message == "formula exceeds 16384 bytes"
+        ));
+    }
+
+    #[test]
+    fn allows_parentheses_and_expression_trees_at_the_depth_boundary() {
+        let limit = usize::try_from(MAX_EXPRESSION_DEPTH).expect("supported depth");
+        let parentheses = format!("{}1{}", "(".repeat(limit - 1), ")".repeat(limit - 1));
+        assert_eq!(
+            parse(&parentheses).expect("depth boundary").to_string(),
+            "1"
+        );
+
+        let chain = std::iter::repeat_n("1", limit)
+            .collect::<Vec<_>>()
+            .join("+");
+        assert_eq!(
+            parse(&chain).expect("depth boundary").expression_depth(),
+            MAX_EXPRESSION_DEPTH
+        );
+    }
+
+    #[test]
+    fn call_arguments_share_the_same_nesting_depth() {
+        let count = usize::try_from(MAX_EXPRESSION_DEPTH).expect("supported depth") + 1;
+        let arguments = std::iter::repeat_n("1", count)
+            .collect::<Vec<_>>()
+            .join(",");
+        let expression = parse(&format!("CONCAT({arguments})")).expect("shallow call");
+        assert!(matches!(&expression, Expr::Call { args, .. } if args.len() == count));
+    }
+
+    #[test]
+    fn parses_comparison_and_additive_operator_spellings() {
+        for (input, expected) in [
+            ("1 != 2", "(1 != 2)"),
+            ("1 <> 2", "(1 != 2)"),
+            ("1 <= 2", "(1 <= 2)"),
+            ("7 - +3", "(7 - 3)"),
+        ] {
+            assert_eq!(
+                parse(input).expect("parse").to_string(),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_argument_error_identifies_the_unexpected_token() {
+        let error = parse("CONCAT(1 2)").expect_err("missing argument separator");
+        assert!(matches!(
+            error,
+            FormulaError::Parse { position: 9, message }
+                if message == "expected , or ) in CONCAT(), found number"
+        ));
+    }
 }

@@ -283,15 +283,46 @@ mod tests {
 
     #[test]
     fn orders_dependencies_before_dependents() {
-        let schema = schema(vec![
-            formula_column("Total", "[Subtotal] + [Tax]"),
-            formula_column("Subtotal", "[Qty] * [Price]"),
+        let mut quantity = formula_column("Qty", "0");
+        quantity.ty = ColumnType::Integer;
+        let mut invoices = schema(vec![
+            formula_column("A_Total", "[Subtotal] + [Tax]"),
+            formula_column("Subtotal", "[Qty] * 10"),
+            formula_column("Tax", "[Subtotal] * 0.1"),
+            quantity,
         ]);
-        // The schema has unknown stored columns, so validation of referenced
-        // types is deferred; the graph only needs the column list.
-        let dag = FormulaDag::build(&schema);
-        // Qty and Price are missing, so typechecking rejects the formulas.
-        assert!(dag.is_err());
+        let mut shipping = formula_column("Shipping", "5");
+        shipping.table = "Orders".into();
+        invoices.tables.push(Table {
+            id: "t_orders".into(),
+            name: "Orders".into(),
+            columns: vec![shipping],
+            created_at: 0,
+        });
+        let mut dag = FormulaDag::build(&invoices).expect("formula graph");
+        assert_eq!(
+            dag.evaluation_order("Invoices").expect("order"),
+            ["Subtotal", "Tax", "A_Total"]
+        );
+        assert_eq!(
+            dag.formula_columns("Invoices").collect::<Vec<_>>(),
+            ["A_Total", "Subtotal", "Tax"]
+        );
+        assert_eq!(
+            dag.dependencies("Invoices", "A_Total").collect::<Vec<_>>(),
+            ["Subtotal", "Tax"]
+        );
+        assert_eq!(dag.dependencies("Invoices", "Subtotal").count(), 0);
+
+        dag.remove_column("Invoices", "Tax");
+        assert_eq!(
+            dag.evaluation_order("Invoices").expect("order"),
+            ["Subtotal", "A_Total"]
+        );
+        assert_eq!(
+            dag.dependencies("Invoices", "A_Total").collect::<Vec<_>>(),
+            ["Subtotal"]
+        );
     }
 
     #[test]
@@ -309,7 +340,8 @@ mod tests {
         let first = FormulaDag::build(&invoicing).expect_err("cycle");
         let second = FormulaDag::build(&invoicing).expect_err("cycle");
         assert_eq!(first.to_string(), second.to_string());
-        assert!(first.to_string().contains("SLAB_E_CYCLE") || first.to_string().contains("A ->"));
+        assert!(matches!(first, FormulaError::Cycle { path } if path == "A -> B -> C -> A"));
+        assert!(FormulaDag::validate_schema(&invoicing).is_err());
     }
 
     #[test]

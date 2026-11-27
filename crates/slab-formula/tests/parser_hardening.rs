@@ -88,6 +88,15 @@ fn rejects_an_oversized_formula_source() {
 }
 
 #[test]
+fn trailing_token_error_identifies_the_token_and_position() {
+    let error = parse("1)").expect_err("unexpected trailing parenthesis");
+    assert!(matches!(
+        error,
+        FormulaError::Parse { position: 1, message } if message == "unexpected )"
+    ));
+}
+
+#[test]
 fn integer_boundaries_are_structured_errors_not_wraps() {
     let context = Context::new(vec![
         ("max", Value::Integer(i64::MAX)),
@@ -214,6 +223,13 @@ fn token_span_rewrite_preserves_literals_formatting_and_other_names() {
     let untouched = rewrite_column_source("SUM([Lines].[rate])", Some("Other"), "rate", "x")
         .expect("untouched");
     assert_eq!(untouched, "SUM([Lines].[rate])");
+}
+
+#[test]
+fn bare_column_rename_preserves_matching_relation_name() {
+    let rewritten = rewrite_column_source("SUM([Rate].[Net]) + Rate", None, "Rate", "_gross_rate")
+        .expect("rewrite");
+    assert_eq!(rewritten, "SUM([Rate].[Net]) + _gross_rate");
 }
 
 proptest! {

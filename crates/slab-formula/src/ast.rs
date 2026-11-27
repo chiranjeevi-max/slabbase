@@ -309,6 +309,7 @@ impl fmt::Display for Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse;
 
     #[test]
     fn renders_canonical_text() {
@@ -323,5 +324,57 @@ mod tests {
             ))),
         };
         assert_eq!(expr.to_string(), "([Subtotal] + 0.08)");
+    }
+
+    #[test]
+    fn column_references_are_deduplicated_in_first_seen_order() {
+        let expression = parse(
+            "IF(NOT [Hidden], [Rate] + [Rate] + [Qty], SUM([Lines].[Rate]) + SUM([Lines].[Qty]) + SUM([Other].[Rate]) + SUM([Lines].[Rate]))",
+        )
+        .expect("formula");
+
+        assert_eq!(expression.bare_columns(), ["Hidden", "Rate", "Qty"]);
+        assert_eq!(
+            expression.qualified_columns(),
+            [
+                ("Lines".into(), "Rate".into()),
+                ("Lines".into(), "Qty".into()),
+                ("Other".into(), "Rate".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn rewriting_tree_changes_only_matching_owner_and_column() {
+        let mut expression =
+            parse("SUM([Lines].[Rate]) + SUM([Lines].[Qty]) + SUM([Other].[Rate]) + [Rate]")
+                .expect("formula");
+
+        expression.rewrite_column(Some("Lines"), "Rate", "Unit Rate");
+
+        assert_eq!(
+            expression,
+            parse("SUM([Lines].[Unit Rate]) + SUM([Lines].[Qty]) + SUM([Other].[Rate]) + [Rate]")
+                .expect("expected formula")
+        );
+    }
+
+    #[test]
+    fn dropping_a_deep_tree_uses_bounded_stack_space() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut expression = Expr::Literal(Value::Integer(0));
+                for _ in 0..10_000 {
+                    expression = Expr::Unary {
+                        op: UnaryOp::Neg,
+                        expr: Box::new(expression),
+                    };
+                }
+                drop(expression);
+            })
+            .expect("start test thread")
+            .join()
+            .expect("drop expression");
     }
 }

@@ -592,6 +592,7 @@ fn expect_arity(name: &str, args: &[Expr], expected: usize) -> Result<(), Formul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slab_core::{Column, CurrencyCode, DeleteAction, Relation, Table};
 
     fn env() -> TypeEnv {
         TypeEnv::default()
@@ -600,29 +601,304 @@ mod tests {
             .with_column("Name", FormulaType::Text)
             .with_column("Qty", FormulaType::Integer)
             .with_column("Price", FormulaType::Decimal)
+            .with_column("Due", FormulaType::Date)
+            .with_column("Updated", FormulaType::Timestamp)
+    }
+
+    fn assert_types(env: &TypeEnv, cases: &[(&str, FormulaType)]) {
+        for &(source, expected) in cases {
+            assert_eq!(
+                validate_expression(source, env).expect(source),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    fn assert_type_errors(env: &TypeEnv, sources: &[&str]) {
+        for &source in sources {
+            let error = validate_expression(source, env).expect_err(source);
+            assert!(matches!(error, FormulaError::Type(_)), "{source}: {error}");
+            assert_eq!(error.code_str(), "SLAB_E_FORMULA_TYPE", "{source}: {error}");
+        }
     }
 
     #[test]
-    fn money_adds_to_money() {
-        let ty = validate_expression("[Subtotal] + [Tax]", &env()).expect("typechecks");
-        assert_eq!(ty, FormulaType::Currency);
+    fn type_labels_and_categories() {
+        use FormulaType::*;
+        for (ty, label, numeric, temporal) in [
+            (Any, "any", false, false),
+            (Text, "text", false, false),
+            (Integer, "integer", true, false),
+            (Decimal, "decimal", true, false),
+            (Currency, "currency", false, false),
+            (Boolean, "boolean", false, false),
+            (Date, "date", false, true),
+            (Timestamp, "timestamp", false, true),
+        ] {
+            assert_eq!(ty.label(), label);
+            assert_eq!(ty.is_numeric(), numeric, "{label}");
+            assert_eq!(ty.is_temporal(), temporal, "{label}");
+        }
     }
 
     #[test]
-    fn rejects_money_plus_text() {
-        let error = validate_expression("[Subtotal] + [Name]", &env()).expect_err("reject");
-        assert_eq!(error.code_str(), "SLAB_E_FORMULA_TYPE");
+    fn arithmetic_promotes_numbers_and_preserves_currency() {
+        use FormulaType::*;
+        let env = env();
+        assert_types(
+            &env,
+            &[
+                ("-Qty", Integer),
+                ("-NULL", Any),
+                ("Qty + Qty", Integer),
+                ("Qty - Price", Decimal),
+                ("Qty % Price", Decimal),
+                ("NULL + Qty", Integer),
+                ("Qty + NULL", Integer),
+                ("NULL + NULL", Any),
+                ("Subtotal + Tax", Currency),
+                ("Subtotal - NULL", Currency),
+                ("Qty * Price", Decimal),
+                ("Subtotal * Qty", Currency),
+                ("Qty * Tax", Currency),
+                ("Subtotal * NULL", Currency),
+                ("NULL * Tax", Currency),
+                ("Qty / Qty", Decimal),
+                ("NULL / Qty", Decimal),
+                ("Qty / NULL", Decimal),
+                ("NULL / NULL", Any),
+                ("Subtotal / Qty", Currency),
+                ("Subtotal / NULL", Currency),
+                ("Subtotal / Tax", Decimal),
+                ("NULL / Tax", Decimal),
+            ],
+        );
+        assert_type_errors(
+            &env,
+            &[
+                "-Name",
+                "Subtotal + Name",
+                "Name + Qty",
+                "Qty + Name",
+                "Subtotal % Qty",
+                "Subtotal * Tax",
+                "Subtotal * Name",
+                "Name * Tax",
+                "Qty * Name",
+                "Subtotal / Name",
+                "Name / Tax",
+                "Name / Qty",
+                "Qty / Name",
+                "Qty / Tax",
+            ],
+        );
     }
 
     #[test]
-    fn division_produces_a_decimal_type() {
-        let ty = validate_expression("[Qty] / [Qty]", &env()).expect("typechecks");
-        assert_eq!(ty, FormulaType::Decimal);
+    fn comparisons_distinguish_equality_ordering_and_logical_operands() {
+        use FormulaType::Boolean;
+        let env = env();
+        assert_types(
+            &env,
+            &[
+                ("Name = Name", Boolean),
+                ("Qty != Price", Boolean),
+                ("TRUE = NULL", Boolean),
+                ("Name < Name", Boolean),
+                ("Due <= Due", Boolean),
+                ("Updated > Updated", Boolean),
+                ("Subtotal >= Tax", Boolean),
+                ("Qty < Price", Boolean),
+                ("NULL < TRUE", Boolean),
+                ("NOT TRUE OR FALSE AND NULL", Boolean),
+            ],
+        );
+        assert_type_errors(
+            &env,
+            &[
+                "Name = Qty",
+                "TRUE != Name",
+                "Qty < Name",
+                "Due < Updated",
+                "TRUE < FALSE",
+                "TRUE AND Qty",
+                "Qty OR FALSE",
+                "NOT Qty",
+            ],
+        );
     }
 
     #[test]
-    fn if_branches_must_agree() {
-        assert!(validate_expression("IF([Qty] > 1, [Name], [Subtotal])", &env()).is_err());
+    fn builtins_infer_result_types_and_reject_invalid_arguments() {
+        use FormulaType::*;
+        let env = env();
+        assert_types(
+            &env,
+            &[
+                ("IF(Qty > 1, Name, Name)", Text),
+                ("IF(TRUE, Qty, Price)", Decimal),
+                ("IF(NULL, Name, NULL)", Text),
+                ("COALESCE(NULL, Qty, Price)", Decimal),
+                ("CONCAT(Name, Qty)", Text),
+                ("len(Name)", Integer),
+                ("UPPER(Name)", Text),
+                ("LOWER(NULL)", Text),
+                ("TRIM(Name)", Text),
+                ("ABS(Qty)", Integer),
+                ("ABS(Subtotal)", Currency),
+                ("ABS(NULL)", Any),
+                ("ROUND(Price, Qty)", Decimal),
+                ("ROUND(Subtotal, NULL)", Currency),
+                ("DATE('2024-02-29')", Date),
+                ("DATE(Due)", Date),
+                ("TODAY()", Date),
+                ("TIMESTAMP('2024-02-29T00:00:00Z')", Timestamp),
+                ("TIMESTAMP(Updated)", Timestamp),
+                ("NOW()", Timestamp),
+                ("YEAR(Due)", Integer),
+                ("MONTH(Updated)", Integer),
+                ("DAY(NULL)", Integer),
+            ],
+        );
+        assert_type_errors(
+            &env,
+            &[
+                "IF(Qty, 1, 2)",
+                "IF(TRUE, Name, Subtotal)",
+                "COALESCE(Name, Qty)",
+                "LEN(Qty)",
+                "ABS(Name)",
+                "ROUND(Name, 1)",
+                "ROUND(Price, 1.5)",
+                "DATE(Qty)",
+                "TIMESTAMP(Qty)",
+                "YEAR(Qty)",
+            ],
+        );
+
+        for (source, function, found) in [
+            ("IF(TRUE, 1)", "IF", 2),
+            ("LEN()", "LEN", 0),
+            ("NOW(1)", "NOW", 1),
+            ("COALESCE()", "COALESCE", 0),
+            ("CONCAT()", "CONCAT", 0),
+        ] {
+            let error = validate_expression(source, &env).expect_err(source);
+            assert!(
+                matches!(error, FormulaError::Arity {function: ref name, found: count, ..}
+                if name == function && count == found),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    fn table(name: &str, columns: Vec<(&str, ColumnType)>) -> Table {
+        Table {
+            id: name.into(),
+            name: name.into(),
+            columns: columns
+                .into_iter()
+                .enumerate()
+                .map(|(position, (column, ty))| Column {
+                    id: format!("{name}.{column}"),
+                    table: name.into(),
+                    name: column.into(),
+                    ty,
+                    required: false,
+                    unique: false,
+                    default: None,
+                    position: u32::try_from(position).expect("test column index fits"),
+                })
+                .collect(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn infers_aggregates_from_child_columns_in_the_schema() {
+        use FormulaType::*;
+        let money = ColumnType::Currency {
+            currency: CurrencyCode::parse("USD").expect("currency"),
+        };
+        let schema = Schema {
+            tables: vec![
+                table("Invoices", vec![("Total", money.clone())]),
+                table(
+                    "Lines",
+                    vec![
+                        ("Invoice", ColumnType::Integer),
+                        ("Qty", ColumnType::Integer),
+                        ("Amount", money),
+                        ("Description", ColumnType::Text),
+                        ("Due", ColumnType::Date),
+                        ("Taxable", ColumnType::Boolean),
+                        (
+                            "Estimate",
+                            ColumnType::Formula {
+                                expression: "Amount".into(),
+                            },
+                        ),
+                    ],
+                ),
+            ],
+            relations: vec![Relation {
+                id: "invoice-lines".into(),
+                name: "Line Items".into(),
+                parent_table: "Invoices".into(),
+                child_table: "Lines".into(),
+                child_column: "Invoice".into(),
+                on_delete: DeleteAction::Cascade,
+            }],
+            layouts: Vec::new(),
+        };
+        schema.validate().expect("valid schema");
+        let env = TypeEnv::for_table(&schema, "Invoices").expect("invoice environment");
+        assert_eq!(
+            env.relations()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["Line Items"]
+        );
+        assert_eq!(env.relation_column("Line Items", "id"), Some(Integer));
+        assert_eq!(env.column("Description"), None);
+        assert_types(
+            &env,
+            &[
+                ("id", Integer),
+                ("Total", Currency),
+                ("COUNT([Line Items].[Taxable])", Integer),
+                ("COUNT([Line Items].[Estimate])", Integer),
+                ("SUM([Line Items].[Qty])", Integer),
+                ("SUM([Line Items].[Amount])", Currency),
+                ("SUM([Line Items].[Estimate])", Any),
+                ("AVG([Line Items].[Qty])", Decimal),
+                ("AVG([Line Items].[Amount])", Currency),
+                ("MIN([Line Items].[Description])", Text),
+                ("MAX([Line Items].[Due])", Date),
+            ],
+        );
+        assert_type_errors(
+            &env,
+            &[
+                "SUM([Line Items].[Description])",
+                "AVG([Line Items].[Due])",
+                "MAX([Line Items].[Taxable])",
+                "SUM(Total)",
+                "[Line Items].[Amount]",
+            ],
+        );
+
+        for (relation, column) in [("Unknown Lines", "Amount"), ("Line Items", "Missing")] {
+            let error = validate_expression(&format!("SUM([{relation}].[{column}])"), &env)
+                .expect_err("unresolved child reference");
+            assert!(
+                matches!(error, FormulaError::UnknownRelation { relation: ref name, column: ref key }
+                if name == relation && key == column),
+                "{error}"
+            );
+        }
     }
 
     #[test]
