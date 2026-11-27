@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use slab_core::{CurrencyCode, Decimal, Money, RoundingMode};
+use slab_core::{CoreError, CurrencyCode, Decimal, Money, RoundingMode};
 
 struct Generator(u64);
 
@@ -79,4 +79,72 @@ fn half_even_rounding_breaks_ties_to_the_even_neighbour() {
         .round(3, RoundingMode::HalfEven)
         .unwrap();
     assert_eq!(rounded.to_string(), "1.234");
+}
+
+#[test]
+fn currency_codes_require_three_ascii_letters() {
+    for input in ["US", "USDX", "U1D", "U€"] {
+        assert!(matches!(
+            CurrencyCode::parse(input),
+            Err(CoreError::InvalidCurrencyCode(rejected)) if rejected == input
+        ));
+    }
+}
+
+#[test]
+fn three_decimal_currencies_keep_their_minor_units_in_display_text() {
+    let currency = CurrencyCode::parse(" kwd ").unwrap();
+    let money = Money::from_minor(currency, 1_234).unwrap();
+    assert_eq!(currency.to_string(), "KWD");
+    assert_eq!(money.scale(), 3);
+    assert_eq!(money.to_string(), "KWD 1.234");
+    assert_eq!(Money::parse("kwd 1.234", currency).unwrap(), money);
+}
+
+#[test]
+fn money_parsing_distinguishes_malformed_text_and_a_foreign_currency() {
+    let usd = CurrencyCode::parse("USD").unwrap();
+    for input in ["100 1.25", "USDX 1.25", "U1D 1.25"] {
+        assert!(matches!(
+            Money::parse(input, usd),
+            Err(CoreError::InvalidDecimal { input: rejected }) if rejected == input
+        ));
+    }
+    assert!(matches!(
+        Money::parse("eur 1.25", usd),
+        Err(CoreError::CurrencyMismatch { left, right }) if left == "EUR" && right == "USD"
+    ));
+}
+
+#[test]
+fn money_arithmetic_rejects_different_currencies() {
+    let usd = Money::from_minor(CurrencyCode::parse("USD").unwrap(), 100).unwrap();
+    let eur = Money::from_minor(CurrencyCode::parse("EUR").unwrap(), 100).unwrap();
+    for result in [usd.checked_add(eur), usd.checked_sub(eur)] {
+        assert!(matches!(
+            result,
+            Err(CoreError::CurrencyMismatch { left, right }) if left == "USD" && right == "EUR"
+        ));
+    }
+}
+
+#[test]
+fn money_ratio_multiplication_rounds_and_rejects_zero_denominators() {
+    let money = Money::from_minor(CurrencyCode::parse("USD").unwrap(), 103).unwrap();
+    assert_eq!(money.checked_mul_ratio(1, 2).unwrap().minor_units(), 52);
+    assert!(matches!(
+        money.checked_mul_ratio(1, 0),
+        Err(CoreError::DivisionByZero)
+    ));
+}
+
+#[test]
+fn allocation_awards_leftover_minor_units_to_the_largest_remainder() {
+    let usd = CurrencyCode::parse("USD").unwrap();
+    for (units, expected) in [(2, [0, 0, 1, 1]), (-2, [0, 0, -1, -1])] {
+        let money = Money::from_minor(usd, units).unwrap();
+        let shares = money.allocate(&[0, 1, 2, 3]).unwrap();
+        let shares: Vec<i64> = shares.into_iter().map(Money::minor_units).collect();
+        assert_eq!(shares, expected);
+    }
 }

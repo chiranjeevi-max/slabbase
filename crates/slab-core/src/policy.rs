@@ -9,14 +9,12 @@ use crate::value::Value;
 /// to change when that happens.
 pub trait PolicyHook: Send + Sync {
     /// Returns a replacement value, or `None` to leave the value unchanged.
-    fn redact(&self, table: &str, column: &str, value: &Value) -> Option<Value> {
-        let _ = (table, column, value);
+    fn redact(&self, _table: &str, _column: &str, _value: &Value) -> Option<Value> {
         None
     }
 
     /// Whether the caller may read the given table at all.
-    fn can_read_table(&self, table: &str) -> bool {
-        let _ = table;
+    fn can_read_table(&self, _table: &str) -> bool {
         true
     }
 }
@@ -26,3 +24,18 @@ pub trait PolicyHook: Send + Sync {
 pub struct NoopPolicy;
 
 impl PolicyHook for NoopPolicy {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_allows_reads_without_redaction() {
+        let policy: &dyn PolicyHook = &NoopPolicy;
+        assert!(policy.can_read_table("clients"));
+        assert_eq!(
+            policy.redact("clients", "name", &Value::from("Jones")),
+            None
+        );
+    }
+}

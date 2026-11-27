@@ -276,4 +276,18 @@ mod tests {
             assert!(validate_identifier(name).is_err(), "{name} should fail");
         }
     }
+
+    #[test]
+    fn identifier_length_is_limited_to_sixty_four_bytes() {
+        assert!(validate_identifier(&"a".repeat(64)).is_ok());
+        let error = validate_identifier(&"a".repeat(65)).expect_err("name is too long");
+        assert!(matches!(error, CoreError::InvalidName { .. }));
+        assert_eq!(error.code_str(), "SLAB_E_NAME");
+    }
+
+    #[test]
+    fn error_code_formats_as_the_stable_machine_readable_string() {
+        assert_eq!(codes::DIV_ZERO.as_str(), "SLAB_E_DIV_ZERO");
+        assert_eq!(codes::DIV_ZERO.to_string(), "SLAB_E_DIV_ZERO");
+    }
 }

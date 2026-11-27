@@ -108,9 +108,6 @@ impl Decimal {
         if body.is_empty() {
             return Err(invalid());
         }
-        if body.bytes().any(|byte| byte == b'e' || byte == b'E') {
-            return Err(invalid());
-        }
         let mut pieces = body.split('.');
         let integer = pieces.next().ok_or_else(invalid)?;
         let fraction = pieces.next().unwrap_or("");
@@ -187,11 +184,8 @@ impl Decimal {
                 max: MAX_SCALE,
             });
         }
-        if target == self.scale {
-            return Ok(self);
-        }
-        if target > self.scale {
-            let factor = POW10[usize::from(target - self.scale)];
+        if let Some(increase) = target.checked_sub(self.scale) {
+            let factor = POW10[usize::from(increase)];
             let scaled =
                 i128::from(self.units)
                     .checked_mul(factor)
@@ -377,7 +371,7 @@ impl Decimal {
 
     /// Checked absolute value.
     pub fn checked_abs(self) -> Result<Self, CoreError> {
-        if self.units < 0 {
+        if self.is_negative() {
             self.checked_neg()
         } else {
             Ok(self)
@@ -526,7 +520,7 @@ pub fn div_round(
     if remainder == 0 {
         return Ok(quotient);
     }
-    let negative = (numerator < 0) ^ (denominator < 0);
+    let negative = numerator.is_negative() ^ denominator.is_negative();
     let step_away = |value: i128| -> Result<i128, CoreError> {
         if negative {
             value.checked_sub(1)
@@ -860,7 +854,7 @@ impl Money {
                 reason: "ratios sum to zero".into(),
             });
         }
-        let negative = self.amount.units() < 0;
+        let negative = self.amount.is_negative();
         let total = i128::from(self.amount.units()).unsigned_abs();
         let mut shares = Vec::with_capacity(ratios.len());
         let mut remainders = Vec::with_capacity(ratios.len());
@@ -960,6 +954,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn powers_of_ten_check_the_i128_limit() {
+        assert_eq!(
+            pow10(38).expect("largest representable power of ten"),
+            100_000_000_000_000_000_000_000_000_000_000_000_000
+        );
+        assert!(matches!(pow10(39), Err(CoreError::NumericOverflow { .. })));
+    }
+
+    #[test]
     fn parses_and_formats_decimal() {
         let parsed = Decimal::parse("-1234.50").expect("valid");
         assert_eq!(parsed.units(), -123_450);
@@ -967,8 +970,62 @@ mod tests {
         assert_eq!(parsed.to_string(), "-1234.50");
         assert_eq!(Decimal::parse("0.005").expect("valid").to_string(), "0.005");
         assert_eq!(Decimal::parse(".5").expect("valid").to_string(), "0.5");
-        assert!(Decimal::parse("1e3").is_err());
-        assert!(Decimal::parse("1,000").is_err());
+        assert_eq!(Decimal::parse(" +.50 ").expect("valid").to_string(), "0.50");
+    }
+
+    #[test]
+    fn rejects_exponents_and_embedded_signs_in_decimal_literals() {
+        for input in ["1e3", "1E3", "1,000", "1.+5", "1.-5", "--1"] {
+            assert!(matches!(
+                Decimal::parse(input),
+                Err(CoreError::InvalidDecimal { input: rejected }) if rejected == input
+            ));
+        }
+    }
+
+    #[test]
+    fn decimal_sign_is_independent_of_scale() {
+        for (units, zero, negative) in [(25, false, false), (0, true, false), (-25, false, true)] {
+            let decimal = Decimal::new(units, 2).expect("valid");
+            assert_eq!(decimal.is_zero(), zero);
+            assert_eq!(decimal.is_negative(), negative);
+        }
+    }
+
+    #[test]
+    fn rescaling_moves_the_decimal_point_by_the_scale_difference() {
+        for (input, target, expected) in [
+            ("-1.25", 5, "-1.25000"),
+            ("4.1234", 1, "4.1"),
+            ("0.1", 9, "0.100000000"),
+            ("1.00", 2, "1.00"),
+        ] {
+            let decimal = Decimal::parse(input).expect("valid");
+            let scaled = decimal
+                .rescale(target, RoundingMode::HalfEven)
+                .expect("rescale");
+            assert_eq!(scaled.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn rescaling_rejects_an_unsupported_target_or_coefficient_overflow() {
+        assert!(matches!(
+            Decimal::from_integer(1).rescale(10, RoundingMode::HalfEven),
+            Err(CoreError::ScaleOutOfRange { scale: 10, max: 9 })
+        ));
+        assert!(matches!(
+            Decimal::from_integer(i64::MAX).rescale(1, RoundingMode::HalfEven),
+            Err(CoreError::NumericOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn normalization_removes_only_fractional_trailing_zeros() {
+        for (input, expected) in [("-1.2500", "-1.25"), ("1200", "1200"), ("0.000", "0")] {
+            let decimal = Decimal::parse(input).expect("valid");
+            assert_eq!(decimal.normalized().to_string(), expected);
+        }
     }
 
     #[test]
@@ -993,6 +1050,76 @@ mod tests {
         let one = Decimal::from_integer(1);
         let eight = Decimal::from_integer(8);
         assert_eq!(one.checked_div(eight).expect("div").to_string(), "0.1250");
+    }
+
+    #[test]
+    fn division_accounts_for_the_dividend_scale() {
+        let dividend = Decimal::parse("0.25").expect("valid");
+        let divisor = Decimal::parse("0.8").expect("valid");
+        assert_eq!(
+            dividend.checked_div(divisor).expect("divide").to_string(),
+            "0.312500"
+        );
+    }
+
+    #[test]
+    fn directed_rounding_accounts_for_both_operand_signs() {
+        for (numerator, denominator, up, down) in [
+            (5, 2, 3, 2),
+            (-5, 2, -2, -3),
+            (5, -2, -2, -3),
+            (-5, -2, 3, 2),
+        ] {
+            assert_eq!(
+                div_round(numerator, denominator, RoundingMode::Up).expect("round up"),
+                up
+            );
+            assert_eq!(
+                div_round(numerator, denominator, RoundingMode::Down).expect("round down"),
+                down
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_value_preserves_scale_and_checks_overflow() {
+        for input in ["-2.50", "2.50"] {
+            let decimal = Decimal::parse(input).expect("valid");
+            assert_eq!(
+                decimal.checked_abs().expect("absolute value").to_string(),
+                "2.50"
+            );
+        }
+        assert!(matches!(
+            Decimal::from_integer(i64::MIN).checked_abs(),
+            Err(CoreError::NumericOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn coefficient_widens_the_signed_minor_units() {
+        let decimal = Decimal::new(i64::MIN, 9).expect("valid");
+        assert_eq!(decimal.coefficient(), -9_223_372_036_854_775_808);
+    }
+
+    #[test]
+    fn decimal_comparison_aligns_either_operand() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let one = Decimal::from_integer(1);
+        let exact = Decimal::parse("1.00").expect("valid");
+        let higher = Decimal::parse("1.01").expect("valid");
+        assert_eq!(one.partial_cmp(&exact), Some(Equal));
+        assert_eq!(exact.partial_cmp(&one), Some(Equal));
+        assert_eq!(one.partial_cmp(&higher), Some(Less));
+        assert_eq!(higher.partial_cmp(&one), Some(Greater));
+    }
+
+    #[test]
+    fn decimal_json_rejects_fractional_numbers_with_a_string_hint() {
+        let error =
+            serde_json::from_str::<Decimal>("0.15").expect_err("requires an exact decimal string");
+        assert!(error.to_string().contains("a decimal string"));
     }
 
     #[test]

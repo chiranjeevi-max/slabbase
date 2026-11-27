@@ -188,7 +188,6 @@ impl ColumnType {
             (Self::Select { options }, Value::Select(selected)) => {
                 options.iter().any(|option| option == selected)
             }
-            (Self::Formula { .. }, _) | (Self::Lookup { .. }, _) => false,
             _ => false,
         }
     }
@@ -630,127 +629,406 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Decimal, Money, SlabDate, SlabTimestamp};
 
-    fn table(name: &str, columns: &[&str]) -> Table {
+    fn column(table: &str, name: &str, ty: ColumnType) -> Column {
+        Column {
+            id: format!("c_{name}"),
+            table: table.into(),
+            name: name.into(),
+            ty,
+            required: false,
+            unique: false,
+            default: None,
+            position: 0,
+        }
+    }
+
+    fn table(name: &str, columns: &[(&str, ColumnType)]) -> Table {
         Table {
             id: format!("t_{name}"),
             name: name.to_owned(),
             columns: columns
                 .iter()
                 .enumerate()
-                .map(|(index, name)| Column {
-                    id: format!("c_{name}"),
-                    table: table_name(name),
-                    name: (*name).to_owned(),
-                    ty: ColumnType::Text,
-                    required: false,
-                    unique: false,
-                    default: None,
-                    position: u32::try_from(index).unwrap_or(0),
+                .map(|(index, (key, ty))| Column {
+                    position: u32::try_from(index).expect("test columns fit"),
+                    ..column(name, key, ty.clone())
                 })
                 .collect(),
             created_at: 0,
         }
     }
 
-    fn table_name(column: &str) -> String {
-        format!("t_{column}")
-    }
-
-    #[test]
-    fn rejects_duplicate_columns() {
-        let mut table = table("Clients", &["Name"]);
-        table.columns.push(table.columns[0].clone());
-        assert!(table.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_relation_cycles() {
-        let clients = Table {
-            id: "t_clients".into(),
-            name: "Clients".into(),
-            columns: vec![Column {
-                id: "c_client".into(),
-                table: "Clients".into(),
-                name: "Name".into(),
-                ty: ColumnType::Text,
-                required: false,
-                unique: false,
-                default: None,
-                position: 0,
-            }],
-            created_at: 0,
-        };
-        let projects = Table {
-            id: "t_projects".into(),
-            name: "Projects".into(),
-            columns: vec![Column {
-                id: "c_project".into(),
-                table: "Projects".into(),
-                name: "Client".into(),
-                ty: ColumnType::Integer,
-                required: false,
-                unique: false,
-                default: None,
-                position: 0,
-            }],
-            created_at: 0,
-        };
-        let relation = |name: &str, parent: &str, child: &str, column: &str| Relation {
+    fn relation(name: &str, parent: &str, child: &str, column: &str) -> Relation {
+        Relation {
             id: format!("r_{name}"),
             name: name.into(),
             parent_table: parent.into(),
             child_table: child.into(),
             child_column: column.into(),
             on_delete: DeleteAction::Cascade,
-        };
-        let schema = Schema {
-            tables: vec![clients, projects],
+        }
+    }
+
+    fn project_schema() -> Schema {
+        Schema {
+            tables: vec![
+                table(
+                    "Clients",
+                    &[("Name", ColumnType::Text), ("Active", ColumnType::Boolean)],
+                ),
+                table(
+                    "Projects",
+                    &[("Client", ColumnType::Integer), ("Title", ColumnType::Text)],
+                ),
+                table("Tasks", &[("Project", ColumnType::Integer)]),
+            ],
             relations: vec![
                 relation("Client Projects", "Clients", "Projects", "Client"),
-                relation("Project Clients", "Projects", "Clients", "Name"),
+                relation("Project Tasks", "Projects", "Tasks", "Project"),
             ],
             layouts: Vec::new(),
-        };
-        assert!(schema.validate().is_err());
+        }
+    }
+
+    fn select(options: &[&str]) -> ColumnType {
+        ColumnType::Select {
+            options: options.iter().map(|option| (*option).into()).collect(),
+        }
+    }
+
+    fn formula(expression: &str) -> ColumnType {
+        ColumnType::Formula {
+            expression: expression.into(),
+        }
+    }
+
+    fn lookup(relation: &str, column: &str) -> ColumnType {
+        ColumnType::Lookup {
+            relation: relation.into(),
+            column: column.into(),
+            aggregate: Aggregate::Count,
+        }
+    }
+
+    fn assert_invalid(result: Result<(), CoreError>, expected: &str) {
+        match result.expect_err(expected) {
+            CoreError::InvalidColumn { reason } => assert_eq!(reason, expected),
+            other => panic!("expected invalid column for {expected}, got {other}"),
+        }
     }
 
     #[test]
-    fn rejects_set_null_relations() {
-        let clients = table("Clients", &["Name"]);
-        let mut projects = table("Projects", &["Client"]);
-        projects.columns[0].ty = ColumnType::Integer;
-        let relation = Relation {
-            id: "r_set_null".into(),
-            name: "Client Projects".into(),
-            parent_table: "Clients".into(),
-            child_table: "Projects".into(),
-            child_column: "Client".into(),
-            on_delete: DeleteAction::SetNull,
-        };
-        let schema = Schema {
-            tables: vec![clients, projects],
-            relations: vec![relation],
-            layouts: Vec::new(),
-        };
-        assert!(
-            schema.validate().is_err(),
-            "SET NULL is not supported and must be rejected before a delete can mis-restore it"
+    fn types_report_stable_names_and_storage_kind() {
+        let usd = CurrencyCode::parse("USD").expect("currency");
+        for (ty, name, stored) in [
+            (ColumnType::Text, "text", true),
+            (ColumnType::Integer, "integer", true),
+            (ColumnType::Decimal { scale: 2 }, "decimal", true),
+            (ColumnType::Currency { currency: usd }, "currency", true),
+            (ColumnType::Boolean, "boolean", true),
+            (ColumnType::Date, "date", true),
+            (ColumnType::Timestamp, "timestamp", true),
+            (select(&["Active"]), "select", true),
+            (ColumnType::AttachmentRef, "attachment", true),
+            (formula("1"), "formula", false),
+            (lookup("Client Projects", "Title"), "lookup", false),
+        ] {
+            assert_eq!(ty.name(), name);
+            assert_eq!(ty.is_stored(), stored, "{name}");
+            assert_eq!(ty.is_computed(), !stored, "{name}");
+        }
+    }
+
+    #[test]
+    fn aggregate_labels_and_delete_clauses_are_stable() {
+        for (aggregate, label) in [
+            (Aggregate::Count, "count"),
+            (Aggregate::Sum, "sum"),
+            (Aggregate::Avg, "avg"),
+            (Aggregate::Min, "min"),
+            (Aggregate::Max, "max"),
+        ] {
+            assert_eq!(aggregate.as_str(), label);
+        }
+        for (action, sql) in [
+            (DeleteAction::Cascade, "CASCADE"),
+            (DeleteAction::SetNull, "SET NULL"),
+            (DeleteAction::Restrict, "RESTRICT"),
+        ] {
+            assert_eq!(action.sql(), sql);
+        }
+    }
+
+    #[test]
+    fn validates_column_type_configuration() {
+        for ty in [
+            ColumnType::Decimal { scale: 0 },
+            ColumnType::Decimal { scale: MAX_SCALE },
+            select(&["Open", "Closed"]),
+            formula("1"),
+            lookup("Client Projects", "Title"),
+        ] {
+            ty.validate("Clients", "Details")
+                .expect("valid column type");
+        }
+
+        let scale = MAX_SCALE + 1;
+        let scale_error = format!("Clients.Details: decimal scale {scale} exceeds {MAX_SCALE}");
+        for (ty, reason) in [
+            (ColumnType::Decimal { scale }, scale_error.as_str()),
+            (select(&[]), "Clients.Details: select has no options"),
+            (select(&[" \t"]), "Clients.Details: empty select option"),
+            (
+                select(&["Open", "Open"]),
+                "Clients.Details: duplicate select option \"Open\"",
+            ),
+            (formula(" \t"), "Clients.Details: formula is empty"),
+            (
+                lookup("Missing!", "Title"),
+                "Clients.Details: invalid relation name \"Missing!\"",
+            ),
+            (
+                lookup("Client Projects", "id"),
+                "Clients.Details: invalid lookup column \"id\"",
+            ),
+        ] {
+            assert_invalid(ty.validate("Clients", "Details"), reason);
+        }
+    }
+
+    #[test]
+    fn accepts_values_of_the_declared_type() {
+        let usd = CurrencyCode::parse("USD").expect("currency");
+        let eur = CurrencyCode::parse("EUR").expect("currency");
+        let amount = |currency| Value::Currency(Money::from_minor(currency, 125).expect("money"));
+        for (ty, value) in [
+            (ColumnType::Text, Value::Text("SlabBase".into())),
+            (ColumnType::Integer, Value::Integer(4)),
+            (
+                ColumnType::Decimal { scale: 2 },
+                Value::Decimal(Decimal::new(125, 2).expect("decimal")),
+            ),
+            (ColumnType::Decimal { scale: 2 }, Value::Integer(4)),
+            (ColumnType::Currency { currency: usd }, amount(usd)),
+            (ColumnType::Boolean, Value::Boolean(true)),
+            (
+                ColumnType::Date,
+                Value::Date(SlabDate::from_ymd(2024, 2, 29).expect("leap day")),
+            ),
+            (
+                ColumnType::Timestamp,
+                Value::Timestamp(SlabTimestamp::from_millis(86_400_000)),
+            ),
+            (select(&["Open", "Closed"]), Value::Select("Closed".into())),
+            (
+                ColumnType::AttachmentRef,
+                Value::AttachmentRef("attachment-1".into()),
+            ),
+        ] {
+            assert!(ty.accepts(&value), "{ty:?} should accept {value:?}");
+            assert!(ty.accepts(&Value::Null), "{ty:?} should accept null");
+        }
+
+        for (ty, value) in [
+            (ColumnType::Integer, Value::Text("4".into())),
+            (ColumnType::Currency { currency: usd }, amount(eur)),
+            (select(&["Open", "Closed"]), Value::Select("Pending".into())),
+            (select(&["Open", "Closed"]), Value::Text("Open".into())),
+            (formula("1"), Value::Integer(1)),
+            (lookup("Client Projects", "Title"), Value::Integer(1)),
+        ] {
+            assert!(!ty.accepts(&value), "{ty:?} should reject {value:?}");
+            assert!(ty.accepts(&Value::Null), "{ty:?} should accept null");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_columns() {
+        let mut table = table("Clients", &[("Name", ColumnType::Text)]);
+        table.validate().expect("one column with a distinct name");
+        table.columns.push(table.columns[0].clone());
+        assert_invalid(table.validate(), "Clients: duplicate column Name");
+    }
+
+    #[test]
+    fn rejects_relation_cycles() {
+        let mut schema = project_schema();
+        schema.validate().expect("acyclic relation chain");
+        schema.tables[0]
+            .columns
+            .push(column("Clients", "Task", ColumnType::Integer));
+        schema
+            .relations
+            .push(relation("Task Clients", "Tasks", "Clients", "Task"));
+        assert_invalid(
+            schema.validate(),
+            "relation cycle involving Clients and Clients",
         );
     }
 
     #[test]
-    fn defaults_must_match_column_type() {
-        let column = Column {
-            id: "c".into(),
-            table: "Clients".into(),
-            name: "Active".into(),
-            ty: ColumnType::Boolean,
-            required: false,
-            unique: false,
-            default: Some(Value::Text("yes".into())),
-            position: 0,
+    fn rejects_set_null_relations() {
+        let mut schema = project_schema();
+        schema.relations[0].on_delete = DeleteAction::SetNull;
+        assert_invalid(
+            schema.validate(),
+            "relation Client Projects: SET NULL is not supported",
+        );
+    }
+
+    #[test]
+    fn validates_column_defaults() {
+        for (default, required, reason) in [
+            (Value::Boolean(true), true, None),
+            (Value::Null, false, None),
+            (
+                Value::Null,
+                true,
+                Some("Clients.Active: required column cannot default to null"),
+            ),
+            (
+                Value::Text("yes".into()),
+                false,
+                Some("Clients.Active: default value is text but column is boolean"),
+            ),
+        ] {
+            let column = Column {
+                required,
+                default: Some(default),
+                ..column("Clients", "Active", ColumnType::Boolean)
+            };
+            match reason {
+                None => column.validate().expect("compatible default"),
+                Some(reason) => assert_invalid(column.validate(), reason),
+            }
+        }
+    }
+
+    #[test]
+    fn only_stored_columns_can_be_unique() {
+        let stored = Column {
+            unique: true,
+            ..column("Clients", "Name", ColumnType::Text)
         };
-        assert!(column.validate().is_err());
+        stored.validate().expect("stored columns can be unique");
+
+        let mut computed = column("Clients", "Total", formula("1"));
+        computed
+            .validate()
+            .expect("computed column without uniqueness");
+        computed.unique = true;
+        assert_invalid(
+            computed.validate(),
+            "Clients.Total: computed columns cannot be unique",
+        );
+    }
+
+    #[test]
+    fn rejects_self_relations() {
+        let relation = relation("Client Clients", "Clients", "Clients", "Client");
+        assert_invalid(
+            relation.validate(),
+            "relation Client Clients: self relations are not supported",
+        );
+    }
+
+    #[test]
+    fn finds_named_tables_columns_and_relations() {
+        let mut schema = project_schema();
+        let projects = schema.table("Projects").expect("Projects table");
+        assert_eq!(projects.name, "Projects");
+        assert_eq!(
+            projects.column("Title").expect("Title column").name,
+            "Title"
+        );
+        assert!(projects.column("Missing").is_none());
+        assert!(schema.table("Missing").is_none());
+        assert!(schema.relation("Missing").is_none());
+        assert_eq!(
+            schema
+                .relation("Project Tasks")
+                .expect("relation")
+                .child_table,
+            "Tasks"
+        );
+
+        let projects = schema
+            .table_mut("Projects")
+            .expect("mutable Projects table");
+        projects
+            .column_mut("Title")
+            .expect("mutable Title column")
+            .required = true;
+        assert!(projects.column_mut("Missing").is_none());
+        assert!(schema.table_mut("Missing").is_none());
+        assert!(schema.tables[1].columns[1].required);
+        assert!(!schema.tables[1].columns[0].required);
+        assert!(!schema.tables[0].columns[1].required);
+    }
+
+    #[test]
+    fn filters_stored_columns_and_relation_directions() {
+        let mut schema = project_schema();
+        schema.tables[0]
+            .columns
+            .push(column("Clients", "Total", formula("1")));
+        let stored: Vec<_> = schema.tables[0]
+            .stored_columns()
+            .map(|col| col.name.as_str())
+            .collect();
+        assert_eq!(stored, ["Name", "Active"]);
+
+        let children: Vec<_> = schema
+            .child_relations("Projects")
+            .map(|relation| relation.name.as_str())
+            .collect();
+        assert_eq!(children, ["Project Tasks"]);
+        let parents: Vec<_> = schema
+            .parent_relations("Projects")
+            .map(|relation| relation.name.as_str())
+            .collect();
+        assert_eq!(parents, ["Client Projects"]);
+    }
+
+    #[test]
+    fn rejects_duplicate_tables_and_relations() {
+        let mut schema = project_schema();
+        schema.tables.push(schema.tables[0].clone());
+        assert_invalid(schema.validate(), "duplicate table Clients");
+        schema.tables.pop();
+
+        schema.relations.push(schema.relations[0].clone());
+        assert_invalid(schema.validate(), "duplicate relation Client Projects");
+    }
+
+    #[test]
+    fn relations_require_stored_child_columns() {
+        let mut schema = project_schema();
+        schema.tables[1].columns[0].ty = formula("1");
+        assert_invalid(
+            schema.validate(),
+            "relation Client Projects: child column must be stored",
+        );
+    }
+
+    #[test]
+    fn lookup_must_use_a_relation_owned_by_the_columns_table() {
+        let mut schema = project_schema();
+        let ty = lookup("Client Projects", "Title");
+        schema.tables[0]
+            .columns
+            .push(column("Clients", "Total", ty.clone()));
+        schema
+            .validate()
+            .expect("lookup on the relation's parent table");
+        schema.tables[1]
+            .columns
+            .push(column("Projects", "Total", ty));
+        assert_invalid(
+            schema.validate(),
+            "Projects.Total: lookup relation Client Projects belongs to Clients",
+        );
     }
 }
