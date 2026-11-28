@@ -33,23 +33,13 @@ const DENSITIES: Array<{ value: Density; label: string }> = [
 export function AppearancePopover() {
   const open = useStore((state) => state.appearanceOpen);
   const appearance = useStore((state) => state.appearance);
-  const resolvedTheme = useStore((state) => state.resolvedTheme);
   const setOpen = useStore((state) => state.setAppearanceOpen);
   const setAppearance = useStore((state) => state.setAppearance);
 
   const anchorRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const presence = usePresence(open, 110);
-  const activeHex =
-    appearance.accent === "custom"
-      ? normalizeHex(appearance.customAccent) ?? appearance.customAccent
-      : ACCENTS[appearance.accent][resolvedTheme];
-  const [hexDraft, setHexDraft] = useState(activeHex);
-
-  useEffect(() => {
-    setHexDraft(activeHex);
-  }, [activeHex, open]);
-
+  const accentControls = useAccentControls(open);
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: MouseEvent) => {
@@ -69,16 +59,6 @@ export function AppearancePopover() {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [open, setOpen]);
-
-  const commitHex = () => {
-    const normalized = normalizeHex(hexDraft);
-    if (normalized) {
-      setAppearance({ accent: "custom", customAccent: normalized });
-      setHexDraft(normalized);
-    } else {
-      setHexDraft(activeHex);
-    }
-  };
 
   return (
     <div className="appearance-anchor" ref={anchorRef}>
@@ -147,76 +127,7 @@ export function AppearancePopover() {
         </section>
 
         <section className="appearance-section">
-          <span className="appearance-label">Accent</span>
-          <div className="accent-grid" role="group" aria-label="Accent">
-            {ACCENT_IDS.map((id) => (
-              <button
-                type="button"
-                key={id}
-                className="accent-swatch"
-                data-accent-option={id}
-                aria-label={`${ACCENTS[id].label} accent`}
-                aria-pressed={appearance.accent === id}
-                title={ACCENTS[id].label}
-                style={
-                  {
-                    "--swatch-color": accentHexFor(
-                      { ...appearance, accent: id } as AppearancePrefs,
-                      resolvedTheme,
-                    ),
-                  } as CSSProperties
-                }
-                onClick={() => setAppearance({ accent: id })}
-              />
-            ))}
-            <button
-              type="button"
-              className="accent-swatch custom"
-              aria-label="Custom accent"
-              aria-pressed={appearance.accent === "custom"}
-              title="Custom accent"
-              data-accent-option="custom"
-              style={
-                {
-                  "--swatch-color": accentHexFor(
-                    { ...appearance, accent: "custom" },
-                    resolvedTheme,
-                  ),
-                } as CSSProperties
-              }
-              onClick={() => setAppearance({ accent: "custom" })}
-            />
-          </div>
-          <div className="accent-custom">
-            <input
-              type="color"
-              aria-label="Custom accent color"
-              value={normalizeHex(hexDraft) ?? activeHex}
-              onChange={(event) => {
-                const next = normalizeHex(event.target.value);
-                if (!next) return;
-                setHexDraft(next);
-                setAppearance({ accent: "custom", customAccent: next });
-              }}
-            />
-            <input
-              type="text"
-              className="field-input"
-              aria-label="Custom accent hex"
-              data-testid="accent-hex"
-              value={hexDraft}
-              spellCheck={false}
-              onChange={(event) => setHexDraft(event.target.value)}
-              onBlur={commitHex}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  commitHex();
-                }
-                if (event.key === "Escape") setHexDraft(activeHex);
-              }}
-            />
-          </div>
+          <AccentControls {...accentControls} />
         </section>
 
         <section className="appearance-section">
@@ -237,5 +148,117 @@ export function AppearancePopover() {
         </div>
       )}
     </div>
+  );
+}
+
+function useAccentControls(open: boolean) {
+  const appearance = useStore((state) => state.appearance);
+  const resolvedTheme = useStore((state) => state.resolvedTheme);
+  const setAppearance = useStore((state) => state.setAppearance);
+  const activeHex =
+    appearance.accent === "custom"
+      ? normalizeHex(appearance.customAccent) ?? appearance.customAccent
+      : ACCENTS[appearance.accent][resolvedTheme];
+  const [hexDraft, setHexDraft] = useState(activeHex);
+
+  useEffect(() => {
+    setHexDraft(activeHex);
+  }, [activeHex, open]);
+
+  const commitHex = () => {
+    const normalized = normalizeHex(hexDraft);
+    if (normalized) {
+      setAppearance({ accent: "custom", customAccent: normalized });
+      setHexDraft(normalized);
+    } else {
+      setHexDraft(activeHex);
+    }
+  };
+
+  return { appearance, resolvedTheme, setAppearance, activeHex, hexDraft, setHexDraft, commitHex };
+}
+
+function AccentControls({
+  appearance,
+  resolvedTheme,
+  setAppearance,
+  activeHex,
+  hexDraft,
+  setHexDraft,
+  commitHex,
+}: ReturnType<typeof useAccentControls>) {
+  return (
+    <>
+      <span className="appearance-label">Accent</span>
+      <div className="accent-grid" role="group" aria-label="Accent">
+        {ACCENT_IDS.map((id) => (
+          <button
+            type="button"
+            key={id}
+            className="accent-swatch"
+            data-accent-option={id}
+            aria-label={`${ACCENTS[id].label} accent`}
+            aria-pressed={appearance.accent === id}
+            title={ACCENTS[id].label}
+            style={
+              {
+                "--swatch-color": accentHexFor(
+                  { ...appearance, accent: id } as AppearancePrefs,
+                  resolvedTheme,
+                ),
+              } as CSSProperties
+            }
+            onClick={() => setAppearance({ accent: id })}
+          />
+        ))}
+        <button
+          type="button"
+          className="accent-swatch custom"
+          aria-label="Custom accent"
+          aria-pressed={appearance.accent === "custom"}
+          title="Custom accent"
+          data-accent-option="custom"
+          style={
+            {
+              "--swatch-color": accentHexFor(
+                { ...appearance, accent: "custom" },
+                resolvedTheme,
+              ),
+            } as CSSProperties
+          }
+          onClick={() => setAppearance({ accent: "custom" })}
+        />
+      </div>
+      <div className="accent-custom">
+        <input
+          type="color"
+          aria-label="Custom accent color"
+          value={normalizeHex(hexDraft) ?? activeHex}
+          onChange={(event) => {
+            const next = normalizeHex(event.target.value);
+            if (!next) return;
+            setHexDraft(next);
+            setAppearance({ accent: "custom", customAccent: next });
+          }}
+        />
+        <input
+          type="text"
+          className="field-input"
+          aria-label="Custom accent hex"
+          data-testid="accent-hex"
+          value={hexDraft}
+          spellCheck={false}
+          onChange={(event) => setHexDraft(event.target.value)}
+          onBlur={commitHex}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              commitHex();
+            }
+            if (event.key === "Escape") setHexDraft(activeHex);
+          }}
+        />
+      </div>
+    </>
   );
 }

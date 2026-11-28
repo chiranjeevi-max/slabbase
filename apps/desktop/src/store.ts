@@ -1,48 +1,25 @@
+import { layoutFor, workspaceActions } from "./storeWorkspace";
+import { schemaActions } from "./storeSchema";
+import { recordActions } from "./storeRecords";
 import { create } from "zustand";
-import { api, frameRecords, isCancelledError, SlabError, type RowValues } from "./api";
+import { api, frameRecords, isCancelledError, SlabError } from "./api";
 import {
   applyAppearance,
   initialAppearance,
   mergeAppearance,
   resolveTheme,
   saveAppearance,
-  type AppearancePrefs,
-  type ResolvedTheme,
 } from "./appearance";
 import type {
-  AuditEntry,
-  ColumnDraft,
   Filter,
-  IndexHint,
-  IndexSpec,
-  IntegrityReportDto,
-  Layout,
   PageQuery,
-  Record as SlabRecord,
-  RecordBundle,
-  RecordRevision,
-  RelationDraft,
-  Schema,
   SortSpec,
-  TableDraft,
   UndoState,
-  Value,
-  WorkspaceInfoDto,
 } from "./bindings";
 
-export type Tone = "info" | "success" | "error";
+import type { AppStore, Tone, Toast } from "./storeTypes";
 
-export interface Toast {
-  id: number;
-  tone: Tone;
-  message: string;
-  code?: string;
-}
-
-export interface FormStatus {
-  name: string;
-  items: number;
-}
+export type { AppStore, FormStatus, Tone, Toast } from "./storeTypes";
 
 const PAGE_SIZE = 200;
 
@@ -55,22 +32,8 @@ const EMPTY_UNDO: UndoState = {
 };
 
 let pageRequest = 0;
-let inspectorRequest = 0;
+const inspectorRequest = { token: 0 };
 let toastCounter = 0;
-
-function firstTable(schema: Schema | null): string | null {
-  return schema?.tables[0]?.name ?? null;
-}
-
-function layoutFor(schema: Schema | null, table: string | null): Layout | null {
-  if (!schema || !table) return null;
-  return schema.layouts.find((layout) => layout.table === table) ?? null;
-}
-
-function firstEditableColumn(schema: Schema | null, table: string | null): string {
-  const definition = schema?.tables.find((candidate) => candidate.name === table);
-  return definition?.columns[0]?.name ?? "id";
-}
 
 function describeError(error: unknown): { message: string; code?: string } {
   if (error instanceof SlabError) return { message: error.message, code: error.code };
@@ -98,136 +61,6 @@ export function pageQueryFor(
   };
 }
 
-export interface AppStore {
-  info: WorkspaceInfoDto | null;
-  schema: Schema | null;
-  booting: boolean;
-  busy: boolean;
-  appearance: AppearancePrefs;
-  resolvedTheme: ResolvedTheme;
-  appearanceOpen: boolean;
-  formStatus: FormStatus | null;
-  toast: Toast | null;
-
-  activeTable: string | null;
-  activeLayoutId: string | null;
-  view: "table" | "form" | "schema";
-  inspectorOpen: boolean;
-  rows: SlabRecord[];
-  nextCursor: PageQuery["cursor"];
-  hasMore: boolean;
-  elapsedMs: number;
-  loadingRows: boolean;
-  sort: SortSpec[];
-  filters: Filter[];
-  filterColumn: string;
-  filterText: string;
-  indexHint: IndexHint | null;
-
-  selectedId: number | null;
-  bundle: RecordBundle | null;
-  bundleTable: string | null;
-  creating: boolean;
-  undoState: UndoState;
-  historyOpen: boolean;
-  recordHistory: RecordRevision[];
-  historyLoading: boolean;
-
-  paletteOpen: boolean;
-  schemaOpen: boolean;
-  schemaTab: "table" | "column" | "relation";
-  schemaTargetTable: string | null;
-  importOpen: boolean;
-  printOpen: boolean;
-  auditOpen: boolean;
-  audit: AuditEntry[];
-  saveTick: number;
-  historyTick: number;
-  integrity: string;
-  integrityReport: IntegrityReportDto | null;
-  integrityCheckedAt: number | null;
-
-  initialize: () => Promise<void>;
-  openWorkspace: (path: string) => Promise<void>;
-  createWorkspace: (path: string, name: string) => Promise<void>;
-  loadSample: () => Promise<void>;
-  closeWorkspace: () => Promise<void>;
-
-  notify: (tone: Tone, message: string, code?: string) => void;
-  clearToast: () => void;
-  setAppearance: (patch: Partial<Omit<AppearancePrefs, "version">>) => void;
-  setAppearanceOpen: (open: boolean) => void;
-  setFormStatus: (status: FormStatus | null) => void;
-
-  selectTable: (table: string) => Promise<void>;
-  selectLayout: (id: string) => void;
-  setView: (view: "table" | "form" | "schema") => void;
-  toggleInspector: () => void;
-  setInspectorOpen: (open: boolean) => void;
-  setSort: (column: string) => Promise<void>;
-  setFilterColumn: (column: string) => void;
-  applyFilter: (text: string) => Promise<void>;
-  clearFilter: () => Promise<void>;
-  loadFirstPage: () => Promise<void>;
-  loadMore: () => Promise<void>;
-
-  applyIndexHint: () => Promise<void>;
-  dismissIndexHint: () => void;
-  openHistory: () => Promise<void>;
-  closeHistory: () => void;
-  restoreRevision: (auditId: number) => Promise<boolean>;
-
-  selectRow: (id: number) => Promise<void>;
-  updatePortalRow: (
-    table: string,
-    id: number,
-    column: string,
-    value: Value,
-  ) => Promise<SlabRecord | null>;
-  insertPortalRow: (table: string, values: RowValues) => Promise<SlabRecord | null>;
-  deletePortalRow: (table: string, id: number) => Promise<boolean>;
-  jumpToRecord: (table: string, id: number) => Promise<void>;
-  closeRecord: () => void;
-  refreshBundle: () => Promise<void>;
-  beginCreate: () => void;
-  cancelCreate: () => void;
-
-  updateCell: (
-    table: string,
-    id: number,
-    column: string,
-    value: Value,
-  ) => Promise<boolean>;
-  insertRecord: (values: RowValues) => Promise<boolean>;
-  deleteRecord: (id: number) => Promise<void>;
-
-  undo: () => Promise<void>;
-  redo: () => Promise<void>;
-
-  createTable: (draft: TableDraft) => Promise<boolean>;
-  addColumn: (table: string, draft: ColumnDraft) => Promise<boolean>;
-  createRelation: (draft: RelationDraft) => Promise<boolean>;
-  renameTable: (oldName: string, newName: string) => Promise<boolean>;
-  renameColumn: (table: string, oldName: string, newName: string) => Promise<boolean>;
-  dropTable: (name: string) => Promise<boolean>;
-  dropColumn: (table: string, column: string) => Promise<boolean>;
-  dropRelation: (name: string) => Promise<boolean>;
-  toggleIndex: (table: string, column: string, enabled: boolean) => Promise<IndexSpec[] | null>;
-  saveLayout: (layout: Layout) => Promise<boolean>;
-
-  openAudit: () => Promise<void>;
-  closeAudit: () => void;
-  backup: (path: string) => Promise<boolean>;
-  checkIntegrity: () => Promise<void>;
-  refreshAfterImport: () => Promise<void>;
-
-  setPaletteOpen: (open: boolean) => void;
-  setSchemaOpen: (open: boolean) => void;
-  openSchema: (tab: "table" | "column" | "relation", table?: string) => void;
-  setImportOpen: (open: boolean) => void;
-  setPrintOpen: (open: boolean) => void;
-}
-
 export const useStore = create<AppStore>((set, get) => {
   const notify = (tone: Tone, message: string, code?: string) => {
     const toast: Toast = { id: ++toastCounter, tone, message, code };
@@ -240,38 +73,6 @@ export const useStore = create<AppStore>((set, get) => {
   const notifyError = (error: unknown) => {
     const described = describeError(error);
     notify("error", described.message, described.code);
-  };
-
-  const refreshMeta = async () => {
-    const [schema, info, undoState] = await Promise.all([
-      api.getSchema(),
-      api.workspaceInfo(),
-      api.undoState(),
-    ]);
-    const state = get();
-    const activeTable =
-      state.activeTable && schema.tables.some((table) => table.name === state.activeTable)
-        ? state.activeTable
-        : firstTable(schema);
-    const activeLayoutId =
-      schema.layouts.find(
-        (layout) => layout.id === state.activeLayoutId && layout.table === activeTable,
-      )?.id ??
-      layoutFor(schema, activeTable)?.id ??
-      null;
-    const selectionIsCurrent =
-      state.selectedId !== null && state.bundleTable === activeTable;
-    set({
-      schema,
-      info: info ?? state.info,
-      undoState,
-      activeTable,
-      activeLayoutId,
-      ...(selectionIsCurrent
-        ? {}
-        : { selectedId: null, bundle: null, bundleTable: null }),
-    });
-    return { schema, activeTable };
   };
 
   const loadFirstPage = async () => {
@@ -316,6 +117,17 @@ export const useStore = create<AppStore>((set, get) => {
   };
 
   return {
+    ...recordActions({ set, get, notify, notifyError, inspectorRequest, loadFirstPage }),
+    ...schemaActions({ set, get, notify, notifyError }),
+    ...workspaceActions({
+      set,
+      get,
+      notify,
+      notifyError,
+      inspectorRequest,
+      invalidatePage: () => { pageRequest += 1; },
+      loadFirstPage,
+    }),
     info: null,
     schema: null,
     booting: true,
@@ -364,114 +176,6 @@ export const useStore = create<AppStore>((set, get) => {
     integrityReport: null,
     integrityCheckedAt: null,
 
-    initialize: async () => {
-      pageRequest += 1;
-      inspectorRequest += 1;
-      set({
-        booting: true,
-        bundle: null,
-        bundleTable: null,
-        selectedId: null,
-        loadingRows: false,
-      });
-      try {
-        const info = await api.workspaceInfo();
-        if (!info) {
-          set({ info: null, schema: null, booting: false, activeTable: null });
-          return;
-        }
-        const schema = await api.getSchema();
-        const undoState = await api.undoState();
-        const activeTable = firstTable(schema);
-        set({
-          info,
-          schema,
-          undoState,
-          booting: false,
-          activeTable,
-          activeLayoutId: layoutFor(schema, activeTable)?.id ?? null,
-          filterColumn: firstEditableColumn(schema, activeTable),
-          rows: [],
-          selectedId: null,
-          bundle: null,
-          bundleTable: null,
-          creating: false,
-          inspectorOpen: false,
-        });
-        if (activeTable) await loadFirstPage();
-      } catch (error) {
-        set({ booting: false, info: null, schema: null });
-        notifyError(error);
-      }
-    },
-
-    openWorkspace: async (path) => {
-      pageRequest += 1;
-      inspectorRequest += 1;
-      set({ busy: true });
-      try {
-        await api.openWorkspace(path);
-        set({ busy: false, view: "table", sort: [], filters: [], filterText: "", inspectorOpen: false });
-        await get().initialize();
-        notify("success", "Workspace opened");
-      } catch (error) {
-        set({ busy: false });
-        notifyError(error);
-      }
-    },
-
-    createWorkspace: async (path, name) => {
-      pageRequest += 1;
-      inspectorRequest += 1;
-      set({ busy: true });
-      try {
-        await api.createWorkspace(path, name);
-        set({ busy: false, view: "table", sort: [], filters: [], filterText: "", inspectorOpen: false });
-        await get().initialize();
-        notify("success", "Workspace created");
-      } catch (error) {
-        set({ busy: false });
-        notifyError(error);
-      }
-    },
-
-    loadSample: async () => {
-      pageRequest += 1;
-      inspectorRequest += 1;
-      set({ busy: true });
-      try {
-        await api.loadSample();
-        set({ busy: false, view: "table", sort: [], filters: [], filterText: "", inspectorOpen: false });
-        await get().initialize();
-        notify("success", "Sample studio loaded");
-      } catch (error) {
-        set({ busy: false });
-        notifyError(error);
-      }
-    },
-
-    closeWorkspace: async () => {
-      pageRequest += 1;
-      inspectorRequest += 1;
-      try {
-        await api.closeWorkspace();
-        set({
-          info: null,
-          schema: null,
-          rows: [],
-          bundle: null,
-          bundleTable: null,
-          selectedId: null,
-          activeTable: null,
-          view: "table",
-          inspectorOpen: false,
-          loadingRows: false,
-        });
-      } catch (error) {
-        notifyError(error);
-      }
-    },
-
     notify,
     clearToast: () => set({ toast: null }),
 
@@ -489,7 +193,7 @@ export const useStore = create<AppStore>((set, get) => {
     selectTable: async (table) => {
       const state = get();
       if (state.activeTable === table) return;
-      inspectorRequest += 1;
+      inspectorRequest.token += 1;
       const definition = state.schema?.tables.find((candidate) => candidate.name === table);
       set({
         activeTable: table,
@@ -586,55 +290,6 @@ export const useStore = create<AppStore>((set, get) => {
 
     dismissIndexHint: () => set({ indexHint: null }),
 
-    openHistory: async () => {
-      const state = get();
-      if (!state.activeTable || state.selectedId === null) return;
-      const table = state.activeTable;
-      const id = state.selectedId;
-      const token = inspectorRequest;
-      set({ historyOpen: true, historyLoading: true });
-      try {
-        const recordHistory = await api.recordHistory(table, id);
-        if (token !== inspectorRequest) return;
-        const current = get();
-        if (current.activeTable !== table || current.selectedId !== id) return;
-        set({ recordHistory, historyLoading: false });
-      } catch (error) {
-        if (token !== inspectorRequest) return;
-        set({ historyLoading: false });
-        notifyError(error);
-      }
-    },
-
-    closeHistory: () => set({ historyOpen: false, recordHistory: [] }),
-
-    restoreRevision: async (auditId) => {
-      const state = get();
-      if (!state.activeTable || state.selectedId === null) return false;
-      const table = state.activeTable;
-      const id = state.selectedId;
-      try {
-        await api.restoreRecordRevision(table, id, auditId);
-        const [undoState, recordHistory] = await Promise.all([
-          api.undoState(),
-          api.recordHistory(table, id),
-        ]);
-        const current = get();
-        if (current.activeTable === table && current.selectedId === id) {
-          set({ undoState, recordHistory });
-        } else {
-          set({ undoState });
-        }
-        await get().loadFirstPage();
-        await get().refreshBundle();
-        notify("success", "Revision restored");
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
     loadMore: async () => {
       const state = get();
       if (!state.activeTable || state.loadingRows || !state.hasMore) return;
@@ -671,426 +326,6 @@ export const useStore = create<AppStore>((set, get) => {
       }
     },
 
-    selectRow: async (id) => {
-      const state = get();
-      if (!state.activeTable) return;
-      const table = state.activeTable;
-      const token = ++inspectorRequest;
-      set({
-        selectedId: id,
-        creating: false,
-        inspectorOpen: true,
-        historyOpen: false,
-        historyLoading: false,
-        recordHistory: [],
-      });
-      try {
-        const record = await api.readRecord(table, id);
-        if (token !== inspectorRequest) return;
-        const current = get();
-        if (current.activeTable !== table || current.selectedId !== id) return;
-        set({ bundle: { record, portals: {} }, bundleTable: table });
-      } catch (error) {
-        if (token !== inspectorRequest) return;
-        if (!isCancelledError(error)) notifyError(error);
-      }
-    },
-
-    jumpToRecord: async (table, id) => {
-      if (get().activeTable !== table) {
-        await get().selectTable(table);
-      }
-      await get().selectRow(id);
-    },
-
-    closeRecord: () => {
-      inspectorRequest += 1;
-      set({
-        selectedId: null,
-        bundle: null,
-        bundleTable: null,
-        inspectorOpen: false,
-        historyOpen: false,
-        recordHistory: [],
-      });
-    },
-
-    refreshBundle: async () => {
-      const state = get();
-      if (!state.activeTable || state.selectedId === null) return;
-      const table = state.activeTable;
-      const id = state.selectedId;
-      const token = inspectorRequest;
-      try {
-        const record = await api.readRecord(table, id);
-        if (token !== inspectorRequest) return;
-        const current = get();
-        if (current.activeTable !== table || current.selectedId !== id) return;
-        set({ bundle: { record, portals: {} }, bundleTable: table });
-      } catch (error) {
-        if (token !== inspectorRequest) return;
-        if (!isCancelledError(error)) notifyError(error);
-      }
-    },
-
-    beginCreate: () => {
-      inspectorRequest += 1;
-      set({
-        creating: true,
-        selectedId: null,
-        bundle: null,
-        bundleTable: null,
-        inspectorOpen: true,
-      });
-    },
-
-    cancelCreate: () => set({ creating: false }),
-
-    updateCell: async (table, id, column, value) => {
-      try {
-        const record = await api.updateRow(table, id, { [column]: value });
-        const undoState = await api.undoState();
-        // Check the *current* table after the round trip. A pre-await snapshot
-        // would still claim the old table and splice a foreign record into the
-        // new table's rows under a colliding id.
-        const current = get();
-        if (current.activeTable === table) {
-          set((latest) => ({
-            rows: latest.rows.map((row) => (row.id === id ? record : row)),
-            undoState,
-            saveTick: latest.saveTick + 1,
-          }));
-        } else {
-          set({ undoState, saveTick: current.saveTick + 1 });
-        }
-        await get().refreshBundle();
-        const info = await api.workspaceInfo();
-        if (info) set({ info });
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    insertRecord: async (values) => {
-      const state = get();
-      if (!state.activeTable) return false;
-      const table = state.activeTable;
-      const token = inspectorRequest;
-      try {
-        const record = await api.insertRow(table, values);
-        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        if (get().activeTable !== table || token !== inspectorRequest) {
-          // The user moved to another table or selected another row while the
-          // insert was in flight. Commit the row, refresh what is on screen,
-          // but do not hijack the inspector.
-          set({
-            creating: false,
-            undoState,
-            info: info ?? get().info,
-            saveTick: get().saveTick + 1,
-          });
-          await loadFirstPage();
-          notify("success", "Record created");
-          return true;
-        }
-        const claim = ++inspectorRequest;
-        set({
-          creating: false,
-          selectedId: record.id,
-          inspectorOpen: true,
-          undoState,
-          info: info ?? get().info,
-          saveTick: get().saveTick + 1,
-        });
-        await loadFirstPage();
-        if (
-          claim !== inspectorRequest ||
-          get().activeTable !== table ||
-          get().selectedId !== record.id
-        ) {
-          return true;
-        }
-        set({ bundle: { record, portals: {} }, bundleTable: table });
-        notify("success", "Record created");
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    deleteRecord: async (id) => {
-      const state = get();
-      if (!state.activeTable) return;
-      const table = state.activeTable;
-      try {
-        await api.deleteRow(table, id);
-        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        const current = get();
-        if (current.activeTable !== table) {
-          set({ undoState, info: info ?? current.info });
-          return;
-        }
-        if (current.selectedId !== id) {
-          // The user selected another row, or opened a draft, while the delete
-          // was in flight. Leave that selection alone.
-          set({ undoState, info: info ?? current.info });
-          await loadFirstPage();
-          notify("success", "Record deleted");
-          return;
-        }
-        inspectorRequest += 1;
-        set({
-          selectedId: null,
-          bundle: null,
-          bundleTable: null,
-          undoState,
-          info: info ?? current.info,
-          inspectorOpen: false,
-        });
-        await loadFirstPage();
-        notify("success", "Record deleted");
-      } catch (error) {
-        notifyError(error);
-      }
-    },
-
-    undo: async () => {
-      try {
-        const undoState = await api.undo();
-        set((current) => ({ undoState, historyTick: current.historyTick + 1 }));
-        await refreshMeta();
-        await get().loadFirstPage();
-        await get().refreshBundle();
-        notify("info", undoState.redo_label ? `Undid change` : "Undone");
-      } catch (error) {
-        notifyError(error);
-      }
-    },
-
-    redo: async () => {
-      try {
-        const undoState = await api.redo();
-        set((current) => ({ undoState, historyTick: current.historyTick + 1 }));
-        await refreshMeta();
-        await get().loadFirstPage();
-        await get().refreshBundle();
-        notify("info", "Redone");
-      } catch (error) {
-        notifyError(error);
-      }
-    },
-
-    createTable: async (draft) => {
-      try {
-        const table = await api.createTable(draft);
-        await refreshMeta();
-        await get().selectTable(table.name);
-        notify("success", `Table ${table.name} created`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    addColumn: async (table, draft) => {
-      try {
-        await api.addColumn(table, draft);
-        await refreshMeta();
-        await get().loadFirstPage();
-        await get().refreshBundle();
-        notify("success", `Column ${draft.name} added`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    createRelation: async (draft) => {
-      try {
-        await api.createRelation(draft);
-        await refreshMeta();
-        await get().refreshBundle();
-        notify("success", `Relation ${draft.name} created`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    renameTable: async (oldName, newName) => {
-      const state = get();
-      try {
-        await api.renameTable(oldName, newName);
-        await refreshMeta();
-        if (state.activeTable === oldName) {
-          const schema = get().schema;
-          set({
-            activeTable: newName,
-            activeLayoutId: layoutFor(schema, newName)?.id ?? null,
-            rows: [],
-            nextCursor: null,
-            hasMore: true,
-            selectedId: null,
-            bundle: null,
-            bundleTable: null,
-            creating: false,
-            inspectorOpen: false,
-          });
-        }
-        await get().loadFirstPage();
-        notify("success", `Table renamed to ${newName}`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    renameColumn: async (table, oldName, newName) => {
-      try {
-        await api.renameColumn(table, oldName, newName);
-        await refreshMeta();
-        await get().loadFirstPage();
-        await get().refreshBundle();
-        notify("success", `Column renamed to ${newName}`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    dropTable: async (name) => {
-      try {
-        await api.dropTable(name);
-        await refreshMeta();
-        set({
-          rows: [],
-          nextCursor: null,
-          hasMore: true,
-          selectedId: null,
-          bundle: null,
-          bundleTable: null,
-          creating: false,
-          inspectorOpen: false,
-        });
-        if (get().activeTable) await get().loadFirstPage();
-        notify("success", `Table ${name} dropped`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    dropColumn: async (table, column) => {
-      try {
-        await api.dropColumn(table, column);
-        await refreshMeta();
-        await get().loadFirstPage();
-        await get().refreshBundle();
-        notify("success", `Column ${column} dropped`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    dropRelation: async (name) => {
-      try {
-        await api.dropRelation(name);
-        await refreshMeta();
-        await get().refreshBundle();
-        notify("success", `Relation ${name} dropped`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    toggleIndex: async (table, column, enabled) => {
-      try {
-        const indexes = await api.toggleIndex(table, column, enabled);
-        notify("success", enabled ? `Index enabled on ${column}` : `Index removed from ${column}`);
-        return indexes;
-      } catch (error) {
-        notifyError(error);
-        return null;
-      }
-    },
-
-    saveLayout: async (layout) => {
-      try {
-        const saved = await api.saveLayout(layout);
-        await refreshMeta();
-        set({ activeLayoutId: saved.id, view: "form" });
-        notify("success", `Form ${saved.name} saved`);
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    openAudit: async () => {
-      try {
-        const audit = await api.auditEntries(100, 0);
-        set({ audit, auditOpen: true });
-      } catch (error) {
-        notifyError(error);
-      }
-    },
-
-    closeAudit: () => set({ auditOpen: false }),
-
-    backup: async (path) => {
-      try {
-        await api.backup(path);
-        notify("success", "Backup written");
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
-    checkIntegrity: async () => {
-      try {
-        const report = await api.integrityCheck();
-        const healthy =
-          report.integrity === "ok" &&
-          report.foreignKeyViolations === 0 &&
-          report.auditChain;
-        set({
-          integrity: healthy ? "ok" : "check",
-          integrityReport: report,
-          integrityCheckedAt: Date.now(),
-        });
-        notify(
-          healthy ? "success" : "error",
-          report.auditTamper
-            ? `Audit chain: ${report.auditTamper}`
-            : `SQLite integrity: ${report.integrity}; foreign keys: ${report.foreignKeyViolations}; audit entries: ${report.auditEntries}`,
-        );
-      } catch (error) {
-        notifyError(error);
-      }
-    },
-
-    refreshAfterImport: async () => {
-      await refreshMeta();
-      await get().loadFirstPage();
-      await get().refreshBundle();
-    },
-
     setPaletteOpen: (open) => set({ paletteOpen: open }),
     setSchemaOpen: (open) => set({ schemaOpen: open }),
     openSchema: (tab, table) =>
@@ -1101,57 +336,6 @@ export const useStore = create<AppStore>((set, get) => {
       }),
     setImportOpen: (open) => set({ importOpen: open }),
     setPrintOpen: (open) => set({ printOpen: open }),
-
-    updatePortalRow: async (table, id, column, value) => {
-      try {
-        const record = await api.updateRow(table, id, { [column]: value });
-        const undoState = await api.undoState();
-        const current = get();
-        set({ undoState, saveTick: current.saveTick + 1 });
-        await get().refreshBundle();
-        // Compare the live table, not a snapshot taken before the await.
-        if (get().activeTable === table) {
-          set((latest) => ({
-            rows: latest.rows.map((row) => (row.id === id ? record : row)),
-          }));
-        }
-        const info = await api.workspaceInfo();
-        if (info) set({ info });
-        return record;
-      } catch (error) {
-        notifyError(error);
-        return null;
-      }
-    },
-
-    insertPortalRow: async (table, values) => {
-      const state = get();
-      try {
-        const record = await api.insertRow(table, values);
-        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        set({ undoState, info: info ?? state.info, saveTick: state.saveTick + 1 });
-        await get().refreshBundle();
-        if (state.activeTable === table) await get().loadFirstPage();
-        return record;
-      } catch (error) {
-        notifyError(error);
-        return null;
-      }
-    },
-
-    deletePortalRow: async (table, id) => {
-      try {
-        await api.deleteRow(table, id);
-        const [undoState, info] = await Promise.all([api.undoState(), api.workspaceInfo()]);
-        set({ undoState, info: info ?? get().info });
-        await get().refreshBundle();
-        return true;
-      } catch (error) {
-        notifyError(error);
-        return false;
-      }
-    },
-
   };
 });
 

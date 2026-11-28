@@ -59,71 +59,7 @@ export function Palette() {
     };
   }, [query, open, notify]);
 
-  const commands = useMemo<Command[]>(() => {
-    const state = useStore.getState();
-    return [
-      {
-        id: "new-record",
-        label: "New record",
-        hint: "⌘N",
-        run: () => state.beginCreate(),
-      },
-      {
-        id: "import",
-        label: "Import CSV or JSON",
-        hint: "⇧⌘I",
-        run: () => state.setImportOpen(true),
-      },
-      {
-        id: "print",
-        label: "Print or export PDF",
-        hint: "⌘P",
-        run: () => state.setPrintOpen(true),
-      },
-      {
-        id: "form",
-        label: "Open Form Studio",
-        hint: "",
-        run: () => state.setView("form"),
-      },
-      {
-        id: "schema",
-        label: "Open Relations & Schema",
-        hint: "",
-        run: () => state.setView("schema"),
-      },
-      {
-        id: "inspector",
-        label: "Toggle Inspector",
-        hint: "",
-        run: () => state.toggleInspector(),
-      },
-      {
-        id: "audit",
-        label: "Audit Log",
-        hint: "",
-        run: () => void state.openAudit(),
-      },
-      {
-        id: "new-table",
-        label: "New table",
-        hint: "",
-        run: () => state.openSchema("table"),
-      },
-      {
-        id: "new-relation",
-        label: "New relation",
-        hint: "",
-        run: () => state.openSchema("relation"),
-      },
-      {
-        id: "appearance",
-        label: "Appearance…",
-        hint: "",
-        run: () => state.setAppearanceOpen(true),
-      },
-    ];
-  }, []);
+  const commands = useMemo(paletteCommands, []);
 
   if (!presence.mounted) return null;
 
@@ -251,6 +187,72 @@ export function Palette() {
       </div>
     </div>
   );
+}
+
+function paletteCommands(): Command[] {
+  const state = useStore.getState();
+  return [
+    {
+      id: "new-record",
+      label: "New record",
+      hint: "⌘N",
+      run: () => state.beginCreate(),
+    },
+    {
+      id: "import",
+      label: "Import CSV or JSON",
+      hint: "⇧⌘I",
+      run: () => state.setImportOpen(true),
+    },
+    {
+      id: "print",
+      label: "Print or export PDF",
+      hint: "⌘P",
+      run: () => state.setPrintOpen(true),
+    },
+    {
+      id: "form",
+      label: "Open Form Studio",
+      hint: "",
+      run: () => state.setView("form"),
+    },
+    {
+      id: "schema",
+      label: "Open Relations & Schema",
+      hint: "",
+      run: () => state.setView("schema"),
+    },
+    {
+      id: "inspector",
+      label: "Toggle Inspector",
+      hint: "",
+      run: () => state.toggleInspector(),
+    },
+    {
+      id: "audit",
+      label: "Audit Log",
+      hint: "",
+      run: () => void state.openAudit(),
+    },
+    {
+      id: "new-table",
+      label: "New table",
+      hint: "",
+      run: () => state.openSchema("table"),
+    },
+    {
+      id: "new-relation",
+      label: "New relation",
+      hint: "",
+      run: () => state.openSchema("relation"),
+    },
+    {
+      id: "appearance",
+      label: "Appearance…",
+      hint: "",
+      run: () => state.setAppearanceOpen(true),
+    },
+  ];
 }
 
 function Highlight({ snippet }: { snippet: string }) {

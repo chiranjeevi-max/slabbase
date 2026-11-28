@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Column, Cursor, Record as SlabRecord, Value } from "../bindings";
 import { DENSITY_ROW_HEIGHT } from "../appearance";
 import { api, frameRecords, isCancelledError } from "../api";
@@ -23,15 +23,9 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
   const historyTick = useStore((state) => state.historyTick);
   const relation = schema?.relations.find((candidate) => candidate.name === relationName);
   const child = schema?.tables.find((candidate) => candidate.name === relation?.child_table);
-  const [rows, setRows] = useState<SlabRecord[]>([]);
-  const [cursor, setCursor] = useState<Cursor | null>(null);
-  const [total, setTotal] = useState(0);
-  const [hasMore, setHasMore] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [scrollTop, setScrollTop] = useState(0);
+  const { rows, setRows, total, setTotal, hasMore, loading, scrollTop, setScrollTop, error, loadMore, reload } =
+    usePortalPages(relation?.name, child?.name, parentId, historyTick);
   const [pulse, setPulse] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const requestRef = useRef(0);
   const density = useStore((state) => state.appearance.density);
   const rowHeight = DENSITY_ROW_HEIGHT[density];
 
@@ -44,103 +38,7 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
             .filter((column): column is Column => column !== undefined)
         : child.columns.filter((column) => !isComputedColumn(column));
 
-  useEffect(() => {
-    if (!relation || !child) return;
-    const token = ++requestRef.current;
-    setRows([]);
-    setCursor(null);
-    setTotal(0);
-    setHasMore(false);
-    setScrollTop(0);
-    setError(null);
-    setLoading(true);
-    api
-      .pagePortal({
-        relation: relation.name,
-        parent_id: parentId,
-        limit: PAGE_SIZE,
-        cursor: null,
-      })
-      .then((page) => {
-        if (requestRef.current !== token) return;
-        setRows(frameRecords(page));
-        setCursor(page.next_cursor);
-        setTotal(page.total_rows);
-        setHasMore(page.next_cursor !== null);
-      })
-      .catch((reason: unknown) => {
-        if (requestRef.current !== token) return;
-        if (isCancelledError(reason)) return;
-        setError(reason instanceof Error ? reason.message : "Could not load child rows");
-        useStore.getState().notify("error", errorText(reason));
-      })
-      .finally(() => {
-        if (requestRef.current === token) setLoading(false);
-      });
-  }, [relation?.name, child?.name, parentId, historyTick]);
-
   if (!relation || !child) return null;
-
-  const loadMore = () => {
-    if (!hasMore || loading || !cursor) return;
-    const token = requestRef.current;
-    setLoading(true);
-    api
-      .pagePortal({
-        relation: relation.name,
-        parent_id: parentId,
-        limit: PAGE_SIZE,
-        cursor,
-      })
-      .then((page) => {
-        if (requestRef.current !== token) return;
-        setRows((current) => {
-          const seen = new Set(current.map((row) => row.id));
-          return [
-            ...current,
-            ...frameRecords(page).filter((row) => !seen.has(row.id)),
-          ];
-        });
-        setCursor(page.next_cursor);
-        setTotal(page.total_rows);
-        setHasMore(page.next_cursor !== null);
-      })
-      .catch((reason: unknown) => {
-        if (requestRef.current !== token) return;
-        if (!isCancelledError(reason)) useStore.getState().notify("error", errorText(reason));
-      })
-      .finally(() => {
-        if (requestRef.current === token) setLoading(false);
-      });
-  };
-
-  const reload = () => {
-    const token = ++requestRef.current;
-    setLoading(true);
-    setRows([]);
-    setCursor(null);
-    api
-      .pagePortal({
-        relation: relation.name,
-        parent_id: parentId,
-        limit: PAGE_SIZE,
-        cursor: null,
-      })
-      .then((page) => {
-        if (requestRef.current !== token) return;
-        setRows(frameRecords(page));
-        setCursor(page.next_cursor);
-        setTotal(page.total_rows);
-        setHasMore(page.next_cursor !== null);
-      })
-      .catch((reason: unknown) => {
-        if (requestRef.current !== token) return;
-        if (!isCancelledError(reason)) useStore.getState().notify("error", errorText(reason));
-      })
-      .finally(() => {
-        if (requestRef.current === token) setLoading(false);
-      });
-  };
 
   const update = async (rowId: number, column: Column, value: Value) => {
     const record = await useStore
@@ -293,6 +191,90 @@ export function PortalGrid({ relationName, columns, parentId }: PortalGridProps)
       </div>
     </div>
   );
+}
+
+function usePortalPages(
+  relationName: string | undefined,
+  childName: string | undefined,
+  parentId: number,
+  historyTick: number,
+) {
+  const [rows, setRows] = useState<SlabRecord[]>([]);
+  const [cursor, setCursor] = useState<Cursor | null>(null);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const requestRef = useRef(0);
+
+  const requestPage = useCallback(async (
+    relation: string,
+    pageCursor: Cursor | null,
+    token: number,
+    showError = false,
+  ) => {
+    try {
+      const page = await api.pagePortal({
+        relation,
+        parent_id: parentId,
+        limit: PAGE_SIZE,
+        cursor: pageCursor,
+      });
+      if (requestRef.current !== token) return;
+      if (pageCursor === null) {
+        setRows(frameRecords(page));
+      } else {
+        setRows((current) => {
+          const seen = new Set(current.map((row) => row.id));
+          return [
+            ...current,
+            ...frameRecords(page).filter((row) => !seen.has(row.id)),
+          ];
+        });
+      }
+      setCursor(page.next_cursor);
+      setTotal(page.total_rows);
+      setHasMore(page.next_cursor !== null);
+    } catch (reason) {
+      if (requestRef.current !== token || isCancelledError(reason)) return;
+      const message = errorText(reason);
+      if (showError) setError(message);
+      useStore.getState().notify("error", message);
+    } finally {
+      if (requestRef.current === token) setLoading(false);
+    }
+  }, [parentId]);
+
+  useEffect(() => {
+    if (relationName === undefined || childName === undefined) return;
+    const token = ++requestRef.current;
+    setRows([]);
+    setCursor(null);
+    setTotal(0);
+    setHasMore(false);
+    setScrollTop(0);
+    setError(null);
+    setLoading(true);
+    void requestPage(relationName, null, token, true);
+  }, [relationName, childName, historyTick, requestPage]);
+
+  const loadMore = () => {
+    if (relationName === undefined || !hasMore || loading || !cursor) return;
+    setLoading(true);
+    void requestPage(relationName, cursor, requestRef.current);
+  };
+
+  const reload = () => {
+    if (relationName === undefined) return;
+    const token = ++requestRef.current;
+    setLoading(true);
+    setRows([]);
+    setCursor(null);
+    void requestPage(relationName, null, token);
+  };
+
+  return { rows, setRows, total, setTotal, hasMore, loading, scrollTop, setScrollTop, error, loadMore, reload };
 }
 
 function gridColumns(columns: Column[]): string {

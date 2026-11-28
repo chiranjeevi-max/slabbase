@@ -7,7 +7,7 @@ import type {
   Value,
 } from "./bindings";
 
-export type RowValues = Record<string, Value>;
+export type { RowValues } from "./api";
 
 export function isNull(
   value: Value | null | undefined,

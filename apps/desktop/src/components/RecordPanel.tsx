@@ -48,21 +48,7 @@ export function RecordPanel({
   if (!table) {
     return (
       <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle}>
-        <header className="record-header">
-          <div>
-            <span className="eyebrow">Inspector</span>
-            <h2>No table</h2>
-          </div>
-          <button
-            type="button"
-            className="icon-control"
-            title="Close inspector"
-            aria-label="Close inspector"
-            onClick={() => useStore.getState().setInspectorOpen(false)}
-          >
-            <Icon name="x" size={14} strokeWidth={1.5} />
-          </button>
-        </header>
+        <InspectorHeader eyebrow="Inspector" title="No table" />
         <p className="inspector-hint">Select a table to inspect its records.</p>
       </aside>
     );
@@ -80,21 +66,7 @@ export function RecordPanel({
   ) {
     return (
       <aside className={`record-panel ${closing ? "is-closing" : ""}`} data-testid="inspector" style={panelStyle}>
-        <header className="record-header">
-          <div>
-            <span className="eyebrow">{table.name}</span>
-            <h2>Inspector</h2>
-          </div>
-          <button
-            type="button"
-            className="icon-control"
-            title="Close inspector"
-            aria-label="Close inspector"
-            onClick={() => useStore.getState().setInspectorOpen(false)}
-          >
-            <Icon name="x" size={14} strokeWidth={1.5} />
-          </button>
-        </header>
+        <InspectorHeader eyebrow={table.name} title="Inspector" />
         <p className="inspector-hint">Select a record to inspect its fields and portals.</p>
       </aside>
     );
@@ -312,6 +284,26 @@ export function RecordPanel({
         </div>
       </div>
     </aside>
+  );
+}
+
+function InspectorHeader({ eyebrow, title }: { eyebrow: string; title: string }) {
+  return (
+    <header className="record-header">
+      <div>
+        <span className="eyebrow">{eyebrow}</span>
+        <h2>{title}</h2>
+      </div>
+      <button
+        type="button"
+        className="icon-control"
+        title="Close inspector"
+        aria-label="Close inspector"
+        onClick={() => useStore.getState().setInspectorOpen(false)}
+      >
+        <Icon name="x" size={14} strokeWidth={1.5} />
+      </button>
+    </header>
   );
 }
 
