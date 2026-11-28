@@ -1,20 +1,11 @@
 import type { IndexHint, PageFrame, PageQuery, PortalFrame, Record as SlabRecord, Relation, SearchHit, SortSpec, Value, WorkspaceInfoDto } from "./bindings";
-import { DESIGN_STUDIO_INFO } from "./fixtures/designStudio";
-import { type FixtureState } from "./fixtureState";
+import { compileFixtureFilter } from "./fixtureFilters";
+import { fixtureError, type FixtureState } from "./fixtureState";
 import { valueText } from "./types";
 
-const EMPTY_INFO: WorkspaceInfoDto = {
-  name: "Untitled",
-  path: null,
-  formatVersion: 1,
-  journalMode: "wal",
-  tables: [],
-};
-
 export function currentInfo(state: FixtureState): WorkspaceInfoDto {
-  if (state.mode === "empty") return EMPTY_INFO;
   return {
-    ...DESIGN_STUDIO_INFO,
+    ...state.info,
     tables: state.schema.tables.map((table) => ({
       name: table.name,
       rowCount: state.rows[table.name]?.length ?? 0,
@@ -59,8 +50,17 @@ function compareValues(left: Value | number | undefined, right: Value | number |
   });
 }
 
-export function filterRows(rows: SlabRecord[], query: PageQuery): SlabRecord[] {
-  let next = rows;
+export function filterRows(state: FixtureState, query: PageQuery): SlabRecord[] {
+  const table = state.schema.tables.find((candidate) => candidate.name === query.table);
+  const predicates = query.filters.map((filter) => {
+    const column = table?.columns.find((candidate) => candidate.name === filter.column);
+    if (!column) fixtureError("SLAB_E_QUERY", `unknown filter column ${filter.column}`);
+    const matches = compileFixtureFilter(column, filter);
+    return (row: SlabRecord) => matches(row.values[column.name]);
+  });
+  let next = tableRows(state, query.table).filter((row) =>
+    predicates.every((matches) => matches(row)),
+  );
   if (query.search) {
     const term = query.search.toLowerCase();
     next = next.filter((row) =>
@@ -68,6 +68,10 @@ export function filterRows(rows: SlabRecord[], query: PageQuery): SlabRecord[] {
     );
   }
   return next;
+}
+
+export function indexName(table: string, column: string): string {
+  return `slab_idx_${table}_${column}`.replaceAll(" ", "_");
 }
 
 function indexHintFor(
@@ -79,11 +83,11 @@ function indexHintFor(
   if (state.mode !== "stress") return null;
   const column = sort[0]?.column ?? filters[0]?.column;
   if (!column || column === "id") return null;
-  if (state.indexed.includes(`${table}:${column}`)) return null;
+  if (state.indexes.some((index) => index.table === table && index.columns[0] === column)) return null;
   return {
     table,
     column,
-    suggestedIndex: `slab_idx_${table}_${column}`.replaceAll(" ", "_"),
+    suggestedIndex: indexName(table, column),
     elapsedMs: 38.2,
     scannedRows: tableRows(state, table).length,
     detail: `SCAN ${table}`,
@@ -152,12 +156,11 @@ export function childRows(state: FixtureState, relation: Relation, parentId: num
 
 export function findRecord(state: FixtureState, table: string, id: number): SlabRecord {
   const record = tableRows(state, table).find((row) => row.id === id);
-  if (!record) throw new Error(`Fixture record ${table}#${id} not found`);
+  if (!record) fixtureError("SLAB_E_NOT_FOUND", `Fixture record ${table}#${id} not found`);
   return record;
 }
 
 export function searchRows(state: FixtureState, term: string, limit: number): SearchHit[] {
-  if (state.mode === "empty") return [];
   const needle = term.trim().toLowerCase();
   if (!needle) return [];
   const hits: SearchHit[] = [];

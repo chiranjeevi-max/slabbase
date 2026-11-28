@@ -50,6 +50,7 @@ Toolbar geometry:
 - Keyboard focus draws a crisp 2px accent ring on `:focus-visible`.
 - Active grid and portal cells use a 1.5px inset accent border and do not shift layout.
 - Modals, sheets, the audit drawer, and `⌘K` trap Tab. Dismissal restores focus to the element that opened the surface.
+- In Form Studio the palette supports Tab to focus and Enter or Space to add an item. Palette items also support drag and drop.
 
 ### Inactive window
 
@@ -84,6 +85,8 @@ Toolbar geometry:
 - Double-clicking another row while the inspector is open loads that row into the inspector.
 - A New Record draft owns the inspector until it is saved or cancelled. Grid clicks and double-clicks do not change the selection while a draft is open.
 - Unsaved Form Studio edits survive a schema refresh, including one caused by the user's own save.
+- A save or rename that completes after a table switch preserves the newer table view and record selection.
+- Undo or redo closes the inspector when it removes the selected record.
 
 ### Scroll surfaces
 
@@ -225,3 +228,6 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | Inspector follows double-click | `double-clicking another row refreshes an open inspector` |
 | Draft isolation | `a grid double-click does not steal an open draft` |
 | Form Studio edit retention | `unsaved item edits survive a schema refresh` |
+| Form Studio palette | `form palette items support keyboard activation and pointer dragging` |
+| Table switches during edits | `a delayed form save keeps the newer table view`, `a delayed table rename keeps the newer table and record selection` |
+| Inspector after undo and redo | `undo closes the inspector when its selected record is removed`, `redo closes the inspector when its selected record is removed` |

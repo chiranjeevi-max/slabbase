@@ -90,9 +90,14 @@ pub(super) fn append_filter(
             let Some(value) = &filter.value else {
                 return Err(StorageError::Query("text filters require a value".into()));
             };
-            let text = value.display_string();
+            let text = match (&column.ty, value) {
+                (ColumnType::Boolean, Value::Boolean(true)) => "Yes".to_owned(),
+                (ColumnType::Boolean, Value::Boolean(false)) => "No".to_owned(),
+                _ => value.display_string(),
+            };
             // Match what the grid shows, not the physical representation:
             // decimals are stored as minor units and booleans as 0/1.
+            // SQLite's lower() folds ASCII case; non-ASCII case is preserved.
             let display = display_expression(column);
             match filter.op {
                 FilterOp::Contains => {
@@ -107,7 +112,7 @@ pub(super) fn append_filter(
                     predicates.push(format!(
                         "substr(lower({display}), 1, length(?{position})) = lower(?{position})"
                     ));
-                    bound.push(SqlValue::Text(text.clone()));
+                    bound.push(SqlValue::Text(text));
                 }
                 _ => {
                     let position = bound.len() + 1;

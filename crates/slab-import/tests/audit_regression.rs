@@ -411,3 +411,24 @@ fn a_literal_text_null_is_preserved() {
     );
     assert_eq!(rows[0].get("Body"), Some(&Value::Text("Null".into())));
 }
+
+#[test]
+fn json_preview_keeps_columns_in_source_order() {
+    for source in [
+        r#"[{"Zebra":1,"Alpha":2},{"Zebra":3,"Delta":4,"Beta":5}]"#,
+        "{\"Zebra\":1,\"Alpha\":2}\n{\"Zebra\":3,\"Delta\":4,\"Beta\":5}",
+    ] {
+        let preview = preview(
+            &mut JsonAdapter,
+            &mut source.as_bytes(),
+            &ImportOptions::default(),
+        )
+        .expect("JSON preview");
+        let columns: Vec<_> = preview
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(columns, ["Zebra", "Alpha", "Delta", "Beta"]);
+    }
+}

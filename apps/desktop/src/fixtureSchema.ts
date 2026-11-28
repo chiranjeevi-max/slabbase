@@ -1,6 +1,31 @@
-import type { Column, Layout, Relation, RelationDraft, Value } from "./bindings";
-import { tableRows } from "./fixtureQueries";
+import type { Column, IndexSpec, Layout, Relation, RelationDraft, Value } from "./bindings";
+import { indexName, relationByName, tableRows } from "./fixtureQueries";
 import { fixtureError, pushHistory, type FixtureState } from "./fixtureState";
+import { isComputedColumn, newItemId } from "./types";
+
+function listIndexes(state: FixtureState, table: string): IndexSpec[] {
+  if (!state.schema.tables.some((candidate) => candidate.name === table)) {
+    fixtureError("SLAB_E_NOT_FOUND", `table ${table} is missing`);
+  }
+  return state.indexes.filter((index) => index.table === table);
+}
+
+function createIndex(state: FixtureState, table: string, column: string): IndexSpec {
+  const tableDefinition = state.schema.tables.find((candidate) => candidate.name === table);
+  if (!tableDefinition) fixtureError("SLAB_E_NOT_FOUND", `table ${table} is missing`);
+  const definition = tableDefinition.columns.find((candidate) => candidate.name === column);
+  if (!definition) fixtureError("SLAB_E_NOT_FOUND", `${table}.${column} is missing`);
+  if (isComputedColumn(definition)) {
+    fixtureError("SLAB_E_COMMAND", "computed columns cannot be indexed");
+  }
+  const existing = state.indexes.find((index) => index.table === table && index.columns[0] === column);
+  if (existing) return existing;
+
+  const index = { name: indexName(table, column), table, columns: [column], unique: false };
+  pushHistory(state, `Create index ${index.name}`);
+  state.indexes.push(index);
+  return index;
+}
 
 export function fixtureSchemaCall<T>(
   state: FixtureState,
@@ -40,7 +65,6 @@ export function fixtureSchemaCall<T>(
       pushHistory(state, `Create table ${draft.name}`);
       state.schema.tables.push(table);
       state.rows[draft.name] = [];
-      state.mode = "full";
       return table as T;
     }
     case "add_column": {
@@ -84,6 +108,11 @@ export function fixtureSchemaCall<T>(
         position: table.columns.length,
       };
       table.columns.push(column);
+      if (!isComputedColumn(column)) {
+        for (const row of tableRows(state, tableName)) {
+          row.values[column.name] = structuredClone(column.default ?? "Null");
+        }
+      }
       return column as T;
     }
     case "create_relation": {
@@ -118,8 +147,11 @@ export function fixtureSchemaCall<T>(
         if (relation.parent_table === oldName) relation.parent_table = newName;
         if (relation.child_table === oldName) relation.child_table = newName;
       }
-      for (const layout of state.layouts) {
+      for (const layout of state.schema.layouts) {
         if (layout.table === oldName) layout.table = newName;
+      }
+      for (const index of state.indexes) {
+        if (index.table === oldName) index.table = newName;
       }
       state.rows[newName] = state.rows[oldName] ?? [];
       delete state.rows[oldName];
@@ -162,13 +194,22 @@ export function fixtureSchemaCall<T>(
           relation.child_column = newName;
         }
       }
-      for (const layout of state.layouts) {
-        if (layout.table !== tableName) continue;
+      for (const layout of state.schema.layouts) {
         for (const item of layout.items) {
-          if (item.kind.kind === "field" && item.kind.column === oldName) {
-            item.kind.column = newName;
+          const kind = item.kind;
+          if (kind.kind === "field" && layout.table === tableName && kind.column === oldName) {
+            kind.column = newName;
+          }
+          if (
+            kind.kind === "portal" &&
+            relationByName(state, kind.relation)?.child_table === tableName
+          ) {
+            kind.columns = kind.columns.map((column) => column === oldName ? newName : column);
           }
         }
+      }
+      for (const index of state.indexes) {
+        if (index.table === tableName && index.columns[0] === oldName) index.columns[0] = newName;
       }
       column.name = newName;
       for (const row of tableRows(state, tableName)) {
@@ -194,8 +235,8 @@ export function fixtureSchemaCall<T>(
       }
       pushHistory(state, `Drop table ${name}`);
       state.schema.tables = state.schema.tables.filter((candidate) => candidate.name !== name);
-      state.layouts = state.layouts.filter((layout) => layout.table !== name);
-      state.schema.layouts = state.layouts;
+      state.schema.layouts = state.schema.layouts.filter((layout) => layout.table !== name);
+      state.indexes = state.indexes.filter((index) => index.table !== name);
       delete state.rows[name];
       return undefined as T;
     }
@@ -226,10 +267,12 @@ export function fixtureSchemaCall<T>(
           `column ${tableName}.${name} is referenced by formula ${tableName}.${formula.name}`,
         );
       }
-      const layout = state.layouts.find(
-        (candidate) =>
-          candidate.table === tableName &&
-          candidate.items.some((item) => item.kind.kind === "field" && item.kind.column === name),
+      const layout = state.schema.layouts.find((candidate) =>
+        candidate.items.some(({ kind }) => {
+          if (kind.kind === "field") return candidate.table === tableName && kind.column === name;
+          return kind.kind === "portal" && kind.columns.includes(name)
+            && relationByName(state, kind.relation)?.child_table === tableName;
+        }),
       );
       if (layout) {
         fixtureError(
@@ -239,6 +282,9 @@ export function fixtureSchemaCall<T>(
       }
       pushHistory(state, `Drop ${tableName}.${name}`);
       table.columns = table.columns.filter((column) => column.name !== name);
+      state.indexes = state.indexes.filter((index) =>
+        index.table !== tableName || !index.columns.includes(name),
+      );
       for (const row of tableRows(state, tableName)) delete row.values[name];
       return undefined as T;
     }
@@ -252,43 +298,46 @@ export function fixtureSchemaCall<T>(
       return undefined as T;
     }
     case "save_layout": {
-      const layout = payload["layout"] as Layout;
+      const draft = payload["layout"] as Layout;
+      const layout = {
+        ...structuredClone(draft),
+        id: draft.id || newItemId("l"),
+        updated_at: Date.now(),
+      };
       pushHistory(state, `Save form ${layout.name}`);
-      const index = state.layouts.findIndex((candidate) => candidate.id === layout.id);
-      if (index >= 0) state.layouts[index] = layout;
-      else state.layouts.push(layout);
-      state.schema.layouts = state.layouts;
+      const index = state.schema.layouts.findIndex((candidate) => candidate.id === layout.id);
+      if (index >= 0) state.schema.layouts[index] = layout;
+      else state.schema.layouts.push(layout);
       return layout as T;
     }
     case "delete_layout": {
       const id = String(payload["id"]);
-      state.layouts = state.layouts.filter((layout) => layout.id !== id);
-      state.schema.layouts = state.layouts;
+      const index = state.schema.layouts.findIndex((layout) => layout.id === id);
+      const layout = state.schema.layouts[index];
+      if (!layout) fixtureError("SLAB_E_NOT_FOUND", `layout ${id} is missing`);
+      pushHistory(state, `Delete form ${layout.name}`);
+      state.schema.layouts.splice(index, 1);
       return undefined as T;
     }
     case "list_indexes":
-      return [] as T;
-    case "create_index": {
-      const table = String(payload["table"]);
-      const column = String(payload["column"]);
-      state.indexed.push(`${table}:${column}`);
-      return {
-        name: `slab_idx_${table}_${column}`.replaceAll(" ", "_"),
-        table,
-        columns: [column],
-        unique: false,
-      } as T;
-    }
+      return listIndexes(state, String(payload["table"])) as T;
+    case "create_index":
+      return createIndex(state, String(payload["table"]), String(payload["column"])) as T;
     case "toggle_index": {
       const table = String(payload["table"]);
       const column = String(payload["column"]);
-      const key = `${table}:${column}`;
       if (payload["enabled"] === false) {
-        state.indexed = state.indexed.filter((candidate) => candidate !== key);
-      } else if (!state.indexed.includes(key)) {
-        state.indexed.push(key);
+        const index = listIndexes(state, table).find(
+          (candidate) => candidate.columns[0] === column,
+        );
+        if (index) {
+          pushHistory(state, `Drop index ${index.name}`);
+          state.indexes = state.indexes.filter((candidate) => candidate !== index);
+        }
+      } else {
+        createIndex(state, table, column);
       }
-      return [] as T;
+      return listIndexes(state, table) as T;
     }
     default:
       throw new Error(`Fixture mode does not implement ${command}`);

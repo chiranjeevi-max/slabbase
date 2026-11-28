@@ -1,4 +1,4 @@
-import type { AuditEntry, Layout, Record as SlabRecord, Schema, UndoState, WorkspaceInfoDto } from "./bindings";
+import type { AuditEntry, IndexSpec, Record as SlabRecord, Schema, UndoState, WorkspaceInfoDto } from "./bindings";
 import { DESIGN_STUDIO_AUDIT, DESIGN_STUDIO_INFO, DESIGN_STUDIO_ROWS, DESIGN_STUDIO_SCHEMA } from "./fixtures/designStudio";
 
 export type FixtureMode = "full" | "empty" | "stress";
@@ -6,50 +6,48 @@ export type FixtureMode = "full" | "empty" | "stress";
 interface FixtureSnapshot {
   schema: Schema;
   rows: Record<string, SlabRecord[]>;
-  layouts: Layout[];
-  indexed: string[];
+  indexes: IndexSpec[];
 }
 
-export interface FixtureState {
+export interface FixtureState extends FixtureSnapshot {
   mode: FixtureMode;
-  schema: Schema;
-  rows: Record<string, SlabRecord[]>;
   info: WorkspaceInfoDto;
-  layouts: Layout[];
   audit: AuditEntry[];
   undo: UndoState;
   history: FixtureSnapshot[];
   future: FixtureSnapshot[];
-  indexed: string[];
 }
 
-function cloneRows(): Record<string, SlabRecord[]> {
-  const rows: Record<string, SlabRecord[]> = {};
-  for (const [table, tableRows] of Object.entries(DESIGN_STUDIO_ROWS)) {
-    rows[table] = tableRows.map((row) => ({
-      id: row.id,
-      values: { ...row.values },
-    }));
-  }
-  return rows;
-}
+const EMPTY_UNDO: UndoState = {
+  can_undo: false,
+  can_redo: false,
+  undo_label: null,
+  redo_label: null,
+  depth: 0,
+};
 
-function initialState(mode: FixtureMode): FixtureState {
-  const schema: Schema = {
-    tables: DESIGN_STUDIO_SCHEMA.tables.map((table) => ({
-      ...table,
-      columns: table.columns.map((column) => ({ ...column })),
-    })),
-    relations: DESIGN_STUDIO_SCHEMA.relations.map((relation) => ({ ...relation })),
-    layouts: DESIGN_STUDIO_SCHEMA.layouts.map((layout) => ({ ...layout })),
-  };
+function emptyState(name = "Untitled", path: string | null = null): FixtureState {
   return {
-    mode,
-    schema,
-    rows: cloneRows(),
-    info: DESIGN_STUDIO_INFO,
-    layouts: schema.layouts,
-    audit: DESIGN_STUDIO_AUDIT,
+    mode: "empty",
+    schema: { tables: [], relations: [], layouts: [] },
+    rows: {},
+    info: { name, path, formatVersion: 1, journalMode: "wal", tables: [] },
+    audit: [],
+    undo: { ...EMPTY_UNDO },
+    history: [],
+    future: [],
+    indexes: [],
+  };
+}
+
+function sampleState(path: string | null = DESIGN_STUDIO_INFO.path): FixtureState {
+  return {
+    ...emptyState(DESIGN_STUDIO_INFO.name, path),
+    mode: "full",
+    schema: structuredClone(DESIGN_STUDIO_SCHEMA),
+    rows: structuredClone(DESIGN_STUDIO_ROWS),
+    info: { ...DESIGN_STUDIO_INFO, path },
+    audit: structuredClone(DESIGN_STUDIO_AUDIT),
     undo: {
       can_undo: true,
       can_redo: false,
@@ -57,9 +55,6 @@ function initialState(mode: FixtureMode): FixtureState {
       redo_label: null,
       depth: 3,
     },
-    history: [],
-    future: [],
-    indexed: [],
   };
 }
 
@@ -158,31 +153,10 @@ function stressState(): FixtureState {
     },
   });
   return {
+    ...emptyState("Stress"),
     mode: "stress",
     schema,
     rows,
-    info: {
-      name: "Stress",
-      path: null,
-      formatVersion: 1,
-      journalMode: "wal",
-      tables: schema.tables.map((table) => ({
-        name: table.name,
-        rowCount: rows[table.name]?.length ?? 0,
-      })),
-    },
-    layouts: [],
-    audit: [],
-    undo: {
-      can_undo: false,
-      can_redo: false,
-      undo_label: null,
-      redo_label: null,
-      depth: 0,
-    },
-    history: [],
-    future: [],
-    indexed: [],
   };
 }
 
@@ -190,8 +164,7 @@ export function snapshot(state: FixtureState): FixtureSnapshot {
   return structuredClone({
     schema: state.schema,
     rows: state.rows,
-    layouts: state.layouts,
-    indexed: state.indexed,
+    indexes: state.indexes,
   });
 }
 
@@ -211,9 +184,7 @@ export function pushHistory(state: FixtureState, label: string): void {
 export function restore(state: FixtureState, snap: FixtureSnapshot): void {
   state.schema = snap.schema;
   state.rows = snap.rows;
-  state.layouts = snap.layouts;
-  state.indexed = snap.indexed;
-  state.schema.layouts = snap.layouts;
+  state.indexes = snap.indexes;
 }
 
 export function fixtureError(code: string, message: string): never {
@@ -223,7 +194,29 @@ export function fixtureError(code: string, message: string): never {
 let state: FixtureState | null = null;
 
 export function stateFor(initialMode: FixtureMode): FixtureState {
-  if (!state) state = initialMode === "stress" ? stressState() : initialState(initialMode);
+  if (!state) {
+    switch (initialMode) {
+      case "full":
+        state = sampleState();
+        break;
+      case "empty":
+        state = emptyState();
+        break;
+      case "stress":
+        state = stressState();
+        break;
+    }
+  }
+  return state;
+}
+
+export function loadFixtureSample(path?: string | null): FixtureState {
+  state = sampleState(path);
+  return state;
+}
+
+export function createEmptyFixture(name?: string, path?: string | null): FixtureState {
+  state = emptyState(name, path);
   return state;
 }
 

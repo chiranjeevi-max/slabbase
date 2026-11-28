@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -30,19 +30,37 @@ impl Workspace {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let (temporary, file) = create_scratch_sibling(parent)?;
+        let permissions = match std::fs::metadata(path) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let mode = permissions.as_ref().map_or(0o600, |mode| mode.mode());
+            options.mode(mode & 0o777);
+        }
+
+        let (temporary, mut file) = create_scratch_sibling(parent, &options)?;
         let outcome = (|| {
-            // Apply the destination's mode before the first row is written.
-            if let Ok(metadata) = std::fs::metadata(path) {
-                std::fs::set_permissions(&temporary, metadata.permissions())?;
+            self.export_sql_to(&mut file)?;
+            // Restore any bits removed by the umask on the file we wrote.
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
             }
-            self.export_sql_to(file)
-        })()
-        .and_then(|()| {
+            if !is_scratch_file(&file, &temporary)? {
+                return Err(StorageError::Workspace(
+                    "the export scratch file was replaced before publishing".into(),
+                ));
+            }
             std::fs::rename(&temporary, path)?;
             Ok(())
-        });
-        if outcome.is_err() {
+        })();
+        if outcome.is_err() && is_scratch_file(&file, &temporary).unwrap_or(false) {
             let _ = std::fs::remove_file(&temporary);
         }
         outcome
@@ -58,8 +76,8 @@ impl Workspace {
 
     /// Writes the SQL dump to an already-open writer.
     ///
-    /// The shell opens a private scratch file with `create_new` and passes the
-    /// handle here, so publishing cannot be raced through a predictable path.
+    /// The shell passes the scratch file it already opened, so serialization
+    /// always writes to that handle.
     pub fn export_sql_to<W: Write>(&self, writer: W) -> Result<(), StorageError> {
         self.check_export_policy()?;
         let schema = self.schema()?;
@@ -134,7 +152,7 @@ impl Workspace {
                     let decoded = decode_value(row, index, &column.ty)?;
                     match self.policy.redact(table_name, &column.name, &decoded) {
                         Some(replacement) => {
-                            ensure_value_fits(&replacement, &column.ty)?;
+                            ensure_value_fits(&replacement, column)?;
                             literals.push(sql_literal(&replacement, &column.ty)?);
                         }
                         None => literals.push(sql_value_literal(value)),
@@ -237,7 +255,8 @@ impl Workspace {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let (temporary, file) = create_scratch_sibling(parent)?;
+        let (temporary, file) =
+            create_scratch_sibling(parent, File::options().write(true).create_new(true))?;
         drop(file);
         let Some(target) = temporary.to_str() else {
             // A non-UTF-8 parent produces a valid Unix path that `VACUUM INTO`
@@ -317,7 +336,10 @@ fn ensure_absent(path: &Path) -> Result<(), StorageError> {
 ///
 /// `create_new` never follows a symlink and never reuses an entry another
 /// process owns.
-fn create_scratch_sibling(parent: &Path) -> Result<(PathBuf, File), StorageError> {
+fn create_scratch_sibling(
+    parent: &Path,
+    options: &OpenOptions,
+) -> Result<(PathBuf, File), StorageError> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -327,7 +349,7 @@ fn create_scratch_sibling(parent: &Path) -> Result<(PathBuf, File), StorageError
             ".slabbase-scratch-{}-{serial}.tmp",
             std::process::id()
         ));
-        match File::create_new(&path) {
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -336,6 +358,21 @@ fn create_scratch_sibling(parent: &Path) -> Result<(PathBuf, File), StorageError
     Err(StorageError::Internal(
         "could not allocate a scratch file".into(),
     ))
+}
+
+fn is_scratch_file(file: &File, path: &Path) -> std::io::Result<bool> {
+    let entry = std::fs::symlink_metadata(path)?;
+    let opened = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(entry.is_file() && entry.dev() == opened.dev() && entry.ino() == opened.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(entry.is_file() && opened.is_file())
+    }
 }
 
 fn snapshot_report(

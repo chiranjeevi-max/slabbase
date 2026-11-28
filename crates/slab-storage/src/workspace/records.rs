@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 
 use rusqlite::{Connection, Transaction, params};
-use slab_core::{DeleteAction, RowData, RowId, Schema, Table, Value};
+use slab_core::{DeleteAction, PolicyHook, RowData, RowId, Schema, Table, Value};
 use slab_formula::FormulaDag;
 
 use crate::error::StorageError;
+use crate::read::check_table_policy;
 use crate::sql::{decode_value, encode_value, normalize_value, quote_ident, stored_columns};
 
 use super::Workspace;
@@ -227,6 +228,7 @@ pub(super) fn delete_row_tx(
 pub(super) fn capture_cascades(
     conn: &Connection,
     schema: &Schema,
+    policy: &dyn PolicyHook,
     table: &str,
     id: RowId,
     seen: &mut BTreeSet<(String, RowId)>,
@@ -246,11 +248,14 @@ pub(super) fn capture_cascades(
             quote_ident("id")
         );
         let mut stmt = conn.prepare(&sql)?;
-        let ids = stmt.query_map(params![id], |row| row.get::<_, RowId>(0))?;
-        let mut child_ids = Vec::new();
-        for child_id in ids {
-            child_ids.push(child_id?);
+        let mut ids = stmt
+            .query_map(params![id], |row| row.get::<_, RowId>(0))?
+            .peekable();
+        if ids.peek().is_none() {
+            continue;
         }
+        check_table_policy(policy, &child.name)?;
+        let child_ids = ids.collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for child_id in child_ids {
             // Two cascade paths can reach one child (for example a project
@@ -266,7 +271,7 @@ pub(super) fn capture_cascades(
                 table: child.name.clone(),
                 row,
             });
-            capture_cascades(conn, schema, &child.name, child_id, seen, out)?;
+            capture_cascades(conn, schema, policy, &child.name, child_id, seen, out)?;
         }
     }
     Ok(())

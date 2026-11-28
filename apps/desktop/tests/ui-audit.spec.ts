@@ -161,6 +161,50 @@ async function openInspector(page: Page): Promise<void> {
   await expect(page.getByTestId("inspector")).toBeVisible();
 }
 
+declare global {
+  interface Window {
+    __slabTestReleaseFixtureCall?: () => void;
+  }
+}
+
+async function pauseFixtureCall(
+  page: Page,
+  method: "saveLayout" | "getSchema" | "readRecord",
+  failureCode?: string,
+) {
+  await page.evaluate(async ({ path, method, failureCode }) => {
+    const { api, SlabError } = await import(path) as typeof import("../src/api");
+    const invoke = api[method];
+    Reflect.set(api, method, async (...args: unknown[]) => {
+      Reflect.set(api, method, invoke);
+      await new Promise<void>((resolve) => {
+        window.__slabTestReleaseFixtureCall = resolve;
+      });
+      delete window.__slabTestReleaseFixtureCall;
+      if (failureCode) throw new SlabError(failureCode, "Record read interrupted");
+      return Reflect.apply(invoke, api, args);
+    });
+  }, { path: "/src/api.ts", method, failureCode });
+
+  return {
+    started: () => page.waitForFunction(() => Boolean(window.__slabTestReleaseFixtureCall)),
+    release: () => page.evaluate(() => window.__slabTestReleaseFixtureCall?.()),
+  };
+}
+
+async function createNamedRecord(page: Page, name: string): Promise<void> {
+  await page.getByTestId("sub-toolbar").getByRole("button", { name: "+ New Record" }).click();
+  const inspector = page.getByTestId("inspector");
+  await inspector.getByRole("textbox", { name: "Name", exact: true }).fill(name);
+  await inspector.getByRole("button", { name: "Create Record" }).click();
+  await expect(inspector.getByRole("heading", { name })).toBeVisible();
+}
+
+async function runHistoryAction(page: Page, action: "undo" | "redo"): Promise<void> {
+  const shortcut = action === "undo" ? "⌘Z" : "⇧⌘Z";
+  await page.getByTestId("toolbar").locator(`button[title$="(${shortcut})"]`).click();
+}
+
 const VIEWS: Array<{
   name: string;
   fixture?: "design-studio" | "empty" | "stress";
@@ -1991,9 +2035,107 @@ test.describe("async races", () => {
     await expect(page.getByTestId("inspector")).toHaveCount(0);
     expect(errors).toEqual([]);
   });
+
+  test("a delayed form save keeps the newer table view", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    await page.getByRole("textbox", { name: "Form name" }).fill("Saved Client Form");
+
+    const save = await pauseFixtureCall(page, "saveLayout");
+    await page.getByRole("button", { name: "Save Form" }).click();
+    await save.started();
+    await selectTable(page, "Invoices");
+    await save.release();
+
+    await expect(page.getByTestId("toast")).toContainText("Form Saved Client Form saved");
+    await expect(page.getByRole("tab", { name: "Table" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+
+    await selectTable(page, "Clients");
+    await page.getByRole("tab", { name: "Form" }).click();
+    await expect(page.getByRole("textbox", { name: "Form name" })).toHaveValue("Saved Client Form");
+  });
+
+  test("a delayed table rename keeps the newer table and record selection", async ({ page }) => {
+    await boot(page);
+    await selectTable(page, "Invoices");
+    await page.getByRole("tab", { name: "Schema" }).click();
+    await page.getByRole("textbox", { name: "Table name" }).fill("Billing");
+
+    const metadata = await pauseFixtureCall(page, "getSchema");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await metadata.started();
+    await selectTable(page, "Clients");
+    const inspector = page.getByTestId("inspector");
+    await page.getByTestId("grid-row").filter({ hasText: "Northlight Studio" }).click();
+    await expect(inspector.getByRole("heading", { name: "Northlight Studio" })).toBeVisible();
+    await metadata.release();
+
+    await expect(page.getByTestId("toast")).toContainText("Table renamed to Billing");
+    await expect(inspector.getByRole("heading", { name: "Northlight Studio" })).toBeVisible();
+    await expect(page.getByTestId("grid-header").locator('[data-column="Name"]')).toBeVisible();
+    await selectTable(page, "Billing");
+    await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+  });
+
+  test("a rename keeps the active table under its new name", async ({ page }) => {
+    await boot(page);
+    await selectTable(page, "Invoices");
+    await page.getByRole("tab", { name: "Schema" }).click();
+    await page.getByRole("textbox", { name: "Table name" }).fill("Billing");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await expect(page.getByTestId("toast")).toContainText("Table renamed to Billing");
+
+    await page.getByRole("tab", { name: "Table" }).click();
+    await expect(page.getByTestId("sidebar").locator('[data-table="Billing"]')).toHaveClass(/active/);
+    await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+  });
 });
 
 test.describe("form studio state", () => {
+  test("form palette items support keyboard activation and pointer dragging", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const palette = page.getByRole("complementary", { name: "Form elements" });
+    const canvas = page.locator(".canvas");
+    const field = canvas.locator(".studio-field").filter({ hasText: /^Name/ });
+    await field.click();
+    await page.getByRole("button", { name: "Remove Item" }).click();
+    await expect(field).toHaveCount(0);
+
+    await page.getByRole("button", { name: "Save Form" }).focus();
+    await page.keyboard.press("Tab");
+    await expect(palette.getByRole("button", { name: /^Name\b/ })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(field).toHaveCount(1);
+
+    const section = palette.getByRole("button", { name: /^Section\b/ });
+    await page.getByRole("button", { name: "Save Form" }).focus();
+    await page.keyboard.press("Tab");
+    await expect(section).toBeFocused();
+    await expect(section).toHaveCSS("outline-width", "2px");
+    await page.keyboard.press("Space");
+    await expect(canvas.locator(".studio-section").getByText("Section", { exact: true })).toHaveCount(1);
+
+    const relation = palette.getByRole("combobox", { name: "Child relation" });
+    await relation.selectOption("Client Invoices");
+    await relation.focus();
+    await page.keyboard.press("Tab");
+    await expect(palette.getByRole("button", { name: /^Portal\b/ })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(canvas.locator(".studio-portal").getByText("Client Invoices")).toHaveCount(1);
+
+    await palette.getByRole("button", { name: /^Label\b/ }).dragTo(canvas, {
+      targetPosition: { x: 40, y: 40 },
+    });
+    await expect(canvas.locator(".studio-label").getByText("Label")).toHaveCount(1);
+
+    await selectTable(page, "Line Items");
+    await page.getByRole("tab", { name: "Form" }).click();
+    await page.getByRole("button", { name: "Create Form" }).click();
+    await expect(palette.getByRole("button", { name: /^Portal\b/ })).toBeDisabled();
+  });
+
   test("unsaved item edits survive a schema refresh", async ({ page }) => {
     const width = page.viewportSize()?.width ?? 0;
     test.skip(width !== 1440, "form inspector survival runs once at the laptop size");
@@ -2031,6 +2173,73 @@ test.describe("form studio state", () => {
 });
 
 test.describe("inspector state", () => {
+  for (const action of ["undo", "redo"] as const) {
+    test(`${action} closes the inspector when its selected record is removed`, async ({ page }) => {
+      await boot(page);
+      const name = "Temporary Client";
+      await createNamedRecord(page, name);
+      const inspector = page.getByTestId("inspector");
+      const row = page.getByTestId("grid-row").filter({ hasText: name });
+
+      if (action === "redo") {
+        page.once("dialog", (dialog) => void dialog.accept());
+        await inspector.getByRole("button", { name: "Delete record" }).click();
+        await expect(page.getByTestId("toast")).toContainText("Record deleted");
+        await runHistoryAction(page, "undo");
+        await expect(page.getByTestId("toast")).toContainText("Undid change");
+        await row.click();
+        await expect(inspector.getByRole("heading", { name })).toBeVisible();
+      }
+
+      await inspector.getByRole("button", { name: "Revision history" }).click();
+      await expect(page.getByTestId("record-history")).toBeVisible();
+      await runHistoryAction(page, action);
+      await expect(page.getByTestId("toast")).toContainText(action === "undo" ? "Undid change" : "Redone");
+      await expect(row).toHaveCount(0);
+      await expect(inspector).toHaveCount(0);
+    });
+  }
+
+  test("a delayed missing record read keeps the newer inspector selection", async ({ page }) => {
+    await boot(page);
+    await createNamedRecord(page, "Temporary Client");
+    const read = await pauseFixtureCall(page, "readRecord");
+    await runHistoryAction(page, "undo");
+    await read.started();
+
+    const inspector = page.getByTestId("inspector");
+    const nextTitle = inspector.getByRole("heading", { name: "Northlight Studio" });
+    await page.getByTestId("grid-row").filter({ hasText: "Northlight Studio" })
+      .locator('[data-column="Name"]').click();
+    await expect(nextTitle).toBeVisible();
+    await read.release();
+    await expect(page.getByTestId("toast")).toContainText("Undid change");
+    await expect(nextTitle).toBeVisible();
+  });
+
+  for (const code of ["SLAB_E_CANCELLED", "SLAB_E_INTERNAL"]) {
+    test(`a ${code} record refresh keeps the current inspector selection`, async ({ page }) => {
+      await boot(page);
+      const name = "Temporary Client";
+      await createNamedRecord(page, name);
+      const read = await pauseFixtureCall(page, "readRecord", code);
+
+      const inspector = page.getByTestId("inspector");
+      const refresh = page.evaluate(async (path) => {
+        const { useStore } = await import(path) as typeof import("../src/store");
+        await useStore.getState().refreshBundle();
+      }, "/src/store.ts");
+
+      await read.started();
+      await read.release();
+      await refresh;
+      await expect(inspector.getByRole("heading", { name })).toBeVisible();
+      await expect(page.getByTestId("toast")).toContainText(
+        code === "SLAB_E_CANCELLED" ? "Record created" : "Record read interrupted",
+      );
+    });
+  }
+
   test("double-clicking another row refreshes an open inspector", async ({ page }) => {
     const width = page.viewportSize()?.width ?? 0;
     test.skip(width !== 1440, "inspector double-click runs once at the laptop size");

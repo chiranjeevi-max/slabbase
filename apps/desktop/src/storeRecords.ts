@@ -1,5 +1,5 @@
 import type { StoreApi } from "zustand";
-import { api, isCancelledError } from "./api";
+import { api, isCancelledError, SlabError } from "./api";
 import type { AppStore } from "./storeTypes";
 
 export function recordActions({
@@ -34,15 +34,24 @@ export function recordActions({
   | "deletePortalRow"
 > {
   const loadBundle = async (table: string, id: number, token: number) => {
+    const isCurrentSelection = () => {
+      const current = get();
+      return token === inspectorRequest.token &&
+        current.activeTable === table &&
+        current.selectedId === id;
+    };
+
     try {
       const record = await api.readRecord(table, id);
-      if (token !== inspectorRequest.token) return;
-      const current = get();
-      if (current.activeTable !== table || current.selectedId !== id) return;
+      if (!isCurrentSelection()) return;
       set({ bundle: { record, portals: {} }, bundleTable: table });
     } catch (error) {
-      if (token !== inspectorRequest.token) return;
-      if (!isCancelledError(error)) notifyError(error);
+      if (!isCurrentSelection() || isCancelledError(error)) return;
+      if (error instanceof SlabError && error.code === "SLAB_E_NOT_FOUND") {
+        get().closeRecord();
+        return;
+      }
+      notifyError(error);
     }
   };
 
@@ -127,6 +136,7 @@ export function recordActions({
         bundleTable: null,
         inspectorOpen: false,
         historyOpen: false,
+        historyLoading: false,
         recordHistory: [],
       });
     },

@@ -50,7 +50,7 @@ impl PageSize {
 pub struct PrintOptions {
     /// Paper size.
     pub page_size: PageSize,
-    /// Margin in PDF points.
+    /// PDF margin in points, between 0 and 144 inclusive.
     pub margin_pt: f64,
     /// Optional document title override.
     pub title: Option<String>,
@@ -452,6 +452,48 @@ mod tests {
         assert!(text.contains("xref"));
         assert!(text.contains("%%EOF"));
         assert!(text.contains("INV-2026-001"));
+    }
+
+    #[test]
+    fn pdf_renderers_reject_margins_that_leave_no_usable_page() {
+        let (schema, layout, bundle) = schema_and_bundle();
+        for margin_pt in [f64::NAN, f64::INFINITY, -1.0, 300.0] {
+            let options = PrintOptions {
+                margin_pt,
+                ..PrintOptions::default()
+            };
+            assert!(render_pdf(&schema, &layout, &bundle, &options).is_err());
+            assert!(TableReport::new(&schema, "Invoices", &options).is_err());
+        }
+    }
+
+    #[test]
+    fn wide_pdf_columns_omit_text_that_cannot_fit() {
+        let (mut schema, _, mut bundle) = schema_and_bundle();
+        let table = &mut schema.tables[0];
+        let original = table.columns[0].clone();
+        table.columns.clear();
+        for index in 0..100 {
+            let name = format!("Wide Column {index}");
+            bundle
+                .record
+                .values
+                .insert(name.clone(), Value::Text("Oversized value".into()));
+            table.columns.push(Column {
+                id: format!("c_{index}"),
+                name,
+                ..original.clone()
+            });
+        }
+        let mut report =
+            TableReport::new(&schema, "Invoices", &PrintOptions::default()).expect("report");
+        report.push(&[bundle.record]);
+        let pdf = report.finish().expect("PDF");
+        let text = String::from_utf8_lossy(&pdf.pdf);
+        assert!(!text.contains("WIDE COLUMN"));
+        assert!(!text.contains("Oversized value"));
+        assert_eq!(pdf.rows_printed, 1);
+        assert!(fit_text("Oversized value", 2.0, 7.5).is_empty());
     }
 
     #[test]

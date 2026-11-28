@@ -1,7 +1,7 @@
 import type { IntegrityReportDto, PageQuery, PortalFrame, PortalQuery, Record as SlabRecord, RecordBundle, RecordRevision, Value } from "./bindings";
 import { currentInfo, filterRows, sortRows, tableRows, pageOf, portalFrameOf, relationByName, childRows, findRecord, searchRows } from "./fixtureQueries";
 import { fixtureSchemaCall } from "./fixtureSchema";
-import { pushHistory, restore, snapshot, stateFor, type FixtureMode } from "./fixtureState";
+import { createEmptyFixture, loadFixtureSample, pushHistory, restore, snapshot, stateFor, type FixtureMode } from "./fixtureState";
 
 export { resetFixtureForTests } from "./fixtureState";
 
@@ -44,7 +44,7 @@ export async function fixtureCall<T>(
     case "workspace_info":
       return currentInfo(state) as T;
     case "get_schema":
-      return (state.mode === "empty" ? { tables: [], relations: [], layouts: [] } : state.schema) as T;
+      return state.schema as T;
     case "undo_state":
       return state.undo as T;
     case "undo": {
@@ -77,7 +77,7 @@ export async function fixtureCall<T>(
     }
     case "page_rows": {
       const query = payload["query"] as PageQuery;
-      const rows = filterRows(sortRows(tableRows(state, query.table), query.sort), query);
+      const rows = sortRows(filterRows(state, query), query.sort);
       return pageOf(state, query.table, rows, query) as T;
     }
     case "read_record": {
@@ -187,12 +187,13 @@ export async function fixtureCall<T>(
     case "cancel_search":
       return false as T;
     case "load_sample":
+      return currentInfo(loadFixtureSample(state.info.path)) as T;
     case "open_workspace":
+      return currentInfo(loadFixtureSample(String(payload["path"]))) as T;
     case "create_workspace":
-      state.mode = "full";
-      return currentInfo(state) as T;
+      return currentInfo(createEmptyFixture(String(payload["name"]), String(payload["path"]))) as T;
     case "close_workspace":
-      state.mode = "empty";
+      createEmptyFixture();
       return undefined as T;
     case "backup_workspace":
     case "preview_import":

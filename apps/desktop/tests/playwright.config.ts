@@ -7,6 +7,7 @@ const desktopDir = fileURLToPath(new URL("..", import.meta.url));
 
 export default defineConfig({
   testDir: ".",
+  testIgnore: "**/fixture.spec.ts",
   outputDir: path.join(os.tmpdir(), "slabbase-playwright"),
   fullyParallel: true,
   workers: process.env.CI ? 1 : undefined,
@@ -29,6 +30,12 @@ export default defineConfig({
     timeout: 60_000,
   },
   projects: [
+    {
+      name: "fixture",
+      testMatch: "**/fixture.spec.ts",
+      testIgnore: [],
+      fullyParallel: false,
+    },
     {
       name: "820x840",
       use: { ...devices["Desktop Chrome"], viewport: { width: 820, height: 840 } },

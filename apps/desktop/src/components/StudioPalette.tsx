@@ -34,7 +34,8 @@ export function StudioPalette({
       <span className="palette-heading">Fields</span>
       {available.length === 0 && <p className="studio-palette-empty">All fields placed</p>}
       {available.map((column) => (
-        <div
+        <button
+          type="button"
           key={column.name}
           className="studio-source-item"
           draggable
@@ -59,7 +60,7 @@ export function StudioPalette({
         >
           <span className="palette-item-name">{column.name}</span>
           <small>{columnTypeLabel(column.ty)}</small>
-        </div>
+        </button>
       ))}
 
       <span className="palette-heading">Elements</span>
@@ -67,7 +68,8 @@ export function StudioPalette({
         { kind: "section", name: "Section", description: "Heading" },
         { kind: "label", name: "Label", description: "Static text" },
       ] as const).map(({ kind, name, description }) => (
-        <div
+        <button
+          type="button"
           key={kind}
           className="studio-source-item"
           draggable
@@ -80,7 +82,7 @@ export function StudioPalette({
         >
           <span className="palette-item-name">{name}</span>
           <small>{description}</small>
-        </div>
+        </button>
       ))}
 
       <span className="palette-heading">Portal</span>
@@ -97,8 +99,10 @@ export function StudioPalette({
           </option>
         ))}
       </select>
-      <div
-        className={`studio-source-item ${!portalRelation ? "disabled" : ""}`}
+      <button
+        type="button"
+        className="studio-source-item"
+        disabled={!portalRelation}
         draggable={Boolean(portalRelation)}
         onDragStart={(event) => {
           if (!portalRelation) return;
@@ -106,11 +110,11 @@ export function StudioPalette({
           setDragging(true);
         }}
         onDragEnd={() => setDragging(false)}
-        onClick={() => portalRelation && addKind("portal")}
+        onClick={() => addKind("portal")}
       >
         <span className="palette-item-name">Portal</span>
         <small>Child table</small>
-      </div>
+      </button>
     </aside>
   );
 }

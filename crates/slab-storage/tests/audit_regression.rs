@@ -316,6 +316,89 @@ fn undo_restores_a_child_reached_by_two_cascade_relations() {
 }
 
 #[test]
+fn undo_restores_a_diamond_cascade_with_two_required_parents() {
+    let mut workspace = workspace();
+    for (table, columns) in [
+        ("Roots", vec![text("Name")]),
+        ("Lefts", vec![integer("Root")]),
+        ("Rights", vec![integer("Root")]),
+        (
+            "Leaves",
+            vec![text("Name"), integer("Left"), integer("Right")],
+        ),
+    ] {
+        workspace
+            .create_table(&TableDraft {
+                name: table.into(),
+                columns,
+            })
+            .expect("table");
+    }
+    for (name, parent, child, column) in [
+        ("A Lefts", "Roots", "Lefts", "Root"),
+        ("B Rights", "Roots", "Rights", "Root"),
+        ("Left Leaves", "Lefts", "Leaves", "Left"),
+        ("Right Leaves", "Rights", "Leaves", "Right"),
+    ] {
+        workspace
+            .create_relation(&RelationDraft {
+                name: name.into(),
+                parent_table: parent.into(),
+                child_table: child.into(),
+                child_column: column.into(),
+                on_delete: DeleteAction::Cascade,
+            })
+            .expect("relation");
+    }
+    let root = workspace
+        .insert_row("Roots", &row(&[("Name", Value::from("root"))]))
+        .expect("root");
+    let left = workspace
+        .insert_row("Lefts", &row(&[("Root", root.id.into())]))
+        .expect("left");
+    let right = workspace
+        .insert_row("Rights", &row(&[("Root", root.id.into())]))
+        .expect("right");
+    let leaf = workspace
+        .insert_row(
+            "Leaves",
+            &row(&[
+                ("Name", Value::from("leaf")),
+                ("Left", left.id.into()),
+                ("Right", right.id.into()),
+            ]),
+        )
+        .expect("leaf");
+
+    workspace.delete_row("Roots", root.id).expect("delete");
+    assert!(workspace.read_record("Leaves", leaf.id).is_err());
+    workspace.undo().expect("undo diamond cascade");
+    for (table, expected) in [
+        ("Roots", &root),
+        ("Lefts", &left),
+        ("Rights", &right),
+        ("Leaves", &leaf),
+    ] {
+        assert_eq!(
+            &workspace
+                .read_record(table, expected.id)
+                .expect("restored row"),
+            expected
+        );
+    }
+    assert_eq!(
+        workspace.search("leaf", 10).expect("search")[0].row_id,
+        leaf.id
+    );
+    workspace.redo().expect("redo diamond cascade");
+    assert!(workspace.search("leaf", 10).expect("search").is_empty());
+    workspace.undo().expect("undo again");
+    let report = workspace.integrity_check().expect("integrity");
+    assert!(report.audit_chain);
+    assert_eq!(report.foreign_key_violations, 0);
+}
+
+#[test]
 fn a_diamond_cascade_decrements_a_lookup_only_once() {
     let mut workspace = workspace();
     workspace
@@ -696,6 +779,66 @@ fn filtering_booleans_does_not_match_null_as_yes() {
 }
 
 #[test]
+fn typed_boolean_text_filters_match_the_grid_labels() {
+    let workspace = invoice_workspace();
+    for op in [FilterOp::Contains, FilterOp::StartsWith, FilterOp::EndsWith] {
+        for paid in [true, false] {
+            let page = workspace
+                .page(&PageQuery {
+                    table: "Invoices".into(),
+                    limit: 10,
+                    filters: vec![Filter {
+                        column: "Paid".into(),
+                        op,
+                        value: Some(Value::Boolean(paid)),
+                    }],
+                    ..PageQuery::default()
+                })
+                .expect("page");
+            assert_eq!(page.rows.len(), 1, "{op:?} {paid}");
+            assert_eq!(page.rows[0].get("Paid"), Some(&Value::Boolean(paid)));
+        }
+    }
+    assert_eq!(count(&workspace, "Paid", FilterOp::Contains, "true"), 0);
+}
+
+#[test]
+fn text_filters_fold_ascii_case_and_preserve_non_ascii_case() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Names".into(),
+            columns: vec![text("Name")],
+        })
+        .expect("table");
+    let record = workspace
+        .insert_row("Names", &row(&[("Name", Value::from("Élan"))]))
+        .expect("insert");
+
+    for (op, matching, non_matching) in [
+        (FilterOp::Contains, "ÉL", "él"),
+        (FilterOp::StartsWith, "ÉL", "él"),
+        (FilterOp::EndsWith, "ÉLAN", "élan"),
+    ] {
+        let results = |needle: &str| {
+            workspace
+                .page(&PageQuery {
+                    filters: vec![Filter {
+                        column: "Name".into(),
+                        op,
+                        value: Some(Value::from(needle)),
+                    }],
+                    ..PageQuery::first("Names", 10)
+                })
+                .expect("page")
+                .rows
+        };
+        assert_eq!(results(matching), vec![record.clone()], "{op:?}");
+        assert!(results(non_matching).is_empty(), "{op:?}");
+    }
+}
+
+#[test]
 fn equality_filters_parse_displayed_text_or_reject_it() {
     let workspace = invoice_workspace();
     for (column, text) in [
@@ -733,6 +876,173 @@ impl slab_core::PolicyHook for DenySecret {
     fn can_read_table(&self, table: &str) -> bool {
         table != "Secret"
     }
+}
+
+#[test]
+fn insert_recovers_the_writer_then_checks_policy_before_validation() {
+    let mut workspace = workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Secret".into(),
+            columns: vec![text("Name")],
+        })
+        .expect("table");
+    let invalid = row(&[("Unknown column", Value::from("invalid"))]);
+    workspace.begin_import().expect("begin import");
+    workspace
+        .insert_import_rows("Secret", &[row(&[("Name", Value::from("pending"))])])
+        .expect("import row");
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+    let error = workspace
+        .insert_row("Secret", &invalid)
+        .expect_err("the writer was busy");
+    assert!(
+        matches!(error, StorageError::Command(ref message) if message.contains("rolled back")),
+        "unexpected error: {error}"
+    );
+    let error = workspace
+        .insert_row("Secret", &invalid)
+        .expect_err("table is denied");
+    assert!(
+        matches!(error, StorageError::Query(ref message) if message.contains("policy")),
+        "an invalid insert exposed the schema of a denied table: {error}"
+    );
+    workspace.set_policy(std::sync::Arc::new(slab_core::NoopPolicy));
+    assert!(
+        workspace
+            .page(&PageQuery::first("Secret", 10))
+            .expect("page")
+            .rows
+            .is_empty()
+    );
+    workspace.begin_import().expect("writer is available");
+    workspace.rollback_import().expect("rollback");
+}
+
+fn create_cascade_policy_tables(workspace: &mut Workspace) {
+    for (table, columns) in [
+        ("Public", vec![text("Name")]),
+        ("Middle", vec![integer("Public")]),
+        ("Secret", vec![text("Name"), integer("Middle")]),
+    ] {
+        workspace
+            .create_table(&TableDraft {
+                name: table.into(),
+                columns,
+            })
+            .expect("table");
+    }
+    for (parent, child) in [("Public", "Middle"), ("Middle", "Secret")] {
+        workspace
+            .create_relation(&RelationDraft {
+                name: format!("{parent} {child}"),
+                parent_table: parent.into(),
+                child_table: child.into(),
+                child_column: parent.into(),
+                on_delete: DeleteAction::Cascade,
+            })
+            .expect("relation");
+    }
+}
+
+#[test]
+fn cascade_delete_authorizes_actual_descendants_before_mutating() {
+    let mut workspace = workspace();
+    create_cascade_policy_tables(&mut workspace);
+    let empty = workspace
+        .insert_row("Public", &row(&[("Name", Value::from("empty"))]))
+        .expect("empty parent");
+    let parent = workspace
+        .insert_row("Public", &row(&[("Name", Value::from("parent"))]))
+        .expect("parent");
+    let middle = workspace
+        .insert_row("Middle", &row(&[("Public", parent.id.into())]))
+        .expect("middle");
+    let secret = workspace
+        .insert_row(
+            "Secret",
+            &row(&[
+                ("Name", Value::from("needle")),
+                ("Middle", middle.id.into()),
+            ]),
+        )
+        .expect("secret");
+    let audit_before = workspace.audit_entries(100, 0).expect("audit").len();
+    let undo_before = workspace.undo_state().depth;
+
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+    let error = workspace
+        .delete_row("Public", parent.id)
+        .expect_err("the actual cascade reaches a denied table");
+    assert!(matches!(error, StorageError::Query(ref message) if message.contains("policy")));
+    assert_eq!(workspace.undo_state().depth, undo_before);
+    workspace.set_policy(std::sync::Arc::new(slab_core::NoopPolicy));
+    assert_eq!(
+        workspace.audit_entries(100, 0).expect("audit").len(),
+        audit_before
+    );
+    assert_eq!(
+        workspace.read_record("Public", parent.id).expect("parent"),
+        parent
+    );
+    assert_eq!(
+        workspace.read_record("Middle", middle.id).expect("middle"),
+        middle
+    );
+    assert_eq!(
+        workspace.read_record("Secret", secret.id).expect("secret"),
+        secret
+    );
+    assert_eq!(workspace.search("needle", 10).expect("search").len(), 1);
+    assert!(workspace.integrity_check().expect("integrity").audit_chain);
+
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+    workspace
+        .delete_row("Public", empty.id)
+        .expect("an empty cascade reaches no denied rows");
+}
+
+#[test]
+fn redo_authorizes_cascade_descendants_added_since_the_original_delete() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let path = directory.path().join("policy-cascade.slab");
+    let mut workspace =
+        Workspace::create(&path, "Cascade", Box::new(TestClock::new())).expect("workspace");
+    create_cascade_policy_tables(&mut workspace);
+    let parent = workspace
+        .insert_row("Public", &row(&[("Name", Value::from("parent"))]))
+        .expect("parent");
+    let middle = workspace
+        .insert_row("Middle", &row(&[("Public", parent.id.into())]))
+        .expect("middle");
+    workspace.delete_row("Public", parent.id).expect("delete");
+    workspace.undo().expect("undo");
+    let conn = Connection::open(&path).expect("open external writer");
+    conn.execute(
+        "INSERT INTO Secret (Name, Middle) VALUES ('external', ?1)",
+        [middle.id],
+    )
+    .expect("add a descendant");
+    let child_id = conn.last_insert_rowid();
+    drop(conn);
+
+    workspace.set_policy(std::sync::Arc::new(DenySecret));
+    let error = workspace.redo().expect_err("redo reaches a denied table");
+    assert!(matches!(error, StorageError::Query(ref message) if message.contains("policy")));
+    assert!(workspace.undo_state().can_redo);
+
+    workspace.set_policy(std::sync::Arc::new(slab_core::NoopPolicy));
+    assert!(workspace.read_record("Secret", child_id).is_ok());
+    workspace.redo().expect("authorized redo");
+    workspace.undo().expect("restore the actual redo cascade");
+    assert_eq!(
+        workspace
+            .read_record("Secret", child_id)
+            .expect("child")
+            .get("Name"),
+        Some(&Value::from("external"))
+    );
+    assert!(workspace.integrity_check().expect("integrity").audit_chain);
 }
 
 #[test]

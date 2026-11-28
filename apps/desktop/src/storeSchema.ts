@@ -28,16 +28,18 @@ export function schemaActions({
   | "saveLayout"
   | "refreshAfterImport"
 > {
-  const refreshMeta = async () => {
+  const refreshMeta = async (rename?: { oldName: string; newName: string }) => {
     const [schema, info, undoState] = await Promise.all([
       api.getSchema(),
       api.workspaceInfo(),
       api.undoState(),
     ]);
     const state = get();
+    const renamedSelection = rename && state.activeTable === rename.oldName;
+    const preferredTable = renamedSelection ? rename.newName : state.activeTable;
     const activeTable =
-      state.activeTable && schema.tables.some((table) => table.name === state.activeTable)
-        ? state.activeTable
+      preferredTable && schema.tables.some((table) => table.name === preferredTable)
+        ? preferredTable
         : firstTable(schema);
     const activeLayoutId =
       schema.layouts.find(
@@ -45,17 +47,27 @@ export function schemaActions({
       )?.id ??
       layoutFor(schema, activeTable)?.id ??
       null;
-    const selectionIsCurrent =
-      state.selectedId !== null && state.bundleTable === activeTable;
     set({
       schema,
       info: info ?? state.info,
       undoState,
       activeTable,
       activeLayoutId,
-      ...(selectionIsCurrent
+      ...(activeTable === state.activeTable
         ? {}
         : { selectedId: null, bundle: null, bundleTable: null }),
+      ...(renamedSelection
+        ? {
+            rows: [],
+            nextCursor: null,
+            hasMore: true,
+            creating: false,
+            inspectorOpen: false,
+            historyOpen: false,
+            historyLoading: false,
+            recordHistory: [],
+          }
+        : {}),
     });
   };
 
@@ -127,25 +139,9 @@ export function schemaActions({
     },
 
     renameTable: async (oldName, newName) => {
-      const state = get();
       try {
         await api.renameTable(oldName, newName);
-        await refreshMeta();
-        if (state.activeTable === oldName) {
-          const schema = get().schema;
-          set({
-            activeTable: newName,
-            activeLayoutId: layoutFor(schema, newName)?.id ?? null,
-            rows: [],
-            nextCursor: null,
-            hasMore: true,
-            selectedId: null,
-            bundle: null,
-            bundleTable: null,
-            creating: false,
-            inspectorOpen: false,
-          });
-        }
+        await refreshMeta({ oldName, newName });
         await get().loadFirstPage();
         notify("success", `Table renamed to ${newName}`);
         return true;
@@ -230,7 +226,10 @@ export function schemaActions({
       try {
         const saved = await api.saveLayout(layout);
         await refreshMeta();
-        set({ activeLayoutId: saved.id, view: "form" });
+        const current = get();
+        if (current.activeTable === saved.table && current.view === "form") {
+          set({ activeLayoutId: saved.id });
+        }
         notify("success", `Form ${saved.name} saved`);
         return true;
       } catch (error) {

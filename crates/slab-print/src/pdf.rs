@@ -4,6 +4,16 @@ use slab_core::{Column, Layout, LayoutItem, LayoutItemKind, Record, RecordBundle
 
 use super::{PrintError, PrintOptions, record_title};
 
+fn check_pdf_margin(margin: f64) -> Result<f64, PrintError> {
+    if (0.0..=144.0).contains(&margin) {
+        Ok(margin)
+    } else {
+        Err(PrintError::Layout(
+            "PDF margin must be between 0 and 144 points".into(),
+        ))
+    }
+}
+
 /// Renders a record and its portals as a PDF byte stream.
 pub fn render_pdf(
     schema: &Schema,
@@ -19,7 +29,7 @@ pub fn render_pdf(
         .ok_or_else(|| PrintError::Data(format!("missing table {}", layout.table)))?;
     let title = options.title.clone().unwrap_or_else(|| layout.name.clone());
     let (page_width, page_height) = options.page_size.dimensions();
-    let margin = options.margin_pt;
+    let margin = check_pdf_margin(options.margin_pt)?;
     let content_width = page_width - margin * 2.0;
     let mut pdf = PdfBuilder::new(page_width, page_height, margin, title.clone());
     pdf.heading(&record_title(schema, table, &bundle.record), 10.0, false);
@@ -136,7 +146,7 @@ impl TableReport {
             .ok_or_else(|| PrintError::Data(format!("missing table {table_name}")))?;
         let title = options.title.clone().unwrap_or_else(|| table.name.clone());
         let (page_width, page_height) = options.page_size.dimensions();
-        let margin = options.margin_pt;
+        let margin = check_pdf_margin(options.margin_pt)?;
         let content_width = page_width - margin * 2.0;
         let mut pdf = PdfBuilder::new(page_width, page_height, margin, title);
         let columns: Vec<Column> = table.columns.clone();
@@ -469,7 +479,7 @@ impl PdfBuilder {
                 self.margin + width * count_to_f64(index) + 3.0,
                 self.y,
                 6.8,
-                &column.name.to_uppercase(),
+                &fit_text(&column.name.to_uppercase(), width - 6.0, 6.8),
                 true,
             );
         }
@@ -722,13 +732,19 @@ pub(super) fn text_width(value: &str, size: f64) -> f64 {
 }
 
 pub(super) fn fit_text(value: &str, width: f64, size: f64) -> String {
-    if width <= 0.0 || text_width(value, size) <= width {
+    if width <= 0.0 {
+        return String::new();
+    }
+    if text_width(value, size) <= width {
         return value.to_owned();
     }
     // Accumulate widths instead of rebuilding and re-measuring the growing
     // candidate for every character; zero-width glyphs would otherwise force
     // a full prefix rescan per character.
     let ellipsis = text_width("…", size);
+    if ellipsis > width {
+        return String::new();
+    }
     let mut output = String::new();
     let mut used = 0.0;
     for ch in value.chars() {

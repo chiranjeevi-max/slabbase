@@ -99,37 +99,17 @@ pub(crate) fn normalize_value(
 /// The read path may return a display-only replacement, but an export has to
 /// write a value the restored table can decode and its CHECK constraints can
 /// accept.
-pub(crate) fn ensure_value_fits(
-    value: &Value,
-    column_type: &ColumnType,
-) -> Result<(), StorageError> {
-    if value.is_null() {
+pub(crate) fn ensure_value_fits(value: &Value, column: &Column) -> Result<(), StorageError> {
+    if column.ty.accepts(value) && !(column.required && value.is_null()) {
         return Ok(());
     }
-    let fits = matches!(
-        (column_type, value),
-        (ColumnType::Text, Value::Text(_))
-            | (ColumnType::Select { .. }, Value::Select(_))
-            | (ColumnType::AttachmentRef, Value::AttachmentRef(_))
-            | (ColumnType::Integer, Value::Integer(_))
-            | (ColumnType::Boolean, Value::Boolean(_))
-            | (
-                ColumnType::Decimal { .. },
-                Value::Decimal(_) | Value::Integer(_)
-            )
-            | (ColumnType::Currency { .. }, Value::Currency(_))
-            | (ColumnType::Date, Value::Date(_))
-            | (ColumnType::Timestamp, Value::Timestamp(_))
-    );
-    if fits {
-        Ok(())
-    } else {
-        Err(StorageError::Query(format!(
-            "redacted value of type {} does not fit column type {}",
-            value.type_name(),
-            column_type.name()
-        )))
-    }
+    Err(StorageError::Query(format!(
+        "redacted value of type {} does not fit column {}.{} ({})",
+        value.type_name(),
+        column.table,
+        column.name,
+        column.ty.name(),
+    )))
 }
 
 /// Encodes a normalized value as a bound SQLite parameter.

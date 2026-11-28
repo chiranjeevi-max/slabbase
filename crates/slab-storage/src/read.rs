@@ -6,7 +6,7 @@ use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use slab_core::{
     Aggregate, Column, ColumnType, Cursor, FilterOp, IndexHint, MAX_PAGE_SIZE, Page, PageQuery,
-    PortalPage, PortalQuery, Record, RecordBundle, RowData, RowId, Schema, SearchHit,
+    PolicyHook, PortalPage, PortalQuery, Record, RecordBundle, RowData, RowId, Schema, SearchHit,
     SortDirection, Table, Value,
 };
 use slab_formula::{EvalContext, FormulaDag, FormulaError, evaluate_expression, parse};
@@ -19,6 +19,16 @@ use crate::workspace::{Workspace, now_ms, read_stored_record};
 mod predicates;
 
 use predicates::{append_cursor_predicate, append_filter};
+
+pub(crate) fn check_table_policy(policy: &dyn PolicyHook, table: &str) -> Result<(), StorageError> {
+    if policy.can_read_table(table) {
+        Ok(())
+    } else {
+        Err(StorageError::Query(format!(
+            "read policy denies table {table}"
+        )))
+    }
+}
 
 impl Workspace {
     /// Reads one row with computed columns applied and policy redaction.
@@ -337,13 +347,7 @@ impl Workspace {
     }
 
     pub(crate) fn check_policy(&self, table: &str) -> Result<(), StorageError> {
-        if self.policy.can_read_table(table) {
-            Ok(())
-        } else {
-            Err(StorageError::Query(format!(
-                "read policy denies table {table}"
-            )))
-        }
+        check_table_policy(self.policy.as_ref(), table)
     }
 
     pub(crate) fn redact_record(&self, table: &Table, record: &mut Record) {

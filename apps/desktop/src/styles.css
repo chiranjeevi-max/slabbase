@@ -2725,20 +2725,22 @@ kbd {
   border-radius: 5px;
   color: var(--text-primary);
   font-size: 12.5px;
+  text-align: start;
   cursor: grab;
   transition: background 120ms var(--ease), transform 120ms var(--ease);
 }
 
-.studio-source-item:hover {
+.studio-source-item:enabled:hover {
   background: var(--bg-hover);
 }
 
-.studio-source-item:active {
+.studio-source-item:enabled:active {
   cursor: grabbing;
   transform: scale(0.99);
 }
 
-.studio-source-item.disabled {
+.studio-source-item:disabled {
+  cursor: default;
   opacity: 0.45;
 }
 

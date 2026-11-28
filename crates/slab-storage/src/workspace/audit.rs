@@ -44,8 +44,15 @@ impl Workspace {
             .check_command_policy(&inverse)
             .and_then(|()| self.apply_command_with_audit(&inverse, "undo", &summary));
         match outcome {
-            Ok(_) => {
-                self.redo.push(command);
+            Ok(applied) => {
+                // An external writer may have added descendants since the
+                // original insert. Restore the cascade undo actually removed.
+                self.redo
+                    .push(if matches!(applied, Command::DeleteRow { .. }) {
+                        applied.inverse()
+                    } else {
+                        command
+                    });
                 Ok(self.undo_state())
             }
             Err(error) => {
@@ -66,10 +73,15 @@ impl Workspace {
             .check_command_policy(&command)
             .and_then(|()| self.apply_command_with_audit(&command, "redo", &summary));
         match outcome {
-            Ok(_) => {
+            Ok(applied) => {
                 // Keep the remaining redo stack intact. `push_undo` clears it
                 // for new edits, but a redo is a replay, not a new edit.
-                self.undo.push(command);
+                self.undo
+                    .push(if matches!(applied, Command::DeleteRow { .. }) {
+                        applied
+                    } else {
+                        command
+                    });
                 if self.undo.len() > UNDO_LIMIT {
                     self.undo.remove(0);
                 }
@@ -82,40 +94,46 @@ impl Workspace {
         }
     }
 
-    /// Recent audit entries, newest first.
+    /// Recent audit entries, newest first. The offset counts visible entries.
     pub fn audit_entries(&self, limit: u32, offset: u32) -> Result<Vec<AuditEntry>, StorageError> {
         let sql = "SELECT id, hlc, timestamp_ms, actor, transaction_id, table_name, row_id,
                           operation, summary, schema_change, entry_hash
-                   FROM _slab_audit_log ORDER BY id DESC LIMIT ?1 OFFSET ?2";
-        let mut stmt = self.read_conn().prepare(sql)?;
-        let rows = stmt.query_map(
-            params![i64::from(limit.min(1000)), i64::from(offset)],
-            |row| {
-                Ok(AuditEntry {
-                    id: row.get(0)?,
-                    hlc: row.get(1)?,
-                    timestamp_ms: row.get(2)?,
-                    actor: row.get(3)?,
-                    transaction: row.get(4)?,
-                    table: row.get(5)?,
-                    row_id: row.get(6)?,
-                    operation: row.get(7)?,
-                    summary: row.get(8)?,
-                    schema_change: row.get::<_, i64>(9)? != 0,
-                    entry_hash: row.get(10)?,
-                })
-            },
-        )?;
+                   FROM _slab_audit_log ORDER BY id DESC";
+        let mut stmt = self.read_conn().prepare_cached(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut remaining = limit.min(1000);
+        let mut skip = offset;
         let mut entries = Vec::new();
-        for row in rows {
-            let entry = row?;
-            if entry
-                .table
+        // Stream a single snapshot and decode a full entry only if it is
+        // authorized and belongs to this page.
+        while remaining > 0
+            && let Some(row) = rows.next()?
+        {
+            let table: Option<String> = row.get(5)?;
+            if table
                 .as_deref()
-                .is_none_or(|table| self.policy.can_read_table(table))
+                .is_some_and(|table| !self.policy.can_read_table(table))
             {
-                entries.push(entry);
+                continue;
             }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            entries.push(AuditEntry {
+                id: row.get(0)?,
+                hlc: row.get(1)?,
+                timestamp_ms: row.get(2)?,
+                actor: row.get(3)?,
+                transaction: row.get(4)?,
+                table,
+                row_id: row.get(6)?,
+                operation: row.get(7)?,
+                summary: row.get(8)?,
+                schema_change: row.get::<_, i64>(9)? != 0,
+                entry_hash: row.get(10)?,
+            });
+            remaining -= 1;
         }
         Ok(entries)
     }

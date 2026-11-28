@@ -34,6 +34,56 @@ fn note_workspace() -> Workspace {
     workspace
 }
 
+#[test]
+fn audit_pages_count_only_authorized_and_tableless_entries() {
+    struct DenyNotes;
+    impl slab_core::PolicyHook for DenyNotes {
+        fn can_read_table(&self, table: &str) -> bool {
+            table != "Notes"
+        }
+    }
+    let mut workspace = note_workspace();
+    workspace
+        .create_table(&TableDraft {
+            name: "Public".into(),
+            columns: vec![ColumnDraft {
+                name: "Body".into(),
+                ty: ColumnType::Text,
+                required: false,
+                unique: false,
+                default: None,
+            }],
+        })
+        .expect("public table");
+    workspace
+        .conn
+        .execute(
+            "UPDATE _slab_audit_log SET table_name = NULL WHERE id = 3",
+            [],
+        )
+        .expect("represent a tableless entry");
+    for table in ["Notes", "Public", "Notes", "Notes", "Notes"] {
+        workspace.insert_row(table, &RowData::new()).expect("row");
+    }
+    workspace.set_policy(std::sync::Arc::new(DenyNotes));
+
+    let table_names = |limit, offset| {
+        workspace
+            .audit_entries(limit, offset)
+            .expect("audit page")
+            .into_iter()
+            .map(|entry| entry.table)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        table_names(2, 0),
+        vec![Some("Public".into()), Some("Public".into())]
+    );
+    assert_eq!(table_names(2, 2), vec![None]);
+    assert!(table_names(2, 3).is_empty());
+    assert!(table_names(0, 0).is_empty());
+}
+
 pub(super) fn downgrade_to_legacy_scheme(workspace: &Workspace) {
     let rows = {
         let mut stmt = workspace

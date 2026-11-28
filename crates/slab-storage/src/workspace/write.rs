@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use rusqlite::{Connection, TransactionBehavior, params};
-use slab_core::{Command, DeleteAction, Relation, RowData, RowId};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use slab_core::{Command, DeleteAction, PolicyHook, Relation, RowData, RowId, Schema};
 use slab_formula::FormulaDag;
 
 use crate::ddl::{create_table_sql, unique_index_sql};
@@ -24,6 +24,42 @@ use super::{UNDO_LIMIT, Workspace, now_ms};
 /// Runs inside a command's transaction before audit and commit.
 type PostApply<'a> = Option<&'a mut dyn FnMut(&Connection, &Command) -> Result<(), StorageError>>;
 
+fn apply_row_delete(
+    tx: &Transaction<'_>,
+    schema: &Schema,
+    policy: &dyn PolicyHook,
+    table: &str,
+    id: RowId,
+) -> Result<Command, StorageError> {
+    let definition = schema
+        .table(table)
+        .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
+    let row = read_stored_record(tx, definition, id)?
+        .ok_or_else(|| StorageError::NotFound(format!("{table} #{id}")))?;
+    let mut children = Vec::new();
+    let mut seen = BTreeSet::from([(table.to_owned(), id)]);
+    capture_cascades(tx, schema, policy, table, id, &mut seen, &mut children)?;
+    delete_row_tx(tx, table, id)?;
+    delete_fts(tx, table, id)?;
+    // Remove every contribution before forgetting any parent state. A
+    // grandchild processed after its parent was forgotten would otherwise
+    // recreate a cache row for a parent that no longer exists.
+    rollup::maintain_delete(tx, schema, table, &row)?;
+    for child in &children {
+        delete_fts(tx, &child.table, child.row.id)?;
+        rollup::maintain_delete(tx, schema, &child.table, &child.row)?;
+    }
+    rollup::forget_parent(tx, table, id)?;
+    for child in &children {
+        rollup::forget_parent(tx, &child.table, child.row.id)?;
+    }
+    Ok(Command::DeleteRow {
+        table: table.to_owned(),
+        row,
+        children,
+    })
+}
+
 impl Workspace {
     /// Inserts a row and returns the stored record.
     pub fn insert_row(
@@ -31,6 +67,8 @@ impl Workspace {
         table: &str,
         values: &RowData,
     ) -> Result<slab_core::Record, StorageError> {
+        self.ensure_writer_available()?;
+        self.check_policy(table)?;
         let schema = self.schema()?;
         let definition = schema
             .table(table)
@@ -273,37 +311,11 @@ impl Workspace {
         self.ensure_writer_available()?;
         self.check_policy(table)?;
         let schema = self.schema()?;
-        let definition = schema
-            .table(table)
-            .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
-        let row = read_stored_record(&self.conn, definition, id)?
-            .ok_or_else(|| StorageError::NotFound(format!("{table} #{id}")))?;
         let hlc = self.clock.now();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut children = Vec::new();
-        let mut seen = BTreeSet::from([(table.to_owned(), id)]);
-        capture_cascades(&tx, &schema, table, id, &mut seen, &mut children)?;
-        delete_row_tx(&tx, table, id)?;
-        delete_fts(&tx, table, id)?;
-        // Remove every contribution before forgetting any parent state. A
-        // grandchild processed after its parent was forgotten would otherwise
-        // recreate a cache row for a parent that no longer exists.
-        rollup::maintain_delete(&tx, &schema, table, &row)?;
-        for child in &children {
-            delete_fts(&tx, &child.table, child.row.id)?;
-            rollup::maintain_delete(&tx, &schema, &child.table, &child.row)?;
-        }
-        rollup::forget_parent(&tx, table, id)?;
-        for child in &children {
-            rollup::forget_parent(&tx, &child.table, child.row.id)?;
-        }
-        let command = Command::DeleteRow {
-            table: table.to_owned(),
-            row,
-            children,
-        };
+        let command = apply_row_delete(&tx, &schema, self.policy.as_ref(), table, id)?;
         append_audit(&tx, &command, &hlc, &self.actor, "delete", &command.label())?;
         tx.commit()?;
         self.push_undo(command);
@@ -347,18 +359,16 @@ impl Workspace {
         Ok(applied)
     }
 
-    /// Checks every table a replayed command can touch before undo or redo.
+    /// Checks the replay target and any rows an inverse insert will restore.
+    /// A delete authorizes its live cascade in the writer transaction.
     pub(super) fn check_command_policy(&self, command: &Command) -> Result<(), StorageError> {
         if let Some(table) = command.table_name() {
             self.check_policy(table)?;
         }
-        match command {
-            Command::InsertRow { children, .. } | Command::DeleteRow { children, .. } => {
-                for child in children {
-                    self.check_policy(&child.table)?;
-                }
+        if let Command::InsertRow { children, .. } = command {
+            for child in children {
+                self.check_policy(&child.table)?;
             }
-            _ => {}
         }
         Ok(())
     }
@@ -478,6 +488,11 @@ impl Workspace {
                 row,
                 children,
             } => {
+                if !children.is_empty() {
+                    // A captured descendant can reference another row later
+                    // in the cascade. Validate all references at commit.
+                    tx.pragma_update(None, "defer_foreign_keys", true)?;
+                }
                 let definition = schema
                     .table(table)
                     .ok_or_else(|| StorageError::NotFound(table.clone()))?;
@@ -514,31 +529,8 @@ impl Workspace {
                 let _ = before;
                 command.clone()
             }
-            Command::DeleteRow {
-                table,
-                row,
-                children,
-            } => {
-                let _ = schema
-                    .table(table)
-                    .ok_or_else(|| StorageError::NotFound(table.clone()))?;
-                let mut cascaded = children.clone();
-                if cascaded.is_empty() {
-                    let mut seen = BTreeSet::from([(table.to_owned(), row.id)]);
-                    capture_cascades(&tx, &schema, table, row.id, &mut seen, &mut cascaded)?;
-                }
-                delete_row_tx(&tx, table, row.id)?;
-                delete_fts(&tx, table, row.id)?;
-                rollup::maintain_delete(&tx, &schema, table, row)?;
-                for child in &cascaded {
-                    delete_fts(&tx, &child.table, child.row.id)?;
-                    rollup::maintain_delete(&tx, &schema, &child.table, &child.row)?;
-                }
-                rollup::forget_parent(&tx, table, row.id)?;
-                for child in &cascaded {
-                    rollup::forget_parent(&tx, &child.table, child.row.id)?;
-                }
-                command.clone()
+            Command::DeleteRow { table, row, .. } => {
+                apply_row_delete(&tx, &schema, self.policy.as_ref(), table, row.id)?
             }
             Command::CreateTable { table } => {
                 let sql = create_table_sql(table, &table.name, &[])?;

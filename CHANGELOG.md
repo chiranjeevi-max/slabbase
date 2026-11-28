@@ -65,6 +65,11 @@ All notable changes to SlabBase are documented here. The format follows [Keep a 
 - Keep Form Studio edits made while a save is in flight, clamp item position and width to the 12-column grid, and resync the portal relation picker when relations change.
 - Keep a New Record draft open when the grid is clicked or double-clicked, and refresh an open inspector when another row is double-clicked.
 - Leave a newer selection alone when a delete or insert resolves, and clear the row-loading indicator whenever a page request is discarded.
+- Restore multi-path cascades through undo and check permissions on every affected table before a cascade delete. Fill audit pages with entries visible under the table policy.
+- Preserve source column order in JSON import previews and reject SQL export redactions that violate column types or required fields.
+- Keep new SQL exports private on Unix and verify the scratch file before publishing.
+- Keep PDF table text inside narrow cells and reject margins that leave insufficient printing space.
+- Enable keyboard activation in the Form Studio palette, preserve the selected table through delayed form saves and table renames, and close the inspector when undo or redo removes its record.
 
 ### Security
 

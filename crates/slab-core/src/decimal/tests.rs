@@ -94,9 +94,13 @@ fn multiplication_rounds_at_max_scale() {
 
 #[test]
 fn division_rounds_half_even() {
-    let one = Decimal::from_integer(1);
-    let eight = Decimal::from_integer(8);
-    assert_eq!(one.checked_div(eight).expect("div").to_string(), "0.1250");
+    let divisor = Decimal::from_integer(20_000);
+    for (dividend, expected) in [(1, "0.0000"), (3, "0.0002"), (-3, "-0.0002")] {
+        let quotient = Decimal::from_integer(dividend)
+            .checked_div(divisor)
+            .expect("div");
+        assert_eq!(quotient.to_string(), expected);
+    }
 }
 
 #[test]
@@ -206,7 +210,7 @@ fn jpy_has_no_minor_unit() {
 }
 
 #[test]
-fn zero_scaled_equality_ignores_scale() {
+fn scaled_equality_ignores_scale() {
     assert_eq!(
         Decimal::parse("1.0").expect("valid"),
         Decimal::parse("1.00").expect("valid")

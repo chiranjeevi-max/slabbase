@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Read;
 
-use serde::de::{self, Deserializer as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use super::{ImportAdapter, ImportError, ImportFormat, ImportOptions, SourceRow, SourceValue};
 
@@ -161,8 +161,9 @@ impl ImportAdapter for JsonAdapter {
                 on_columns,
                 on_row,
                 row_number: &mut row_number,
+                array_row: false,
             };
-            match deserializer.deserialize_any(visitor) {
+            match visitor.deserialize(&mut deserializer) {
                 Ok(()) => {}
                 Err(error) if error.is_eof() => break Some(error),
                 Err(error) => return Err(error.into()),
@@ -208,6 +209,18 @@ struct JsonVisitor<'a> {
     on_columns: &'a mut dyn FnMut(&[String]),
     on_row: &'a mut dyn FnMut(SourceRow),
     row_number: &'a mut u64,
+    array_row: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonVisitor<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
 }
 
 impl<'de> Visitor<'de> for JsonVisitor<'_> {
@@ -217,13 +230,25 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
         formatter.write_str("an object or an array of objects")
     }
 
-    fn visit_seq<A>(mut self, mut sequence: A) -> Result<(), A::Error>
+    fn visit_seq<A>(self, mut sequence: A) -> Result<(), A::Error>
     where
         A: SeqAccess<'de>,
     {
-        while let Some(value) = sequence.next_element::<serde_json::Value>()? {
-            self.emit_value(value);
+        if self.array_row {
+            while sequence.next_element::<IgnoredAny>()?.is_some() {}
+            return self.non_object();
         }
+        while sequence
+            .next_element_seed(JsonVisitor {
+                columns: &mut *self.columns,
+                seen: &mut *self.seen,
+                on_columns: &mut *self.on_columns,
+                on_row: &mut *self.on_row,
+                row_number: &mut *self.row_number,
+                array_row: true,
+            })?
+            .is_some()
+        {}
         Ok(())
     }
 
@@ -231,12 +256,12 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let mut values = BTreeMap::new();
+        let mut fields = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             let value: serde_json::Value = map.next_value()?;
-            values.insert(key, source_value(value));
+            fields.push((key, source_value(value)));
         }
-        self.emit_object(values);
+        self.emit_object(fields);
         Ok(())
     }
 
@@ -244,100 +269,81 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
     where
         E: de::Error,
     {
-        Err(E::custom(
-            "JSON source must be an object or an array of objects",
-        ))
+        self.non_object()
     }
 
     fn visit_bool<E>(self, _value: bool) -> Result<(), E>
     where
         E: de::Error,
     {
-        Err(E::custom(
-            "JSON source must be an object or an array of objects",
-        ))
+        self.non_object()
     }
 
     fn visit_i64<E>(self, _value: i64) -> Result<(), E>
     where
         E: de::Error,
     {
-        Err(E::custom(
-            "JSON source must be an object or an array of objects",
-        ))
+        self.non_object()
     }
 
     fn visit_u64<E>(self, _value: u64) -> Result<(), E>
     where
         E: de::Error,
     {
-        Err(E::custom(
-            "JSON source must be an object or an array of objects",
-        ))
+        self.non_object()
     }
 
     fn visit_f64<E>(self, _value: f64) -> Result<(), E>
     where
         E: de::Error,
     {
-        Err(E::custom(
-            "JSON source must be an object or an array of objects",
-        ))
+        self.non_object()
     }
 
     fn visit_unit<E>(self) -> Result<(), E>
     where
         E: de::Error,
     {
-        Err(E::custom(
-            "JSON source must be an object or an array of objects",
-        ))
+        self.non_object()
     }
 }
 
 impl JsonVisitor<'_> {
-    fn emit_value(&mut self, value: serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                self.emit_object(
-                    object
-                        .into_iter()
-                        .map(|(key, value)| (key, source_value(value)))
-                        .collect(),
-                );
-            }
-            _ => {
-                *self.row_number = self.row_number.saturating_add(1);
-                (self.on_row)(SourceRow {
-                    number: *self.row_number,
-                    issues: vec!["row is not an object".into()],
-                    ..SourceRow::default()
-                });
-            }
+    fn non_object<E: de::Error>(self) -> Result<(), E> {
+        if !self.array_row {
+            return Err(E::custom(
+                "JSON source must be an object or an array of objects",
+            ));
         }
+        *self.row_number = self.row_number.saturating_add(1);
+        (self.on_row)(SourceRow {
+            number: *self.row_number,
+            issues: vec!["row is not an object".into()],
+            ..SourceRow::default()
+        });
+        Ok(())
     }
 
-    fn emit_object(&mut self, values: BTreeMap<String, SourceValue>) {
-        let mut added = false;
-        for key in values.keys() {
-            if self.seen.insert(key.clone()) {
-                self.columns.push(key.clone());
-                added = true;
-            }
-        }
-        if added {
-            (self.on_columns)(self.columns);
-        }
+    fn emit_object(&mut self, fields: Vec<(String, SourceValue)>) {
         *self.row_number = self.row_number.saturating_add(1);
         let mut row = SourceRow {
             number: *self.row_number,
             ..SourceRow::default()
         };
+        let previous_columns = self.columns.len();
+        for (key, value) in fields {
+            if self.seen.insert(key.clone()) {
+                self.columns.push(key.clone());
+            }
+            row.values.insert(key, value);
+        }
+        if self.columns.len() != previous_columns {
+            (self.on_columns)(self.columns);
+        }
         for column in self.columns.iter() {
-            row.values.insert(
-                column.clone(),
-                values.get(column).cloned().unwrap_or(SourceValue::Null),
-            );
+            if !row.values.contains_key(column) {
+                row.values.insert(column.clone(), SourceValue::Null);
+            }
         }
         (self.on_row)(row);
     }
