@@ -1626,7 +1626,10 @@ test.describe("release hardening", () => {
     const active = page.locator(".grid-cell .field-input").first();
     await expect(active).toBeVisible();
     const before = await active.inputValue();
-    await page.keyboard.type("zz");
+    // One keystroke: Chromium may split consecutive typed characters into
+    // separate native undo steps on slow runners, and this test checks
+    // routing, not the browser's coalescing.
+    await page.keyboard.type("z");
     await expect(active).not.toHaveValue(before);
     await page.keyboard.press("Meta+z");
     await expect(active).toHaveValue(before);
