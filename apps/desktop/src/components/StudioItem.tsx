@@ -9,8 +9,7 @@ import type {
 } from "../bindings";
 import { columnTypeLabel, isComputedColumn } from "../types";
 import { Icon } from "./Icons";
-
-export const ROW_HEIGHT = 30;
+import { GRID_COLUMNS, gridItemStyle, MAX_GRID_ROW, ROW_HEIGHT, type GridRect } from "./studioGeometry";
 
 export function StudioItem({
   item,
@@ -29,9 +28,9 @@ export function StudioItem({
   schema: Schema | null;
   selected: boolean;
   onSelect: () => void;
-  onDragState: (dragging: boolean) => void;
+  onDragState: (item: LayoutItem | null) => void;
   onResize: (patch: Partial<LayoutItem>) => void;
-  onGuide: (guide: { x: number; y: number; w: number; h: number } | null) => void;
+  onGuide: (guide: GridRect | null) => void;
 }) {
   const resizeRef = useRef(false);
   const resizeOrigin = useRef<{
@@ -41,12 +40,6 @@ export function StudioItem({
     rect: DOMRect;
     item: LayoutItem;
   } | null>(null);
-  const rounded = {
-    left: `${(item.x / 12) * 100}%`,
-    top: item.y * ROW_HEIGHT,
-    width: `${(item.w / 12) * 100}%`,
-    height: item.h * ROW_HEIGHT - 4,
-  };
 
   const beginResize = (event: React.PointerEvent, handle: ResizeHandle) => {
     event.preventDefault();
@@ -68,14 +61,14 @@ export function StudioItem({
   const moveResize = (event: React.PointerEvent) => {
     const origin = resizeOrigin.current;
     if (!origin || !(origin.rect.width > 0)) return;
-    const rawDx = ((event.clientX - origin.startX) / origin.rect.width) * 12;
+    const rawDx = ((event.clientX - origin.startX) / origin.rect.width) * GRID_COLUMNS;
     const rawDy = (event.clientY - origin.startY) / ROW_HEIGHT;
     if (!Number.isFinite(rawDx) || !Number.isFinite(rawDy)) return;
     const dx = Math.round(rawDx);
     const dy = Math.round(rawDy);
     let { x, y, w, h } = origin.item;
     if (origin.handle.includes("e")) {
-      w = Math.max(1, Math.min(12 - x, origin.item.w + dx));
+      w = Math.max(1, Math.min(GRID_COLUMNS - x, origin.item.w + dx));
     }
     if (origin.handle.includes("w")) {
       const nextX = Math.max(0, Math.min(origin.item.x + origin.item.w - 1, origin.item.x + dx));
@@ -83,12 +76,14 @@ export function StudioItem({
       w = origin.item.w + (origin.item.x - nextX);
     }
     if (origin.handle.includes("s")) {
-      h = Math.max(1, origin.item.h + dy);
+      h = Math.max(1, Math.min(MAX_GRID_ROW, origin.item.h + dy));
     }
     if (origin.handle.includes("n")) {
-      const nextY = Math.max(0, Math.min(origin.item.y + origin.item.h - 1, origin.item.y + dy));
-      y = nextY;
-      h = origin.item.h + (origin.item.y - nextY);
+      const bottom = origin.item.y + origin.item.h;
+      const minimum = Math.max(0, bottom - MAX_GRID_ROW);
+      const maximum = Math.min(MAX_GRID_ROW, bottom - 1);
+      y = Math.max(minimum, Math.min(maximum, origin.item.y + dy));
+      h = bottom - y;
     }
     onResize({ x, y, w, h });
     onGuide({ x, y, w, h });
@@ -108,7 +103,10 @@ export function StudioItem({
       className={`studio-item ${selected ? "selected" : ""} ${
         resizeRef.current ? "resizing" : ""
       }`}
-      style={rounded}
+      style={gridItemStyle(item)}
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
       draggable
       onDragStart={(event) => {
         if (resizeRef.current) {
@@ -116,12 +114,17 @@ export function StudioItem({
           return;
         }
         event.dataTransfer.setData("text/plain", `slab-move:${item.id}`);
-        onDragState(true);
+        onDragState(item);
       }}
-      onDragEnd={() => onDragState(false)}
+      onDragEnd={() => onDragState(null)}
       onClick={(event) => {
         event.stopPropagation();
         onSelect();
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        if (!event.repeat) onSelect();
       }}
     >
       {item.kind.kind === "section" && (
@@ -264,7 +267,7 @@ export function ItemInspector({
               value={kind.relation}
               onChange={(event) =>
                 onChange({
-                  kind: { ...kind, relation: event.target.value },
+                  kind: { ...kind, relation: event.target.value, columns: [] },
                 })
               }
             >
@@ -293,33 +296,24 @@ export function ItemInspector({
       )}
       <span className="palette-heading">Position</span>
       <div className="inspector-grid">
-        {(["x", "y", "w", "h"] as const).map((key) => (
+        {([
+          ["x", 0, Math.max(0, GRID_COLUMNS - item.w)],
+          ["y", 0, MAX_GRID_ROW],
+          ["w", 1, Math.max(1, GRID_COLUMNS - item.x)],
+          ["h", 1, MAX_GRID_ROW],
+        ] as const).map(([key, min, max]) => (
           <label className="inspector-field" key={key}>
             <span>{key.toUpperCase()}</span>
             <input
               className="field-input inspector-number"
               type="number"
-              min={key === "w" || key === "h" ? 1 : 0}
-              max={
-                key === "x"
-                  ? Math.max(0, 12 - item.w)
-                  : key === "w"
-                    ? Math.max(1, 12 - item.x)
-                    : 40
-              }
+              min={min}
+              max={max}
               value={item[key]}
               onChange={(event) => {
                 const parsed = Number(event.target.value);
                 if (!Number.isFinite(parsed)) return;
-                const minimum = key === "w" || key === "h" ? 1 : 0;
-                const maximum =
-                  key === "x"
-                    ? Math.max(0, 12 - item.w)
-                    : key === "w"
-                      ? Math.max(1, 12 - item.x)
-                      : 40;
-                const value = Math.max(minimum, Math.min(maximum, Math.trunc(parsed)));
-                onChange({ [key]: value });
+                onChange({ [key]: Math.max(min, Math.min(max, Math.trunc(parsed))) });
               }}
             />
           </label>

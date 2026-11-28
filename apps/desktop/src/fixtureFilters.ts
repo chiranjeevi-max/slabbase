@@ -1,37 +1,7 @@
 import type { Column, Filter, Value } from "./bindings";
 import { fixtureError } from "./fixtureState";
+import { checkedInteger, currencyScale, decimalText, minorUnits } from "./fixtureValues";
 import { isComputedColumn, isNull, valueText } from "./types";
-
-const MIN_I64 = -(2n ** 63n);
-const MAX_I64 = 2n ** 63n - 1n;
-
-function checkedInteger(value: bigint): bigint | null {
-  return value < MIN_I64 || value > MAX_I64 ? null : value;
-}
-
-function currencyScale(currency: string): number {
-  if (["JPY", "KRW", "VND", "CLP", "ISK"].includes(currency)) return 0;
-  if (["BHD", "KWD", "OMR", "TND", "JOD"].includes(currency)) return 3;
-  return 2;
-}
-
-function minorUnits(text: string, scale: number): bigint | null {
-  const match = /^([+-]?)(\d*)(?:\.(\d*))?$/.exec(text.trim());
-  if (!match) return null;
-  const [, sign = "", integer = "", fraction = ""] = match;
-  if (!(integer || fraction) || fraction.length > 9 || /[1-9]/.test(fraction.slice(scale))) {
-    return null;
-  }
-  if (checkedInteger(BigInt(`${sign}${integer}${fraction}`)) === null) return null;
-  const minor = fraction.slice(0, scale).padEnd(scale, "0");
-  return checkedInteger(BigInt(`${sign}${integer || "0"}${minor}`));
-}
-
-function decimalText(units: bigint, scale: number): string {
-  if (scale === 0) return units.toString();
-  const magnitude = (units < 0n ? -units : units).toString().padStart(scale + 1, "0");
-  return `${units < 0n ? "-" : ""}${magnitude.slice(0, -scale)}.${magnitude.slice(-scale)}`;
-}
 
 function canonicalTimestamp(text: string): string | null {
   const match = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(?:\.(\d{3}))?[Zz]?$/.exec(text.trim());

@@ -150,7 +150,7 @@ export interface AppStore {
   dropColumn: (table: string, column: string) => Promise<boolean>;
   dropRelation: (name: string) => Promise<boolean>;
   toggleIndex: (table: string, column: string, enabled: boolean) => Promise<IndexSpec[] | null>;
-  saveLayout: (layout: Layout) => Promise<boolean>;
+  saveLayout: (layout: Layout) => Promise<Layout | null>;
 
   openAudit: () => Promise<void>;
   closeAudit: () => void;

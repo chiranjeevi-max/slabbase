@@ -32,11 +32,13 @@ fn dropping_only_the_hash_columns_does_not_reenable_backfill() {
 
     {
         let connection = Connection::open(&path).expect("raw open");
-        // A modern log keeps `hash_version`; dropping only the two hash
-        // columns must not make it look like a pre-hash legacy file.
+        // Keep `hash_version` as the only evidence that this log already had
+        // hashes, so the format-2 guard cannot mask a broken schema check.
         connection
             .execute_batch(
-                "ALTER TABLE _slab_audit_log DROP COLUMN prev_hash;
+                "UPDATE _slab_meta SET value = '1' WHERE key = 'format_version';
+                 PRAGMA user_version = 1;
+                 ALTER TABLE _slab_audit_log DROP COLUMN prev_hash;
                  ALTER TABLE _slab_audit_log DROP COLUMN entry_hash;
                  UPDATE _slab_audit_log SET summary = 'silently rewritten';
                  DELETE FROM _slab_meta WHERE key IN ('audit_head_hash', 'audit_head_id');",

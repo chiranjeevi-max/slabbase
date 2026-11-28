@@ -1,16 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { Layout, LayoutItem, Relation, Table } from "../bindings";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { Layout, LayoutItem, Table } from "../bindings";
 import { useStore } from "../store";
 import { newItemId } from "../types";
 import { Icon } from "./Icons";
-import { ItemInspector, ROW_HEIGHT, StudioItem } from "./StudioItem";
-import { nextRow, StudioPalette } from "./StudioPalette";
-
-type GridRect = { x: number; y: number; w: number; h: number };
+import { ItemInspector, StudioItem } from "./StudioItem";
+import { StudioPalette } from "./StudioPalette";
+import {
+  GRID_COLUMNS, gridItemStyle, MAX_GRID_ROW, ROW_HEIGHT, type GridRect, type StudioItemSource,
+} from "./studioGeometry";
 
 export function FormStudio() {
   const state = useStudioState();
-  const { table, layout, setLayout } = state;
+  const { table, layout, startForm } = state;
 
   if (!table) {
     return <div className="canvas-empty">Select a table to design a form.</div>;
@@ -28,7 +29,7 @@ export function FormStudio() {
           <button
             type="button"
             className="button primary"
-            onClick={() => setLayout(defaultLayout(table))}
+            onClick={startForm}
           >
             Create Form
           </button>
@@ -50,14 +51,10 @@ function StudioEditor({
   layout: Layout;
 }) {
   const {
-    schema, activeTable, inspectorOpen, saveLayout, setLayout, selectedId, setSelectedId,
-    setDragging, saving, setSaving, loadedLayout, dirtyRef, relations, portalRelation, setPortalRelation,
+    schema, inspectorOpen, update, selectedId, setSelectedId, startForm, save, saving,
+    setDragItem, relations, portalRelation, setPortalRelation,
   } = state;
   const selected = layout.items.find((item) => item.id === selectedId) ?? null;
-  const update = (next: Layout) => {
-    dirtyRef.current = true;
-    setLayout({ ...next, items: [...next.items] });
-  };
 
   const updateItem = (id: string, patch: Partial<LayoutItem>) => {
     update({
@@ -66,22 +63,13 @@ function StudioEditor({
     });
   };
 
-  const save = async () => {
-    const snapshot = { ...layout, updated_at: Date.now() };
-    dirtyRef.current = false;
-    setSaving(true);
-    const saved = await saveLayout(snapshot);
-    setSaving(false);
-    if (saved) {
-      // Edits made while the save was in flight set dirtyRef again; the effect
-      // will preserve them instead of replacing the form with this snapshot.
-      loadedLayout.current = {
-        key: `${activeTable ?? ""}|${snapshot.id}`,
-        updatedAt: snapshot.updated_at,
-      };
-    } else {
-      dirtyRef.current = true;
-    }
+  const addItem = (source: StudioItemSource, position?: GridRect) => {
+    const { kind, w, h } = source;
+    const nextRow = Math.max(0, ...layout.items.map((item) => item.y + item.h)) + 1;
+    const geometry = position ?? { x: 0, y: Math.min(MAX_GRID_ROW, nextRow), w, h };
+    const item = { ...geometry, id: newItemId(kind.kind), kind };
+    update({ ...layout, items: [...layout.items, item] });
+    setSelectedId(item.id);
   };
 
   return (
@@ -115,7 +103,7 @@ function StudioEditor({
           <button
             type="button"
             className="button compact"
-            onClick={() => setLayout(defaultLayout(table))}
+            onClick={startForm}
           >
             New Form
           </button>
@@ -134,10 +122,8 @@ function StudioEditor({
         <StudioPalette
           table={table}
           layout={layout}
-          update={update}
-          setSelectedId={setSelectedId}
-          setDragging={setDragging}
-          addKind={addKind}
+          onDragItem={setDragItem}
+          addItem={addItem}
           portalRelation={portalRelation}
           setPortalRelation={setPortalRelation}
           relations={relations}
@@ -147,7 +133,7 @@ function StudioEditor({
           state={state}
           layout={layout}
           table={table}
-          update={update}
+          addItem={addItem}
           updateItem={updateItem}
         />
 
@@ -198,19 +184,6 @@ function StudioEditor({
     </div>
   );
 
-  function addKind(kind: string) {
-    const base = layout;
-    if (!base) return;
-    const item = newKindItem(
-      kind,
-      { x: 0, y: nextRow(base) },
-      relations,
-      portalRelation,
-    );
-    if (!item) return;
-    update({ ...base, items: [...base.items, item] });
-    setSelectedId(item.id);
-  }
 }
 
 function useStudioState() {
@@ -220,19 +193,20 @@ function useStudioState() {
   const inspectorOpen = useStore((state) => state.inspectorOpen);
   const saveLayout = useStore((state) => state.saveLayout);
   const setFormStatus = useStore((state) => state.setFormStatus);
-  const [layout, setLayout] = useState<Layout | null>(null);
+  const [layout, setCurrentLayout] = useState<Layout | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [snap, setSnap] = useState<GridRect | null>(null);
-  const [dragging, setDragging] = useState(false);
+  const [dragItem, setCurrentDragItem] = useState<StudioItemSource | null>(null);
   const [saving, setSaving] = useState(false);
-  const [guide, setGuide] = useState<GridRect | null>(
-    null,
-  );
-  const canvasRef = useRef<HTMLDivElement>(null);
+  const [guide, setGuide] = useState<GridRect | null>(null);
   const layoutRef = useRef<Layout | null>(null);
   const loadedLayout = useRef<{ key: string; updatedAt: number } | null>(null);
   const dirtyRef = useRef(false);
-  layoutRef.current = layout;
+  const pendingSave = useRef<Layout | null>(null);
+  const setLayout = useCallback((next: Layout | null) => {
+    layoutRef.current = next;
+    setCurrentLayout(next);
+  }, []);
 
   const table = schema?.tables.find((candidate) => candidate.name === activeTable);
   const relations = useMemo(
@@ -240,13 +214,53 @@ function useStudioState() {
     [schema, activeTable],
   );
   const [portalRelation, setPortalRelation] = useState<string>("");
+  const key = `${activeTable ?? ""}|${activeLayoutId ?? ""}`;
+
+  const setDragItem = (item: StudioItemSource | null) => {
+    setCurrentDragItem(item);
+    setSnap(null);
+  };
+
+  const update = (next: Layout) => {
+    dirtyRef.current = true;
+    setLayout(next);
+  };
+
+  const startForm = () => {
+    if (!table) return;
+    pendingSave.current = null;
+    setSelectedId(null);
+    update(defaultLayout(table));
+  };
+
+  const save = async () => {
+    const snapshot = layoutRef.current;
+    if (!snapshot) return;
+    pendingSave.current = snapshot;
+    // Keep the live draft mounted through the metadata refresh inside saveLayout.
+    dirtyRef.current = true;
+    setSaving(true);
+    const saved = await saveLayout(snapshot);
+    setSaving(false);
+    const current = useStore.getState();
+    if (pendingSave.current !== snapshot || current.view !== "form"
+      || current.activeTable !== activeTable || current.activeLayoutId !== activeLayoutId) return;
+    pendingSave.current = null;
+    const draft = layoutRef.current;
+    if (!saved || !draft) return;
+
+    const editedSinceSave = draft !== snapshot;
+    dirtyRef.current = editedSinceSave;
+    loadedLayout.current = { key: `${saved.table}|${saved.id}`, updatedAt: saved.updated_at };
+    setLayout(editedSinceSave ? { ...draft, id: saved.id, updated_at: saved.updated_at } : saved);
+    if (current.activeLayoutId !== saved.id) useStore.setState({ activeLayoutId: saved.id });
+  };
 
   useEffect(() => {
     const existing =
       schema?.layouts.find(
         (candidate) => candidate.id === activeLayoutId && candidate.table === activeTable,
       ) ?? schema?.layouts.find((candidate) => candidate.table === activeTable);
-    const key = `${activeTable ?? ""}|${activeLayoutId ?? ""}`;
     const updatedAt = existing?.updated_at ?? -1;
     const loaded = loadedLayout.current;
     if (
@@ -265,10 +279,18 @@ function useStudioState() {
     }
     setLayout(existing ?? null);
     setSelectedId(null);
+    setCurrentDragItem(null);
+    setSnap(null);
+    setGuide(null);
     setPortalRelation(relations[0]?.name ?? "");
     loadedLayout.current = { key, updatedAt };
     dirtyRef.current = false;
-  }, [schema, activeTable, activeLayoutId, relations]);
+    pendingSave.current = null;
+  }, [schema, activeTable, activeLayoutId, key, relations, setLayout]);
+
+  useEffect(() => () => {
+    pendingSave.current = null;
+  }, []);
 
   useEffect(() => {
     if (!layout) {
@@ -280,9 +302,9 @@ function useStudioState() {
   }, [layout, setFormStatus]);
 
   return {
-    schema, activeTable, inspectorOpen, saveLayout, layout, setLayout, selectedId, setSelectedId,
-    snap, setSnap, dragging, setDragging, saving, setSaving, guide, setGuide, canvasRef,
-    loadedLayout, dirtyRef, table, relations, portalRelation, setPortalRelation,
+    schema, inspectorOpen, layout, update, startForm, selectedId, setSelectedId,
+    snap, setSnap, dragItem, setDragItem, save, saving, guide, setGuide,
+    table, relations, portalRelation, setPortalRelation,
   };
 }
 
@@ -290,100 +312,70 @@ function StudioCanvas({
   state,
   layout,
   table,
-  update,
+  addItem,
   updateItem,
 }: {
   state: ReturnType<typeof useStudioState>;
   layout: Layout;
   table: Table;
-  update: (layout: Layout) => void;
+  addItem: (source: StudioItemSource, position: GridRect) => void;
   updateItem: (id: string, patch: Partial<LayoutItem>) => void;
 }) {
   const {
-    canvasRef, dragging, setDragging, snap, setSnap, guide, setGuide,
-    selectedId, setSelectedId, schema, relations, portalRelation,
+    dragItem, setDragItem, snap, setSnap, guide, setGuide,
+    selectedId, setSelectedId, schema, relations,
   } = state;
   const canvasHeight = Math.max(
     520,
     Math.max(0, ...layout.items.map((item) => item.y + item.h)) * ROW_HEIGHT + 80,
   );
 
-  const dropPosition = (event: React.DragEvent) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
+  const dropPosition = (event: React.DragEvent<HTMLDivElement>, { w, h }: StudioItemSource) => {
+    const rect = event.currentTarget.getBoundingClientRect();
     if (!(rect.width > 0)) return null;
-    const columns = 12;
-    const rawX = ((event.clientX - rect.left) / rect.width) * columns;
-    const rawY = Math.max(0, Math.floor((event.clientY - rect.top) / ROW_HEIGHT));
+    const rawX = ((event.clientX - rect.left) / rect.width) * GRID_COLUMNS;
+    const rawY = (event.clientY - rect.top) / ROW_HEIGHT;
     if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) return null;
-    return { x: Math.max(0, Math.min(columns - 1, Math.round(rawX))), y: rawY };
+    return {
+      x: Math.max(0, Math.min(GRID_COLUMNS - w, Math.round(rawX))),
+      y: Math.max(0, Math.min(MAX_GRID_ROW, Math.floor(rawY))),
+      w,
+      h,
+    };
   };
 
-  const handleDrop = (event: React.DragEvent) => {
+  const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!dragItem) return;
     event.preventDefault();
-    setSnap(null);
-    setDragging(false);
-    const position = dropPosition(event);
+    setDragItem(null);
+    const position = dropPosition(event, dragItem);
     if (!position) return;
-    const payload = event.dataTransfer.getData("text/plain");
-    if (payload.startsWith("slab-column:")) {
-      const name = payload.slice("slab-column:".length);
-      const column = table.columns.find((candidate) => candidate.name === name);
-      if (!column) return;
-      const width = 6;
-      const x = Math.min(position.x, 12 - width);
-      const item: LayoutItem = {
-        id: newItemId("field"),
-        kind: { kind: "field", column: name },
-        x,
-        y: position.y,
-        w: width,
-        h: 2,
-      };
-      update({ ...layout, items: [...layout.items, item] });
-      setSelectedId(item.id);
-    } else if (payload.startsWith("slab-move:")) {
-      const id = payload.slice("slab-move:".length);
-      const item = layout.items.find((candidate) => candidate.id === id);
-      if (!item) return;
-      const x = Math.min(position.x, 12 - item.w);
-      updateItem(id, { x: Math.max(0, x), y: position.y });
-    } else if (payload.startsWith("slab-kind:")) {
-      const kind = payload.slice("slab-kind:".length);
-      const item = newKindItem(kind, position, relations, portalRelation);
-      if (!item) return;
-      update({ ...layout, items: [...layout.items, item] });
-      setSelectedId(item.id);
+    if (dragItem.id) {
+      updateItem(dragItem.id, { x: position.x, y: position.y });
+    } else {
+      addItem(dragItem, position);
     }
   };
 
   return (
     <div className="canvas-wrap">
       <div
-        ref={canvasRef}
-        className={`canvas ${dragging ? "dragging" : ""}`}
+        className={`canvas ${dragItem ? "dragging" : ""}`}
         style={{ height: canvasHeight }}
         onDragOver={(event) => {
+          if (!dragItem) return;
           event.preventDefault();
-          const position = dropPosition(event);
-          if (position) setSnap({ x: position.x, y: position.y, w: 6, h: 2 });
+          setSnap(dropPosition(event, dragItem));
         }}
-        onDragLeave={() => setSnap(null)}
+        onDragLeave={(event) => {
+          if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) {
+            setSnap(null);
+          }
+        }}
         onDrop={handleDrop}
         onClick={() => setSelectedId(null)}
       >
-        {snap && (
-          <div
-            className="snap-preview"
-            style={{
-              left: `${(snap.x / 12) * 100}%`,
-              top: snap.y * ROW_HEIGHT,
-              width: `${(snap.w / 12) * 100}%`,
-              height: snap.h * ROW_HEIGHT,
-            }}
-          />
-        )}
+        {snap && <div className="snap-preview" style={gridItemStyle(snap)} />}
         {layout.items.map((item) => (
           <StudioItem
             key={item.id}
@@ -396,21 +388,13 @@ function StudioCanvas({
               setSelectedId(item.id);
               useStore.getState().setInspectorOpen(true);
             }}
-            onDragState={setDragging}
+            onDragState={setDragItem}
             onResize={(patch) => updateItem(item.id, patch)}
             onGuide={setGuide}
           />
         ))}
         {guide && (
-          <div
-            className="resize-guide-box"
-            style={{
-              left: `${(guide.x / 12) * 100}%`,
-              top: guide.y * ROW_HEIGHT,
-              width: `${(guide.w / 12) * 100}%`,
-              height: guide.h * ROW_HEIGHT - 4,
-            }}
-          >
+          <div className="resize-guide-box" style={gridItemStyle(guide)}>
             <span>
               {guide.w} × {guide.h}
             </span>
@@ -419,52 +403,6 @@ function StudioCanvas({
       </div>
     </div>
   );
-}
-
-function newKindItem(
-  kind: string,
-  position: { x: number; y: number },
-  relations: Relation[],
-  portalRelation: string,
-): LayoutItem | null {
-  if (kind === "section") {
-    return {
-      id: newItemId("section"),
-      kind: { kind: "section", title: "Section" },
-      x: 0,
-      y: position.y,
-      w: 12,
-      h: 1,
-    };
-  }
-  if (kind === "label") {
-    return {
-      id: newItemId("label"),
-      kind: { kind: "label", text: "Label" },
-      x: Math.min(position.x, 6),
-      y: position.y,
-      w: 6,
-      h: 2,
-    };
-  }
-  if (kind === "portal") {
-    const relation = relations.find((candidate) => candidate.name === portalRelation);
-    if (!relation) return null;
-    return {
-      id: newItemId("portal"),
-      kind: {
-        kind: "portal",
-        relation: relation.name,
-        columns: [],
-        rows: 5,
-      },
-      x: 0,
-      y: position.y,
-      w: 12,
-      h: 6,
-    };
-  }
-  return null;
 }
 
 function defaultLayout(table: Table): Layout {

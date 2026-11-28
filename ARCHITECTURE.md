@@ -82,6 +82,8 @@ Writes follow one path:
 
 Undo applies the inverse through the same path, so an undo is itself audited and can be redone.
 
+Row updates read the before image and merge the patch inside the immediate write transaction. The computed record, audit entry, and undo command all reflect that write.
+
 Cascade deletes authorize the affected child tables inside the same write transaction. Undo restores all captured rows in one transaction and defers foreign-key checks until commit, so a descendant can reference another row restored by that undo.
 
 ### `slab-import`
@@ -92,11 +94,13 @@ JSON preview lists columns in the order their keys first appear across rows.
 
 The CSV adapter strips a UTF-8 BOM before header mapping and reports ragged rows as row issues; `apply` treats those issues like conversion failures, so strict imports never silently drop or reinterpret a row. The JSON adapter distinguishes a clean end of stream from a value truncated at EOF by inspecting the final non-whitespace byte, and missing optional keys are nulls rather than row errors. `Workspace::begin_import`, `insert_import_rows`, and `commit_import` wrap the whole production import in one immediate SQLite transaction, so a failure at any batch rolls back every earlier row. FTS inserts use an append-only path; the former delete-then-insert on every new row made bulk import quadratic in the index size. If a caller abandons the import, the next ordinary write rolls the stale transaction back and returns a typed `SLAB_E_COMMAND` refusal; a close rolls it back and completes cleanly. Either path leaves the writer usable instead of permanently wedged.
 
+A failed `insert_import_rows` ends the active import. The caller can begin a fresh import or proceed with ordinary writes.
+
 ### `slab-print`
 
 Consumes a `Layout`, a record, and portal data from `slab-core` and produces either a self-contained HTML document or a PDF byte stream. The PDF writer emits PDF 1.7 with base-14 Helvetica fonts and vector rules, so no font files are redistributed.
 
-The PDF renderer accepts margins from 0 to 144 points. Table text is truncated to the available cell width and omitted if an ellipsis would overflow.
+The PDF renderer accepts margins from 0 to 144 points. Table text is fitted to the available cell width using the metrics of the font that draws it. Text is omitted if an ellipsis would overflow.
 
 PDF text uses WinAnsiEncoding. Latin-1 text and the CP1252 punctuation block (euro, em dash, smart quotes, ellipsis) encode directly. Common symbols outside WinAnsi use deterministic ASCII fallbacks (`₹` to `INR`, `₽` to `RUB`, `−` to `-`, zero-width characters to nothing); other unsupported scripts and emoji become `?`. The fallback is deliberate and stable across exports because embedding a full Unicode font is outside the v1.0 redistribution model. Form fields are single-line and long tokens are truncated with an ellipsis; the table report streams rows and stops at the explicit 25,000-row ceiling.
 
@@ -193,6 +197,8 @@ scheme 2 (current): BLAKE3(length-prefixed(prev_hash, hlc, timestamp_ms, actor,
 `diff_json` includes the operation, summary, schema flag, and both before and after JSON strings. Length prefixes make the scheme-2 preimage unambiguous even if a field contains the old separator. The first entry links to 64 zeroes. `_slab_meta.audit_head_hash` and `_slab_meta.audit_head_id` anchor the tail, which detects a deleted final row; a modern log with a missing head is reported as tampered, not re-anchored. New entries use scheme 2. When the hash columns are absent from the table itself, the file predates them: the columns are added and the chain is backfilled with scheme 2 in one transaction. A valid scheme-1 chain is verified first and then rewritten to scheme 2 atomically; scheme 1 authenticated content but not the actor, so the migration trusts the actor values stored in those rows. A log whose hash columns exist but whose hashes were NULLed is never backfilled, so deleting the hashes and the head cannot launder altered history. If some entries are hashed and others are not, the missing hashes are left in place so `Integrity Check` reports the altered entry. `Integrity Check` verifies `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, and the full chain, returning an explicit tamper diagnostic naming the first broken entry.
 
 `record_history(table, row_id)` returns the chronological field-level diffs for one record. `restore_record_revision(table, row_id, audit_id)` rebuilds the stored row from that revision, validates foreign keys and the formula DAG, applies the normal update or insert path so rollups stay exact, appends a new `restore` entry to the hash chain, and pushes the inverse onto the undo stack. Restoring is therefore itself undoable with `⌘Z`. The Record Inspector exposes this as a quiet History clock button and an inline revision sheet with before → after values and a `Restore` action.
+
+Integrity checks read the audit rows and both head anchors from one SQLite snapshot.
 
 Audit page limits and offsets count entries visible under the table policy. Entries without a table are visible.
 

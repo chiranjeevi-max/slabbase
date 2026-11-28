@@ -98,7 +98,7 @@ export function Sidebar({
           title={overlay ? "Close Sidebar" : "Collapse Sidebar"}
           aria-label={overlay ? "Close Sidebar" : "Collapse Sidebar"}
           data-testid="sidebar-header-toggle"
-          onClick={onToggle}
+          onClick={overlay ? closeOverlay : onToggle}
         >
           <Icon name="sidebar" size={14} strokeWidth={1.5} />
         </button>

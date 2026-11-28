@@ -41,12 +41,14 @@ export function schemaActions({
       preferredTable && schema.tables.some((table) => table.name === preferredTable)
         ? preferredTable
         : firstTable(schema);
-    const activeLayoutId =
-      schema.layouts.find(
-        (layout) => layout.id === state.activeLayoutId && layout.table === activeTable,
-      )?.id ??
-      layoutFor(schema, activeTable)?.id ??
-      null;
+    const selectedLayoutId = schema.layouts.find(
+      (layout) => layout.id === state.activeLayoutId && layout.table === activeTable,
+    )?.id;
+    // Let Form Studio attach the first saved ID without replacing its active draft.
+    const editingWithoutLayout = state.view === "form" && state.activeTable === activeTable
+      && state.activeLayoutId === null;
+    const activeLayoutId = selectedLayoutId
+      ?? (editingWithoutLayout ? null : layoutFor(schema, activeTable)?.id ?? null);
     set({
       schema,
       info: info ?? state.info,
@@ -226,15 +228,11 @@ export function schemaActions({
       try {
         const saved = await api.saveLayout(layout);
         await refreshMeta();
-        const current = get();
-        if (current.activeTable === saved.table && current.view === "form") {
-          set({ activeLayoutId: saved.id });
-        }
         notify("success", `Form ${saved.name} saved`);
-        return true;
+        return saved;
       } catch (error) {
         notifyError(error);
-        return false;
+        return null;
       }
     },
 

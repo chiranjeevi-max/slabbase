@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
-use slab_core::{Command, DeleteAction, PolicyHook, Relation, RowData, RowId, Schema};
+use slab_core::{
+    Command, DeleteAction, PolicyHook, Record, Relation, RowData, RowId, Schema, Table,
+};
 use slab_formula::FormulaDag;
 
 use crate::ddl::{create_table_sql, unique_index_sql};
@@ -19,10 +21,22 @@ use super::schema::{
     insert_layout_meta, insert_relation_meta, insert_table_meta, rebuild_table,
     rename_column_in_schema,
 };
-use super::{UNDO_LIMIT, Workspace, now_ms};
+use super::{UNDO_LIMIT, Workspace, load_schema, now_ms};
 
 /// Runs inside a command's transaction before audit and commit.
 type PostApply<'a> = Option<&'a mut dyn FnMut(&Connection, &Command) -> Result<(), StorageError>>;
+
+fn apply_row_update(
+    tx: &Transaction<'_>,
+    schema: &Schema,
+    table: &Table,
+    before: &Record,
+    after: &Record,
+) -> Result<(), StorageError> {
+    update_record_tx(tx, table, after)?;
+    refresh_fts(tx, table, after.id, &after.values)?;
+    rollup::maintain_update(tx, schema, &table.name, before, after)
+}
 
 fn apply_row_delete(
     tx: &Transaction<'_>,
@@ -145,9 +159,9 @@ impl Workspace {
     ///
     /// Rows written through [`Self::insert_import_rows`] share one SQLite
     /// transaction. Nothing is visible to other connections, and no undo entry
-    /// is published, until [`Self::commit_import`] succeeds. Call
-    /// [`Self::rollback_import`] on every error path so a failed import leaves
-    /// zero half-committed rows.
+    /// is published, until [`Self::commit_import`] succeeds. A failed batch
+    /// rolls the import back. Call [`Self::rollback_import`] if an error
+    /// elsewhere, such as reading the source, prevents submitting all batches.
     pub fn begin_import(&mut self) -> Result<(), StorageError> {
         if self.pending_import.is_some() {
             return Err(StorageError::Command(
@@ -162,17 +176,36 @@ impl Workspace {
 
     /// Inserts one validated batch inside the active import transaction.
     ///
-    /// Every row receives its own audit entry, matching a normal insert.
+    /// Every row receives its own audit entry, matching a normal insert. A
+    /// batch error rolls back the entire import, including previous batches.
     pub fn insert_import_rows(
         &mut self,
         table: &str,
         rows: &[RowData],
     ) -> Result<Vec<RowId>, StorageError> {
-        if self.pending_import.is_none() {
+        let Some(mut commands) = self.pending_import.take() else {
             return Err(StorageError::Command(
                 "no import transaction is active".into(),
             ));
+        };
+        match self.insert_import_batch(table, rows, &mut commands) {
+            Ok(ids) => {
+                self.pending_import = Some(commands);
+                Ok(ids)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
+    }
+
+    fn insert_import_batch(
+        &mut self,
+        table: &str,
+        rows: &[RowData],
+        commands: &mut Vec<Command>,
+    ) -> Result<Vec<RowId>, StorageError> {
         self.check_policy(table)?;
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -186,7 +219,6 @@ impl Workspace {
             prepared.push(prepare_row(definition, values, None, true)?);
         }
         let hlc = self.clock.now();
-        let mut commands = Vec::with_capacity(prepared.len());
         let mut ids = Vec::with_capacity(prepared.len());
         for values in prepared {
             let row = slab_core::Record { id: 0, values };
@@ -212,9 +244,6 @@ impl Workspace {
             )?;
             commands.push(command);
             ids.push(id);
-        }
-        if let Some(pending) = self.pending_import.as_mut() {
-            pending.extend(commands);
         }
         Ok(ids)
     }
@@ -284,26 +313,46 @@ impl Workspace {
         table: &str,
         id: RowId,
         changes: &RowData,
-    ) -> Result<slab_core::Record, StorageError> {
+    ) -> Result<Record, StorageError> {
         self.ensure_writer_available()?;
         self.check_policy(table)?;
-        let schema = self.schema()?;
+        // Another writer can commit while this connection waits for the lock.
+        // Merge the patch against the row visible after acquiring it.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let schema = load_schema(&tx)?;
         let definition = schema
             .table(table)
             .ok_or_else(|| StorageError::NotFound(table.to_owned()))?;
-        let before = read_stored_record(&self.conn, definition, id)?
+        let before = read_stored_record(&tx, definition, id)?
             .ok_or_else(|| StorageError::NotFound(format!("{table} #{id}")))?;
         let prepared = prepare_row(definition, changes, Some(&before.values), false)?;
-        let after = slab_core::Record {
+        let after = Record {
             id,
             values: prepared,
         };
+        let dag = FormulaDag::build(&schema)?;
+        let hlc = self.clock.now();
+        apply_row_update(&tx, &schema, definition, &before, &after)?;
+        let mut record = read_computed_record(&tx, &schema, &dag, definition, id)?;
         let command = Command::UpdateRow {
             table: table.to_owned(),
-            before: before.clone(),
+            before,
             after,
         };
-        self.apply_row_command_with_readback(&command, command.operation(), &command.label())
+        append_audit(
+            &tx,
+            &command,
+            &hlc,
+            &self.actor,
+            command.operation(),
+            &command.label(),
+        )?;
+        tx.commit()?;
+        self.push_undo(command);
+        self.redact_record(definition, &mut record);
+        Ok(record)
     }
 
     /// Deletes a row and captures cascade-deleted children for undo.
@@ -523,10 +572,7 @@ impl Workspace {
                 let definition = schema
                     .table(table)
                     .ok_or_else(|| StorageError::NotFound(table.clone()))?;
-                update_record_tx(&tx, definition, after)?;
-                refresh_fts(&tx, definition, after.id, &after.values)?;
-                rollup::maintain_update(&tx, &schema, table, before, after)?;
-                let _ = before;
+                apply_row_update(&tx, &schema, definition, before, after)?;
                 command.clone()
             }
             Command::DeleteRow { table, row, .. } => {

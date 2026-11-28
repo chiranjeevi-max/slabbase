@@ -33,20 +33,24 @@ export function recordActions({
   | "insertPortalRow"
   | "deletePortalRow"
 > {
+  let latestBundleRequest = 0;
+
   const loadBundle = async (table: string, id: number, token: number) => {
-    const isCurrentSelection = () => {
+    const request = ++latestBundleRequest;
+    const isCurrent = () => {
       const current = get();
-      return token === inspectorRequest.token &&
+      return request === latestBundleRequest &&
+        token === inspectorRequest.token &&
         current.activeTable === table &&
         current.selectedId === id;
     };
 
     try {
       const record = await api.readRecord(table, id);
-      if (!isCurrentSelection()) return;
+      if (!isCurrent()) return;
       set({ bundle: { record, portals: {} }, bundleTable: table });
     } catch (error) {
-      if (!isCurrentSelection() || isCancelledError(error)) return;
+      if (!isCurrent() || isCancelledError(error)) return;
       if (error instanceof SlabError && error.code === "SLAB_E_NOT_FOUND") {
         get().closeRecord();
         return;

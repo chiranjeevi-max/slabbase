@@ -98,6 +98,13 @@ test("an empty fixture can create its first table and load a fresh sample", asyn
   expect((await schema("empty")).tables).toEqual([]);
   await fixtureCall("redo", {}, "empty");
 
+  const undoBefore = await fixtureCall<UndoState>("undo_state", {}, "empty");
+  await expect(fixtureCall("load_sample", {}, "empty"))
+    .rejects.toMatchObject({ code: "SLAB_E_COMMAND" });
+  expect(await fixtureCall("workspace_info", {}, "empty")).toEqual(created);
+  expect(await fixtureCall("undo_state", {}, "empty")).toEqual(undoBefore);
+  await fixtureCall("undo", {}, "empty");
+
   const sample = await fixtureCall<WorkspaceInfoDto>("load_sample", {}, "empty");
   expect(sample.name).toBe("Design Studio");
   expect(sample.tables).toContainEqual({ name: "Clients", rowCount: 3 });
@@ -114,8 +121,32 @@ test("listing and toggling indexes return the table's current indexes", async ()
   expect(await list("Clients")).toEqual([]);
 
   const secondIndex = await fixtureCall<IndexSpec>("create_index", { table: "Projects", column: "Budget" }, "full");
+  expect(await list("Projects")).toEqual([secondIndex, dueIndex]);
   expect(await toggle("Due Date", false)).toEqual([secondIndex]);
   expect(await list("Projects")).toEqual([secondIndex]);
+});
+
+test("a generated index name can only identify one index", async () => {
+  const table = "Projects";
+  const toggle = (column: string, enabled: boolean) => fixtureCall<IndexSpec[]>("toggle_index", { table, column, enabled }, "full");
+  const undoState = () => fixtureCall<UndoState>("undo_state", {}, "full");
+  await fixtureCall("add_column", {
+    table, draft: { name: "Due_Date", ty: { kind: "date" }, required: false, unique: false, default: null },
+  }, "full");
+  const original = await toggle("Due Date", true);
+  const undoBefore = await undoState();
+  expect(await toggle("Due Date", true)).toEqual(original);
+  expect(await fixtureCall("create_index", { table, column: "Due_Date" }, "full")).toEqual({
+    name: "slab_idx_Projects_Due_Date", table, columns: ["Due_Date"], unique: false,
+  });
+  expect(await toggle("Due_Date", true)).toEqual(original);
+  expect(await toggle("Due_Date", false)).toEqual(original);
+  expect(await undoState()).toEqual(undoBefore);
+
+  expect(await toggle("Due Date", false)).toEqual([]);
+  expect(await toggle("Due_Date", true)).toEqual([
+    { name: "slab_idx_Projects_Due_Date", table, columns: ["Due_Date"], unique: false },
+  ]);
 });
 
 test("adding a stored column materializes its default in existing rows", async () => {
@@ -126,6 +157,114 @@ test("adding a stored column materializes its default in existing rows", async (
 
   await fixtureCall("undo", {}, "full");
   expect((await fixtureCall<SlabRecord>("read_record", { table: "Clients", id: 2 }, "full")).values).not.toHaveProperty("Approved");
+});
+
+test("adding a required column without a default requires an empty table", async () => {
+  const draft = { name: "Contact", ty: { kind: "text" }, required: true, unique: false, default: null };
+  const schemaBefore = structuredClone(await schema());
+  const rowsBefore = await filteredPage("Clients", []);
+  const undoBefore = await fixtureCall<UndoState>("undo_state", {}, "full");
+  await expect(fixtureCall("add_column", { table: "Clients", draft }, "full"))
+    .rejects.toMatchObject({ code: "SLAB_E_COMMAND" });
+  expect(await schema()).toEqual(schemaBefore);
+  expect(await filteredPage("Clients", [])).toEqual(rowsBefore);
+  expect(await fixtureCall("undo_state", {}, "full")).toEqual(undoBefore);
+
+  await fixtureCall("create_table", { draft: { name: "Pending", columns: [] } }, "full");
+  await expect(fixtureCall("add_column", { table: "Pending", draft: { ...draft, default: "Null" } }, "full"))
+    .rejects.toMatchObject({ code: "SLAB_E_COLUMN" });
+  expect(await fixtureCall("add_column", { table: "Pending", draft }, "full"))
+    .toMatchObject({ name: "Contact", required: true });
+});
+
+test("adding a unique column rejects a non-null default shared by multiple rows", async () => {
+  const draft = { name: "Approved", ty: { kind: "boolean" }, required: false, unique: true, default: { Boolean: true } };
+  const schemaBefore = structuredClone(await schema());
+  const rowsBefore = await filteredPage("Clients", []);
+  const undoBefore = await fixtureCall<UndoState>("undo_state", {}, "full");
+  await expect(fixtureCall("add_column", { table: "Clients", draft }, "full"))
+    .rejects.toMatchObject({ code: "SLAB_E_UNIQUE" });
+  expect(await schema()).toEqual(schemaBefore);
+  expect(await filteredPage("Clients", [])).toEqual(rowsBefore);
+  expect(await fixtureCall("undo_state", {}, "full")).toEqual(undoBefore);
+
+  await fixtureCall("add_column", { table: "Clients", draft: { ...draft, default: "Null" } }, "full");
+  expect((await filteredPage("Clients", [{ column: "Approved", op: "isNull", value: null }])).total_rows).toBe(3);
+
+  await fixtureCall("create_table", { draft: { name: "Pending", columns: [] } }, "full");
+  await fixtureCall("insert_row", { table: "Pending", values: {} }, "full");
+  await fixtureCall("add_column", { table: "Pending", draft }, "full");
+  const record = await fixtureCall<SlabRecord>("read_record", { table: "Pending", id: 1 }, "full");
+  expect(record.values["Approved"]).toEqual({ Boolean: true });
+});
+
+test("inserting a fixture row applies defaults only to omitted values", async () => {
+  const table = "Clients";
+  await fixtureCall("add_column", {
+    table, draft: { name: "Approved", ty: { kind: "boolean" }, required: false, unique: false, default: { Boolean: true } },
+  }, "full");
+  const defaulted = await fixtureCall<SlabRecord>("insert_row", { table, values: { Name: { Text: "Default" } } }, "full");
+  const falseValue = await fixtureCall<SlabRecord>("insert_row", { table, values: { Name: { Text: "False" }, Approved: { Boolean: false } } }, "full");
+  const nullValue = await fixtureCall<SlabRecord>("insert_row", { table, values: { Name: { Text: "Null" }, Approved: "Null" } }, "full");
+  expect(defaulted.values["Approved"]).toEqual({ Boolean: true });
+  expect(defaulted.values["Notes"]).toBe("Null");
+  expect(falseValue.values["Approved"]).toEqual({ Boolean: false });
+  expect(nullValue.values["Approved"]).toBe("Null");
+  const approved = await filteredPage(table, [{ column: "Approved", op: "eq", value: { Text: "Yes" } }]);
+  expect(approved.rows.map((row) => row.id)).toContain(defaulted.id);
+  expect(approved.rows.map((row) => row.id)).not.toContain(falseValue.id);
+  expect(approved.rows.map((row) => row.id)).not.toContain(nullValue.id);
+});
+
+test("an explicit null fails a required fixture column even with a default", async () => {
+  const table = "Clients";
+  await fixtureCall("add_column", {
+    table, draft: { name: "Approved", ty: { kind: "boolean" }, required: true, unique: false, default: { Boolean: true } },
+  }, "full");
+  const undoBefore = await fixtureCall<UndoState>("undo_state", {}, "full");
+  await expect(fixtureCall("insert_row", {
+    table, values: { Name: { Text: "Null" }, Approved: "Null" },
+  }, "full")).rejects.toMatchObject({ code: "SLAB_E_TYPE" });
+  expect((await filteredPage(table, [])).total_rows).toBe(3);
+  expect(await fixtureCall("undo_state", {}, "full")).toEqual(undoBefore);
+});
+
+test("fixture currency edits round to column scale before filtering", async () => {
+  const table = "Projects";
+  const record = await fixtureCall<SlabRecord>("update_row", {
+    table, id: 1, values: { Budget: { Currency: { currency: "USD", amount: "12.345" } } },
+  }, "full");
+  expect(record.values["Budget"]).toEqual({ Currency: { currency: "USD", amount: "12.34" } });
+  const matching = await filteredPage(table, [{ column: "Budget", op: "eq", value: { Text: "12.34" } }]);
+  expect(matching.rows.map((row) => row.id)).toEqual([1]);
+  await expect(filteredPage(table, [
+    { column: "Budget", op: "eq", value: { Currency: { currency: "USD", amount: "12.345" } } },
+  ])).rejects.toMatchObject({ code: "SLAB_E_QUERY" });
+});
+
+test("fixture decimal writes keep exact half-even rounding at the declared scale", async () => {
+  const table = "Numbers";
+  await fixtureCall("create_table", { draft: { name: table, columns: [
+    { name: "Amount", ty: { kind: "decimal", scale: 2 }, required: false, unique: false, default: { Decimal: "0.015" } },
+  ] } }, "full");
+  const insert = (values: SlabRecord["values"]) => fixtureCall<SlabRecord>("insert_row", { table, values }, "full");
+  expect((await insert({ Amount: { Integer: 12 } })).values["Amount"]).toEqual({ Decimal: "12.00" });
+  expect((await insert({})).values["Amount"]).toEqual({ Decimal: "0.02" });
+  expect((await insert({ Amount: { Decimal: "-1.235" } })).values["Amount"]).toEqual({ Decimal: "-1.24" });
+  const large = await insert({ Amount: { Decimal: "900719925474099.225" } });
+  expect(large.values["Amount"]).toEqual({ Decimal: "900719925474099.22" });
+  expect((await filteredPage(table, [
+    { column: "Amount", op: "eq", value: { Decimal: "900719925474099.220" } },
+  ])).rows.map((row) => row.id)).toEqual([large.id]);
+  await expect(filteredPage(table, [
+    { column: "Amount", op: "eq", value: { Decimal: "900719925474099.225" } },
+  ])).rejects.toMatchObject({ code: "SLAB_E_QUERY" });
+
+  await fixtureCall("add_column", { table, draft: {
+    name: "Fee", ty: { kind: "decimal", scale: 2 }, required: false, unique: false, default: { Decimal: "1.235" },
+  } }, "full");
+  const backfilled = await fixtureCall<SlabRecord>("read_record", { table, id: large.id }, "full");
+  expect(backfilled.values["Fee"]).toEqual({ Decimal: "1.24" });
 });
 
 test("fixture boolean filters use Yes and No without matching nulls", async () => {

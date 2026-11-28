@@ -1,4 +1,6 @@
-use rusqlite::{Connection, params};
+use std::cell::RefCell;
+
+use rusqlite::{Connection, functions::FunctionFlags, params};
 use slab_core::{ColumnDraft, ColumnType, RowData, TableDraft, Value};
 
 use super::Workspace;
@@ -32,6 +34,55 @@ fn note_workspace() -> Workspace {
             .expect("row");
     }
     workspace
+}
+
+#[test]
+fn integrity_check_uses_one_snapshot_for_audit_rows_and_head() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let path = directory.path().join("audit-snapshot.slab");
+    let mut writer = Workspace::create(&path, "Audit", Box::new(TestClock::new())).expect("create");
+    writer
+        .create_table(&TableDraft {
+            name: "Notes".into(),
+            columns: vec![],
+        })
+        .expect("table");
+    let reader = Workspace::open_read_only(&path, Box::new(TestClock::new())).expect("open reader");
+
+    // Commit the next audit entry while the reader is scanning the old rows.
+    let writer = RefCell::new(Some(writer));
+    reader
+        .conn
+        .create_scalar_function(
+            "append_audit_during_scan",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                if let Some(mut writer) = writer.borrow_mut().take() {
+                    writer
+                        .insert_row("Notes", &RowData::new())
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                }
+                Ok(true)
+            },
+        )
+        .expect("register SQLite callback");
+    reader
+        .conn
+        .execute_batch(
+            "PRAGMA query_only = OFF;
+             CREATE TEMP VIEW _slab_audit_log AS
+             SELECT * FROM main._slab_audit_log WHERE append_audit_during_scan();
+             PRAGMA query_only = ON;",
+        )
+        .expect("interpose on audit scan");
+
+    let report = reader.integrity_check().expect("verify original snapshot");
+    assert!(report.audit_chain, "{report:?}");
+    assert_eq!(report.audit_entries, 1);
+    let report = reader.integrity_check().expect("verify next snapshot");
+    assert!(report.audit_chain, "{report:?}");
+    assert_eq!(report.audit_entries, 2);
 }
 
 #[test]

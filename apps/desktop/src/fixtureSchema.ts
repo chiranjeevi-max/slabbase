@@ -1,6 +1,7 @@
 import type { Column, IndexSpec, Layout, Relation, RelationDraft, Value } from "./bindings";
 import { indexName, relationByName, tableRows } from "./fixtureQueries";
 import { fixtureError, pushHistory, type FixtureState } from "./fixtureState";
+import { normalizeFixtureValue } from "./fixtureValues";
 import { isComputedColumn, newItemId } from "./types";
 
 function listIndexes(state: FixtureState, table: string): IndexSpec[] {
@@ -22,8 +23,12 @@ function createIndex(state: FixtureState, table: string, column: string): IndexS
   if (existing) return existing;
 
   const index = { name: indexName(table, column), table, columns: [column], unique: false };
+  // The native command returns the requested spec even when SQLite skips a name collision.
+  if (state.indexes.some((candidate) => candidate.name.toLowerCase() === index.name.toLowerCase())) {
+    return index;
+  }
   pushHistory(state, `Create index ${index.name}`);
-  state.indexes.push(index);
+  state.indexes.unshift(index);
   return index;
 }
 
@@ -96,7 +101,6 @@ export function fixtureSchemaCall<T>(
           fixtureError("SLAB_E_FORMULA_REF", `lookup relation ${lookup.relation} is missing`);
         }
       }
-      pushHistory(state, `Add ${tableName}.${draft.name}`);
       const column = {
         id: `c_${crypto.randomUUID()}`,
         table: tableName,
@@ -107,10 +111,27 @@ export function fixtureSchemaCall<T>(
         default: draft.default,
         position: table.columns.length,
       };
+      const stored = !isComputedColumn(column);
+      const rows = tableRows(state, tableName);
+      let backfill: Value = "Null";
+      if (stored) {
+        if (column.required && column.default === "Null") {
+          fixtureError("SLAB_E_COLUMN", `${tableName}.${column.name} cannot default to null`);
+        }
+        if (column.required && column.default === null && rows.length > 0) {
+          fixtureError("SLAB_E_COMMAND", `${tableName}.${column.name} cannot be required without a default on a non-empty table`);
+        }
+        backfill = normalizeFixtureValue(column, column.default ?? "Null");
+        if (column.unique && backfill !== "Null" && rows.length > 1) {
+          fixtureError("SLAB_E_UNIQUE", `${tableName}.${column.name} would have duplicate values`);
+        }
+      }
+
+      pushHistory(state, `Add ${tableName}.${draft.name}`);
       table.columns.push(column);
-      if (!isComputedColumn(column)) {
-        for (const row of tableRows(state, tableName)) {
-          row.values[column.name] = structuredClone(column.default ?? "Null");
+      if (stored) {
+        for (const row of rows) {
+          row.values[column.name] = structuredClone(backfill);
         }
       }
       return column as T;

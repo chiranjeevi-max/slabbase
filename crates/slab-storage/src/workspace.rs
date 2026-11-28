@@ -582,21 +582,25 @@ impl Workspace {
     /// Runs SQLite integrity and foreign key checks plus audit chain
     /// verification.
     pub fn integrity_check(&self) -> Result<IntegrityReport, StorageError> {
-        let integrity: String = self
+        // Keep the audit scan and its head reads on one snapshot. If the
+        // writer already has an import open, reuse that transaction.
+        let snapshot = self
             .conn
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            .is_autocommit()
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()?;
+        let conn = snapshot.as_deref().unwrap_or(&self.conn);
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         let foreign_key_violations: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                    row.get(0)
-                })?;
-        let journal_mode: String = self
-            .conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-        let page_count: i64 = self
-            .conn
-            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        let (audit_chain, audit_entries, audit_tamper) = verify_audit_chain(&self.conn)?;
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let (audit_chain, audit_entries, audit_tamper) = verify_audit_chain(conn)?;
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
+        }
         Ok(IntegrityReport {
             integrity,
             foreign_key_violations: u64::try_from(foreign_key_violations).unwrap_or(0),
@@ -883,3 +887,6 @@ mod audit_foreign_columns_tests;
 
 #[cfg(test)]
 mod restore_compat_tests;
+
+#[cfg(test)]
+mod write_tests;

@@ -2836,6 +2836,11 @@ kbd {
   border-color: var(--accent);
 }
 
+.studio-item:focus-visible {
+  z-index: 2;
+  outline-offset: -2px;
+}
+
 .studio-field {
   display: flex;
   flex-direction: column;

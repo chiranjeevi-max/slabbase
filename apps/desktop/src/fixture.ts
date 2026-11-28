@@ -1,7 +1,9 @@
 import type { IntegrityReportDto, PageQuery, PortalFrame, PortalQuery, Record as SlabRecord, RecordBundle, RecordRevision, Value } from "./bindings";
 import { currentInfo, filterRows, sortRows, tableRows, pageOf, portalFrameOf, relationByName, childRows, findRecord, searchRows } from "./fixtureQueries";
 import { fixtureSchemaCall } from "./fixtureSchema";
-import { createEmptyFixture, loadFixtureSample, pushHistory, restore, snapshot, stateFor, type FixtureMode } from "./fixtureState";
+import { createEmptyFixture, fixtureError, loadFixtureSample, pushHistory, restore, snapshot, stateFor, type FixtureMode, type FixtureState } from "./fixtureState";
+import { normalizeFixtureValue } from "./fixtureValues";
+import { isComputedColumn } from "./types";
 
 export { resetFixtureForTests } from "./fixtureState";
 
@@ -20,6 +22,28 @@ declare global {
 
 function argsOf(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function prepareFixtureValues(
+  state: FixtureState,
+  table: string,
+  values: Record<string, Value>,
+  existing?: Record<string, Value>,
+): Record<string, Value> {
+  const definition = state.schema.tables.find((candidate) => candidate.name === table);
+  if (!definition) fixtureError("SLAB_E_NOT_FOUND", `table ${table} is missing`);
+  const next = { ...existing, ...values };
+  for (const column of definition.columns) {
+    if (isComputedColumn(column)) continue;
+    const supplied = Object.hasOwn(values, column.name);
+    if (!supplied && existing) continue;
+    const value = (supplied ? values[column.name] : column.default) ?? "Null";
+    if (column.required && value === "Null") {
+      fixtureError("SLAB_E_TYPE", `${table}.${column.name} is required`);
+    }
+    next[column.name] = normalizeFixtureValue(column, value);
+  }
+  return next;
 }
 
 export async function fixtureCall<T>(
@@ -163,8 +187,9 @@ export async function fixtureCall<T>(
       const id = Number(payload["id"]);
       const values = payload["values"] as Record<string, Value>;
       const record = findRecord(state, table, id);
+      const prepared = prepareFixtureValues(state, table, values, record.values);
       pushHistory(state, "Update row");
-      record.values = { ...record.values, ...values };
+      record.values = prepared;
       return record as T;
     }
     case "insert_row": {
@@ -172,7 +197,7 @@ export async function fixtureCall<T>(
       const values = payload["values"] as Record<string, Value>;
       const rows = tableRows(state, table);
       const id = rows.reduce((max, row) => Math.max(max, row.id), 0) + 1;
-      const record: SlabRecord = { id, values: { ...values } };
+      const record: SlabRecord = { id, values: prepareFixtureValues(state, table, values) };
       pushHistory(state, "Insert row");
       rows.push(record);
       return record as T;
@@ -187,6 +212,9 @@ export async function fixtureCall<T>(
     case "cancel_search":
       return false as T;
     case "load_sample":
+      if (state.schema.tables.length > 0) {
+        fixtureError("SLAB_E_COMMAND", "the sample can only be loaded into an empty workspace");
+      }
       return currentInfo(loadFixtureSample(state.info.path)) as T;
     case "open_workspace":
       return currentInfo(loadFixtureSample(String(payload["path"]))) as T;

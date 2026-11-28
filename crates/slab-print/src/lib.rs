@@ -374,7 +374,7 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pdf::{char_width, fit_text, text_width};
+    use super::pdf::PdfFont;
     use super::*;
     use slab_core::{CurrencyCode, Decimal, GridSpec, LayoutItem, Money, Table};
     use std::collections::BTreeMap;
@@ -493,7 +493,36 @@ mod tests {
         assert!(!text.contains("WIDE COLUMN"));
         assert!(!text.contains("Oversized value"));
         assert_eq!(pdf.rows_printed, 1);
-        assert!(fit_text("Oversized value", 2.0, 7.5).is_empty());
+        assert!(
+            PdfFont::Regular
+                .fit_text("Oversized value", 2.0, 7.5)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pdf_table_headers_fit_the_rendered_bold_font() {
+        let (mut schema, _, _) = schema_and_bundle();
+        let table = &mut schema.tables[0];
+        let second = Column {
+            id: "c_status".into(),
+            name: "Status".into(),
+            position: 1,
+            ..table.columns[0].clone()
+        };
+        table.columns[0].name = "A".repeat(60);
+        table.columns.push(second);
+
+        let pdf =
+            render_table_pdf(&schema, "Invoices", &[], &PrintOptions::default()).expect("PDF");
+        let stream = String::from_utf8_lossy(&pdf);
+        // Two 258-point cells leave 252 points each after padding. In bold,
+        // 50 A's and an ellipsis would advance 252.28 points at 6.8pt.
+        let header = stream
+            .lines()
+            .find(|line| line.contains("/F2 6.8 Tf 1 0 0 1 51.00"))
+            .expect("header");
+        assert!(header.ends_with(&format!("({}\\205) Tj ET", "A".repeat(49))));
     }
 
     #[test]
@@ -684,39 +713,43 @@ mod tests {
 
     #[test]
     fn a_huge_token_does_not_overflow_width_arithmetic() {
-        let width = text_width(&"@".repeat(8_000_000), 9.0);
+        let width = PdfFont::Regular.text_width(&"@".repeat(8_000_000), 9.0);
         assert!(width > 1.0e7);
     }
 
     #[test]
     fn fitting_text_keeps_a_value_that_exactly_fits() {
         let value = "AAAA";
-        let width = text_width(value, 9.0);
-        assert_eq!(fit_text(value, width, 9.0), value);
+        let font = PdfFont::Regular;
+        let width = font.text_width(value, 9.0);
+        assert_eq!(font.fit_text(value, width, 9.0), value);
     }
 
     #[test]
     fn winansi_punctuation_uses_its_rendered_width() {
-        assert_eq!(char_width('–'), 556);
-        assert_eq!(char_width('—'), 1000);
+        assert_eq!(PdfFont::Regular.char_width('–'), 556);
+        assert_eq!(PdfFont::Regular.char_width('—'), 1000);
+        assert_eq!(PdfFont::Bold.char_width('‘'), 278);
     }
 
     #[test]
     fn winansi_latin1_uses_its_rendered_width() {
-        assert_eq!(char_width('\u{A0}'), 278);
-        assert_eq!(char_width('é'), 556);
-        assert_eq!(char_width('æ'), 889);
-        assert_eq!(char_width('ÿ'), 500);
+        assert_eq!(PdfFont::Regular.char_width('\u{A0}'), 278);
+        assert_eq!(PdfFont::Regular.char_width('é'), 556);
+        assert_eq!(PdfFont::Regular.char_width('æ'), 889);
+        assert_eq!(PdfFont::Regular.char_width('ÿ'), 500);
+        assert_eq!(PdfFont::Bold.char_width('À'), 722);
     }
 
     #[test]
     fn fitting_zero_width_text_terminates_and_truncates() {
         let value = format!("{}{}", "\u{200B}".repeat(50_000), "@".repeat(50_000));
         let started = std::time::Instant::now();
-        let fitted = fit_text(&value, 200.0, 9.0);
+        let font = PdfFont::Regular;
+        let fitted = font.fit_text(&value, 200.0, 9.0);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(fitted.ends_with('…'));
-        assert!(text_width(&fitted, 9.0) <= 200.0 + 10.0);
+        assert!(font.text_width(&fitted, 9.0) <= 200.0 + 10.0);
     }
 
     #[test]

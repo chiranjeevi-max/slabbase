@@ -1245,6 +1245,15 @@ test.describe("interaction polish", () => {
         const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
         return node ? node.getBoundingClientRect().x < 0 : true;
       });
+
+      const opener = page.getByTestId("sidebar-toggle");
+      await opener.click();
+      const close = page.getByTestId("sidebar-header-toggle");
+      await close.focus();
+      await expect(close).toBeFocused();
+      await page.keyboard.press("Enter");
+      await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+      await expect(opener).toBeFocused();
     } else {
       const sidebar = page.getByTestId("sidebar");
       await expect(sidebar).toBeVisible();
@@ -2045,11 +2054,17 @@ test.describe("async races", () => {
     await page.getByRole("button", { name: "Save Form" }).click();
     await save.started();
     await selectTable(page, "Invoices");
+    const invoice = page.getByTestId("grid-row").first();
+    const number = (await invoice.locator('[data-column="Number"] .cell-text').innerText()).trim();
+    const heading = page.getByTestId("inspector").getByRole("heading", { name: number });
+    await invoice.locator('[data-column="Number"]').click();
+    await expect(heading).toBeVisible();
     await save.release();
 
     await expect(page.getByTestId("toast")).toContainText("Form Saved Client Form saved");
     await expect(page.getByRole("tab", { name: "Table" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+    await expect(heading).toBeVisible();
 
     await selectTable(page, "Clients");
     await page.getByRole("tab", { name: "Form" }).click();
@@ -2093,6 +2108,169 @@ test.describe("async races", () => {
 });
 
 test.describe("form studio state", () => {
+  for (const table of ["Clients", "Line Items"]) {
+    test(`the first form save keeps later ${table} edits`, async ({ page }) => {
+      await boot(page);
+      if (table !== "Clients") await selectTable(page, table);
+      await page.getByRole("tab", { name: "Form" }).click();
+      await page.getByRole("button", {
+        name: table === "Clients" ? "New Form" : "Create Form",
+        exact: true,
+      }).click();
+      const name = page.getByRole("textbox", { name: "Form name" });
+      const layout = page.getByRole("combobox", { name: "Form layout" });
+      const item = page.locator(".studio-item").first();
+      const saveButton = page.getByRole("button", { name: "Save Form", exact: true });
+      await name.fill("Draft snapshot");
+      await expect(layout).toHaveValue("");
+
+      const save = await pauseFixtureCall(page, "saveLayout");
+      await saveButton.click();
+      await save.started();
+      await name.fill("Later draft edits");
+      await item.click();
+      const y = page.getByLabel("Y", { exact: true });
+      await y.fill("1");
+      await save.release();
+
+      await expect(page.getByTestId("toast")).toContainText("Form Draft snapshot saved");
+      await expect(layout).not.toHaveValue("");
+      const savedId = await layout.inputValue();
+      await expect(name).toHaveValue("Later draft edits");
+      await expect(y).toHaveValue("1");
+      await saveButton.click();
+      await expect(page.getByTestId("toast")).toContainText("Form Later draft edits saved");
+      await expect(layout).toHaveValue(savedId);
+      await expect(layout.getByRole("option", { name: "Draft snapshot" })).toHaveCount(0);
+      await page.getByRole("tab", { name: "Table" }).click();
+      await page.getByRole("tab", { name: "Form" }).click();
+      await expect(name).toHaveValue("Later draft edits");
+      await item.click();
+      await expect(y).toHaveValue("1");
+    });
+  }
+
+  test("a delayed form save keeps the newer form selection on the same table", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const name = page.getByRole("textbox", { name: "Form name" });
+    const layout = page.getByRole("combobox", { name: "Form layout" });
+    const saveButton = page.getByRole("button", { name: "Save Form", exact: true });
+    await page.getByRole("button", { name: "New Form", exact: true }).click();
+    await name.fill("Second client form");
+    await saveButton.click();
+    await expect(page.getByTestId("toast")).toContainText("Form Second client form saved");
+    await expect(layout).not.toHaveValue("");
+    const secondId = await layout.inputValue();
+    await layout.selectOption({ label: "Client Record" });
+    await name.fill("Saved first form edits");
+
+    const save = await pauseFixtureCall(page, "saveLayout");
+    await saveButton.click();
+    await save.started();
+    await layout.selectOption(secondId);
+    await expect(name).toHaveValue("Second client form");
+    await name.fill("Unsaved second form edits");
+    const item = page.locator(".studio-item").first();
+    await item.click();
+    const y = page.getByLabel("Y", { exact: true });
+    await y.fill("3");
+    await save.release();
+
+    await expect(page.getByTestId("toast")).toContainText("Form Saved first form edits saved");
+    await expect(layout).toHaveValue(secondId);
+    await expect(name).toHaveValue("Unsaved second form edits");
+    await expect(y).toHaveValue("3");
+    await layout.selectOption({ label: "Saved first form edits" });
+    await expect(name).toHaveValue("Saved first form edits");
+  });
+
+  test("canvas items support keyboard selection and visible focus", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const canvas = page.locator(".canvas");
+    const inspector = page.getByRole("complementary", { name: "Form item inspector" });
+    await page.getByRole("button", { name: /^Portal\b/ }).focus();
+    await page.keyboard.press("Tab");
+    const section = canvas.getByRole("button", { name: "Contact", exact: true });
+    await expect(section).toBeFocused();
+    await expect(section).toHaveCSS("outline-width", "2px");
+    await expect(section).toHaveCSS("outline-offset", "-2px");
+    await page.keyboard.press("Enter");
+    await expect(inspector.getByLabel("Title")).toHaveValue("Contact");
+    await page.keyboard.press("Tab");
+    await expect(canvas.getByRole("button", { name: /^Name\b/ })).toBeFocused();
+    await page.keyboard.press("Space");
+    await expect(inspector.getByLabel("Column")).toHaveValue("Name");
+  });
+
+  test("the snap preview matches palette drops and canvas moves at the right edge", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const palette = page.getByRole("complementary", { name: "Form elements" });
+    const canvas = page.locator(".canvas");
+    const preview = canvas.locator(".snap-preview");
+    const label = canvas.locator(".studio-item").filter({ hasText: /^Label$/ });
+    const section = canvas.locator(".studio-item").filter({ hasText: /^Section$/ });
+
+    for (const [source, item, offsetY, left, width, height] of [
+      [palette.getByRole("button", { name: /^Label\b/ }), label, 45, "50%", "50%", "56px"],
+      [palette.getByRole("button", { name: /^Section\b/ }), section, 105, "0%", "100%", "26px"],
+      [section, section, 165, "0%", "100%", "26px"],
+    ] as const) {
+      const canvasBox = await canvas.boundingBox();
+      if (!canvasBox) throw new Error("The form canvas has no box");
+      const position = { clientX: canvasBox.x + canvasBox.width - 6, clientY: canvasBox.y + offsetY };
+      const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+      // The native data store prevents reading the payload before drop.
+      const protectedTransfer = await page.evaluateHandle(() => new DataTransfer());
+      await source.dispatchEvent("dragstart", { dataTransfer });
+      await canvas.dispatchEvent("dragover", { ...position, dataTransfer: protectedTransfer });
+      const style = new RegExp(`left: ${left};.*width: ${width}; height: ${height};`);
+      await expect(preview).toHaveAttribute("style", style);
+      const box = await preview.boundingBox();
+      await canvas.dispatchEvent("drop", { ...position, dataTransfer });
+
+      await expect(preview).toHaveCount(0);
+      await expect(item).toHaveAttribute("style", style);
+      expect(await item.boundingBox()).toEqual(box);
+    }
+  });
+
+  test("changing the portal relation uses columns from the new child table", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const portal = page.locator(".studio-portal").filter({ hasText: "Client Projects" });
+    await expect(portal.locator(".portal-preview-cell")).toHaveText(["Name", "Status", "Due Date"]);
+    await portal.click();
+    await page.getByRole("combobox", { name: "Relation", exact: true }).selectOption("Client Invoices");
+    const changedPortal = page.locator(".studio-portal").filter({ hasText: "Client Invoices" });
+    await expect(changedPortal.locator(".portal-preview-cell")).toHaveText([
+      "Number", "Client", "Project", "Issued", "Due",
+    ]);
+    await page.getByRole("button", { name: "Save Form" }).click();
+    await expect(page.getByTestId("toast")).toContainText("Form Client Record saved");
+  });
+
+  test("the form inspector accepts vertical grid values above 40", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const item = page.locator(".studio-item").first();
+    await item.click();
+    const y = page.getByLabel("Y", { exact: true });
+    const h = page.getByLabel("H", { exact: true });
+    await y.fill("41");
+    await h.fill("45");
+    await expect(y).toHaveValue("41");
+    await expect(h).toHaveValue("45");
+    await expect(item).toHaveCSS("top", "1230px");
+    await expect(item).toHaveCSS("height", "1346px");
+    await y.fill("65536");
+    await h.fill("65536");
+    await expect(y).toHaveValue("65535");
+    await expect(h).toHaveValue("65535");
+  });
+
   test("form palette items support keyboard activation and pointer dragging", async ({ page }) => {
     await boot(page);
     await page.getByRole("tab", { name: "Form" }).click();
@@ -2215,6 +2393,28 @@ test.describe("inspector state", () => {
     await read.release();
     await expect(page.getByTestId("toast")).toContainText("Undid change");
     await expect(nextTitle).toBeVisible();
+  });
+
+  test("a delayed undo read cannot close a record restored by redo", async ({ page }) => {
+    await boot(page);
+    const name = "Restored Client";
+    await createNamedRecord(page, name);
+    const row = page.getByTestId("grid-row").filter({ hasText: name });
+    const title = page.getByTestId("inspector").getByRole("heading", { name });
+    const read = await pauseFixtureCall(page, "readRecord", "SLAB_E_NOT_FOUND");
+
+    await runHistoryAction(page, "undo");
+    await read.started();
+    await expect(row).toHaveCount(0);
+
+    await runHistoryAction(page, "redo");
+    await expect(page.getByTestId("toast")).toContainText("Redone");
+    await expect(row).toBeVisible();
+    await expect(title).toBeVisible();
+
+    await read.release();
+    await expect(page.getByTestId("toast")).toContainText("Undid change");
+    await expect(title).toBeVisible();
   });
 
   for (const code of ["SLAB_E_CANCELLED", "SLAB_E_INTERNAL"]) {

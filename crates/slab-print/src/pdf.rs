@@ -32,9 +32,13 @@ pub fn render_pdf(
     let margin = check_pdf_margin(options.margin_pt)?;
     let content_width = page_width - margin * 2.0;
     let mut pdf = PdfBuilder::new(page_width, page_height, margin, title.clone());
-    pdf.heading(&record_title(schema, table, &bundle.record), 10.0, false);
+    pdf.heading(
+        &record_title(schema, table, &bundle.record),
+        10.0,
+        PdfFont::Regular,
+    );
     if let Some(subtitle) = &options.subtitle {
-        pdf.text(margin, pdf.y, 8.0, subtitle, false);
+        pdf.text(margin, pdf.y, 8.0, subtitle, PdfFont::Regular);
         pdf.y -= 14.0;
     }
     pdf.y -= 6.0;
@@ -55,7 +59,7 @@ pub fn render_pdf(
             if let LayoutItemKind::Section { title } = &item.kind {
                 pdf.ensure(30.0);
                 pdf.y -= 8.0;
-                pdf.heading(title, 9.0, true);
+                pdf.heading(title, 9.0, PdfFont::Bold);
                 pdf.rule();
                 pdf.y -= 8.0;
             }
@@ -151,7 +155,7 @@ impl TableReport {
         let mut pdf = PdfBuilder::new(page_width, page_height, margin, title);
         let columns: Vec<Column> = table.columns.clone();
         if columns.is_empty() {
-            pdf.text(margin, pdf.y, 10.0, "No columns", false);
+            pdf.text(margin, pdf.y, 10.0, "No columns", PdfFont::Regular);
         } else {
             let column_width = content_width / count_to_f64(columns.len());
             pdf.table_header_refs(&columns, column_width);
@@ -199,12 +203,13 @@ impl TableReport {
             }
             for (index, column) in self.columns.iter().enumerate() {
                 let value = row.get(&column.name).cloned().unwrap_or(Value::Null);
+                let font = PdfFont::Regular;
                 self.pdf.text(
                     self.pdf.margin + self.column_width * count_to_f64(index) + 2.0,
                     self.pdf.y,
                     7.5,
-                    &fit_text(&value.display_string(), self.column_width - 6.0, 7.5),
-                    false,
+                    &font.fit_text(&value.display_string(), self.column_width - 6.0, 7.5),
+                    font,
                 );
             }
             self.pdf.y -= 14.0;
@@ -227,7 +232,7 @@ impl TableReport {
                 &format!(
                     "Export stopped at {TABLE_ROW_CEILING} rows; filter the table to continue."
                 ),
-                true,
+                PdfFont::Bold,
             );
             self.pdf.y -= 12.0;
         }
@@ -295,12 +300,12 @@ fn draw_pdf_portal(
     let row_count = usize::from(*rows).max(1);
     let table_rows = bundle.portal(relation);
     pdf.ensure(40.0);
-    pdf.heading(relation, 8.5, true);
+    pdf.heading(relation, 8.5, PdfFont::Bold);
     pdf.y -= 4.0;
     let column_width = content_width / count_to_f64(visible.len());
     pdf.table_header(&visible, column_width);
     if table_rows.is_empty() {
-        pdf.text(pdf.margin, pdf.y, 8.5, "No rows", false);
+        pdf.text(pdf.margin, pdf.y, 8.5, "No rows", PdfFont::Regular);
         pdf.y -= 14.0;
     } else {
         for row in table_rows.iter().take(row_count) {
@@ -310,12 +315,13 @@ fn draw_pdf_portal(
             }
             for (index, column) in visible.iter().enumerate() {
                 let value = row.get(&column.name).cloned().unwrap_or(Value::Null);
+                let font = PdfFont::Regular;
                 pdf.text(
                     pdf.margin + column_width * count_to_f64(index) + 2.0,
                     pdf.y,
                     7.5,
-                    &fit_text(&value.display_string(), column_width - 6.0, 7.5),
-                    false,
+                    &font.fit_text(&value.display_string(), column_width - 6.0, 7.5),
+                    font,
                 );
             }
             pdf.y -= 13.0;
@@ -402,11 +408,11 @@ impl PdfBuilder {
         }
     }
 
-    fn text(&mut self, x: f64, y: f64, size: f64, value: &str, bold: bool) {
+    fn text(&mut self, x: f64, y: f64, size: f64, value: &str, font: PdfFont) {
         if value.is_empty() {
             return;
         }
-        let font = if bold { "F2" } else { "F1" };
+        let font = font.resource();
         let _ = writeln!(
             self.current,
             "0.12 0.12 0.11 rg BT /{font} {size:.1} Tf 1 0 0 1 {x:.2} {y:.2} Tm {} Tj ET",
@@ -414,8 +420,8 @@ impl PdfBuilder {
         );
     }
 
-    fn heading(&mut self, value: &str, size: f64, bold: bool) {
-        self.text(self.margin, self.y, size, value, bold);
+    fn heading(&mut self, value: &str, size: f64, font: PdfFont) {
+        self.text(self.margin, self.y, size, value, font);
         self.y -= size + 4.0;
     }
 
@@ -429,7 +435,8 @@ impl PdfBuilder {
     }
 
     fn field_value(&mut self, x: f64, y: f64, value: &str, width: f64) {
-        self.text(x, y, 9.5, &fit_text(value, width, 9.5), false);
+        let font = PdfFont::Regular;
+        self.text(x, y, 9.5, &font.fit_text(value, width, 9.5), font);
         let _ = writeln!(
             self.current,
             "0.85 0.83 0.77 RG 0.4 w {x:.2} {:.2} m {:.2} {:.2} l S",
@@ -475,12 +482,13 @@ impl PdfBuilder {
             width * count_to_f64(columns.len())
         );
         for (index, column) in columns.iter().enumerate() {
+            let font = PdfFont::Bold;
             self.text(
                 self.margin + width * count_to_f64(index) + 3.0,
                 self.y,
                 6.8,
-                &fit_text(&column.name.to_uppercase(), width - 6.0, 6.8),
-                true,
+                &font.fit_text(&column.name.to_uppercase(), width - 6.0, 6.8),
+                font,
             );
         }
         self.y -= 15.0;
@@ -695,66 +703,93 @@ const WINANSI_LATIN1_WIDTHS: [u16; 96] = [
     500,
 ];
 
+/// Helvetica-Bold advances in WinAnsi byte order, from 0x20 through 0xFF.
+/// The glyph advances come from Adobe's Core 14 Helvetica-Bold AFM.
+const HELVETICA_BOLD_WIDTHS: [u16; 224] = [
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667,
+    611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+    667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556,
+    278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584,
+    350, 556, 350, 278, 556, 500, 1000, 556, 556, 333, 1000, 667, 333, 1000, 350, 611, 350, 350,
+    278, 278, 500, 500, 350, 556, 1000, 333, 1000, 556, 333, 944, 350, 500, 667, 278, 333, 556,
+    556, 556, 556, 280, 556, 333, 737, 370, 556, 584, 333, 737, 333, 400, 584, 333, 333, 333, 611,
+    556, 278, 333, 333, 365, 556, 834, 834, 834, 611, 722, 722, 722, 722, 722, 722, 1000, 722, 667,
+    667, 667, 667, 278, 278, 278, 278, 722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722,
+    722, 667, 667, 611, 556, 556, 556, 556, 556, 556, 889, 556, 556, 556, 556, 556, 278, 278, 278,
+    278, 611, 611, 611, 611, 611, 611, 611, 584, 611, 611, 611, 611, 611, 556, 611, 556,
+];
+
 fn count_to_f64(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-fn byte_width(byte: u8) -> u64 {
-    if (32..=126).contains(&byte) {
-        u64::from(HELVETICA_WIDTHS[(byte - 32) as usize])
-    } else if (0x80..=0x9F).contains(&byte) {
-        u64::from(WINANSI_WIDTHS[(byte - 0x80) as usize])
-    } else if (0xA0..=0xFF).contains(&byte) {
-        u64::from(WINANSI_LATIN1_WIDTHS[(byte - 0xA0) as usize])
-    } else {
-        556
-    }
+#[derive(Clone, Copy)]
+pub(super) enum PdfFont {
+    Regular,
+    Bold,
 }
 
-/// The rendered width of one source character after WinAnsi encoding or the
-/// deterministic ASCII fallback. A fallback such as `₹` → `INR` occupies
-/// three glyphs, not one.
-pub(super) fn char_width(ch: char) -> u64 {
-    if let Some(byte) = winansi_byte(ch) {
-        return byte_width(byte);
-    }
-    if let Some(fallback) = ascii_fallback(ch) {
-        return fallback.bytes().map(byte_width).sum();
-    }
-    byte_width(b'?')
-}
-
-pub(super) fn text_width(value: &str, size: f64) -> f64 {
-    // Sum in u64: a single oversized token can exceed u32 in glyph units and
-    // wrap (or panic in debug) before the size is applied.
-    let total: u64 = value.chars().map(char_width).sum();
-    total as f64 * size / 1000.0
-}
-
-pub(super) fn fit_text(value: &str, width: f64, size: f64) -> String {
-    if width <= 0.0 {
-        return String::new();
-    }
-    if text_width(value, size) <= width {
-        return value.to_owned();
-    }
-    // Accumulate widths instead of rebuilding and re-measuring the growing
-    // candidate for every character; zero-width glyphs would otherwise force
-    // a full prefix rescan per character.
-    let ellipsis = text_width("…", size);
-    if ellipsis > width {
-        return String::new();
-    }
-    let mut output = String::new();
-    let mut used = 0.0;
-    for ch in value.chars() {
-        let glyph = char_width(ch) as f64 * size / 1000.0;
-        if used + glyph + ellipsis > width {
-            output.push('…');
-            return output;
+impl PdfFont {
+    const fn resource(self) -> &'static str {
+        match self {
+            Self::Regular => "F1",
+            Self::Bold => "F2",
         }
-        output.push(ch);
-        used += glyph;
     }
-    output
+
+    fn byte_width(self, byte: u8) -> u64 {
+        let width = match (self, byte) {
+            (Self::Bold, 0x20..=0xFF) => HELVETICA_BOLD_WIDTHS[usize::from(byte - 0x20)],
+            (Self::Regular, 0x20..=0x7E) => HELVETICA_WIDTHS[usize::from(byte - 0x20)],
+            (Self::Regular, 0x80..=0x9F) => WINANSI_WIDTHS[usize::from(byte - 0x80)],
+            (Self::Regular, 0xA0..=0xFF) => WINANSI_LATIN1_WIDTHS[usize::from(byte - 0xA0)],
+            _ => 556,
+        };
+        u64::from(width)
+    }
+
+    /// A fallback such as `₹` → `INR` advances by three glyphs.
+    pub(super) fn char_width(self, ch: char) -> u64 {
+        if let Some(byte) = winansi_byte(ch) {
+            return self.byte_width(byte);
+        }
+        if let Some(fallback) = ascii_fallback(ch) {
+            return fallback.bytes().map(|byte| self.byte_width(byte)).sum();
+        }
+        self.byte_width(b'?')
+    }
+
+    pub(super) fn text_width(self, value: &str, size: f64) -> f64 {
+        // A single oversized token can exceed u32 in glyph units.
+        let total: u64 = value.chars().map(|ch| self.char_width(ch)).sum();
+        total as f64 * size / 1000.0
+    }
+
+    pub(super) fn fit_text(self, value: &str, width: f64, size: f64) -> String {
+        if width <= 0.0 {
+            return String::new();
+        }
+        if self.text_width(value, size) <= width {
+            return value.to_owned();
+        }
+        // Accumulate advances so a run of zero-width characters never
+        // requires a full prefix rescan for each glyph.
+        let ellipsis = self.text_width("…", size);
+        if ellipsis > width {
+            return String::new();
+        }
+        let mut output = String::new();
+        let mut used = 0.0;
+        for ch in value.chars() {
+            let glyph = self.char_width(ch) as f64 * size / 1000.0;
+            if used + glyph + ellipsis > width {
+                output.push('…');
+                return output;
+            }
+            output.push(ch);
+            used += glyph;
+        }
+        output
+    }
 }
