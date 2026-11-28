@@ -161,6 +161,50 @@ async function openInspector(page: Page): Promise<void> {
   await expect(page.getByTestId("inspector")).toBeVisible();
 }
 
+declare global {
+  interface Window {
+    __slabTestReleaseFixtureCall?: () => void;
+  }
+}
+
+async function pauseFixtureCall(
+  page: Page,
+  method: "saveLayout" | "getSchema" | "readRecord",
+  failureCode?: string,
+) {
+  await page.evaluate(async ({ path, method, failureCode }) => {
+    const { api, SlabError } = await import(path) as typeof import("../src/api");
+    const invoke = api[method];
+    Reflect.set(api, method, async (...args: unknown[]) => {
+      Reflect.set(api, method, invoke);
+      await new Promise<void>((resolve) => {
+        window.__slabTestReleaseFixtureCall = resolve;
+      });
+      delete window.__slabTestReleaseFixtureCall;
+      if (failureCode) throw new SlabError(failureCode, "Record read interrupted");
+      return Reflect.apply(invoke, api, args);
+    });
+  }, { path: "/src/api.ts", method, failureCode });
+
+  return {
+    started: () => page.waitForFunction(() => Boolean(window.__slabTestReleaseFixtureCall)),
+    release: () => page.evaluate(() => window.__slabTestReleaseFixtureCall?.()),
+  };
+}
+
+async function createNamedRecord(page: Page, name: string): Promise<void> {
+  await page.getByTestId("sub-toolbar").getByRole("button", { name: "+ New Record" }).click();
+  const inspector = page.getByTestId("inspector");
+  await inspector.getByRole("textbox", { name: "Name", exact: true }).fill(name);
+  await inspector.getByRole("button", { name: "Create Record" }).click();
+  await expect(inspector.getByRole("heading", { name })).toBeVisible();
+}
+
+async function runHistoryAction(page: Page, action: "undo" | "redo"): Promise<void> {
+  const shortcut = action === "undo" ? "⌘Z" : "⇧⌘Z";
+  await page.getByTestId("toolbar").locator(`button[title$="(${shortcut})"]`).click();
+}
+
 const VIEWS: Array<{
   name: string;
   fixture?: "design-studio" | "empty" | "stress";
@@ -1201,6 +1245,15 @@ test.describe("interaction polish", () => {
         const node = document.querySelector<HTMLElement>('[data-testid="sidebar"]');
         return node ? node.getBoundingClientRect().x < 0 : true;
       });
+
+      const opener = page.getByTestId("sidebar-toggle");
+      await opener.click();
+      const close = page.getByTestId("sidebar-header-toggle");
+      await close.focus();
+      await expect(close).toBeFocused();
+      await page.keyboard.press("Enter");
+      await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+      await expect(opener).toBeFocused();
     } else {
       const sidebar = page.getByTestId("sidebar");
       await expect(sidebar).toBeVisible();
@@ -1573,7 +1626,10 @@ test.describe("release hardening", () => {
     const active = page.locator(".grid-cell .field-input").first();
     await expect(active).toBeVisible();
     const before = await active.inputValue();
-    await page.keyboard.type("zz");
+    // One keystroke: Chromium may split consecutive typed characters into
+    // separate native undo steps on slow runners, and this test checks
+    // routing, not the browser's coalescing.
+    await page.keyboard.type("z");
     await expect(active).not.toHaveValue(before);
     await page.keyboard.press("Meta+z");
     await expect(active).toHaveValue(before);
@@ -1991,9 +2047,276 @@ test.describe("async races", () => {
     await expect(page.getByTestId("inspector")).toHaveCount(0);
     expect(errors).toEqual([]);
   });
+
+  test("a delayed form save keeps the newer table view", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    await page.getByRole("textbox", { name: "Form name" }).fill("Saved Client Form");
+
+    const save = await pauseFixtureCall(page, "saveLayout");
+    await page.getByRole("button", { name: "Save Form" }).click();
+    await save.started();
+    await selectTable(page, "Invoices");
+    const invoice = page.getByTestId("grid-row").first();
+    const number = (await invoice.locator('[data-column="Number"] .cell-text').innerText()).trim();
+    const heading = page.getByTestId("inspector").getByRole("heading", { name: number });
+    await invoice.locator('[data-column="Number"]').click();
+    await expect(heading).toBeVisible();
+    await save.release();
+
+    await expect(page.getByTestId("toast")).toContainText("Form Saved Client Form saved");
+    await expect(page.getByRole("tab", { name: "Table" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+    await expect(heading).toBeVisible();
+
+    await selectTable(page, "Clients");
+    await page.getByRole("tab", { name: "Form" }).click();
+    await expect(page.getByRole("textbox", { name: "Form name" })).toHaveValue("Saved Client Form");
+  });
+
+  test("a delayed table rename keeps the newer table and record selection", async ({ page }) => {
+    await boot(page);
+    await selectTable(page, "Invoices");
+    await page.getByRole("tab", { name: "Schema" }).click();
+    await page.getByRole("textbox", { name: "Table name" }).fill("Billing");
+
+    const metadata = await pauseFixtureCall(page, "getSchema");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await metadata.started();
+    await selectTable(page, "Clients");
+    const inspector = page.getByTestId("inspector");
+    await page.getByTestId("grid-row").filter({ hasText: "Northlight Studio" }).click();
+    await expect(inspector.getByRole("heading", { name: "Northlight Studio" })).toBeVisible();
+    await metadata.release();
+
+    await expect(page.getByTestId("toast")).toContainText("Table renamed to Billing");
+    await expect(inspector.getByRole("heading", { name: "Northlight Studio" })).toBeVisible();
+    await expect(page.getByTestId("grid-header").locator('[data-column="Name"]')).toBeVisible();
+    await selectTable(page, "Billing");
+    await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+  });
+
+  test("a rename keeps the active table under its new name", async ({ page }) => {
+    await boot(page);
+    await selectTable(page, "Invoices");
+    await page.getByRole("tab", { name: "Schema" }).click();
+    await page.getByRole("textbox", { name: "Table name" }).fill("Billing");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await expect(page.getByTestId("toast")).toContainText("Table renamed to Billing");
+
+    await page.getByRole("tab", { name: "Table" }).click();
+    await expect(page.getByTestId("sidebar").locator('[data-table="Billing"]')).toHaveClass(/active/);
+    await expect(page.getByTestId("grid-header").locator('[data-column="Number"]')).toBeVisible();
+  });
 });
 
 test.describe("form studio state", () => {
+  for (const table of ["Clients", "Line Items"]) {
+    test(`the first form save keeps later ${table} edits`, async ({ page }) => {
+      await boot(page);
+      if (table !== "Clients") await selectTable(page, table);
+      await page.getByRole("tab", { name: "Form" }).click();
+      await page.getByRole("button", {
+        name: table === "Clients" ? "New Form" : "Create Form",
+        exact: true,
+      }).click();
+      const name = page.getByRole("textbox", { name: "Form name" });
+      const layout = page.getByRole("combobox", { name: "Form layout" });
+      const item = page.locator(".studio-item").first();
+      const saveButton = page.getByRole("button", { name: "Save Form", exact: true });
+      await name.fill("Draft snapshot");
+      await expect(layout).toHaveValue("");
+
+      const save = await pauseFixtureCall(page, "saveLayout");
+      await saveButton.click();
+      await save.started();
+      await name.fill("Later draft edits");
+      await item.click();
+      const y = page.getByLabel("Y", { exact: true });
+      await y.fill("1");
+      await save.release();
+
+      await expect(page.getByTestId("toast")).toContainText("Form Draft snapshot saved");
+      await expect(layout).not.toHaveValue("");
+      const savedId = await layout.inputValue();
+      await expect(name).toHaveValue("Later draft edits");
+      await expect(y).toHaveValue("1");
+      await saveButton.click();
+      await expect(page.getByTestId("toast")).toContainText("Form Later draft edits saved");
+      await expect(layout).toHaveValue(savedId);
+      await expect(layout.getByRole("option", { name: "Draft snapshot" })).toHaveCount(0);
+      await page.getByRole("tab", { name: "Table" }).click();
+      await page.getByRole("tab", { name: "Form" }).click();
+      await expect(name).toHaveValue("Later draft edits");
+      await item.click();
+      await expect(y).toHaveValue("1");
+    });
+  }
+
+  test("a delayed form save keeps the newer form selection on the same table", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const name = page.getByRole("textbox", { name: "Form name" });
+    const layout = page.getByRole("combobox", { name: "Form layout" });
+    const saveButton = page.getByRole("button", { name: "Save Form", exact: true });
+    await page.getByRole("button", { name: "New Form", exact: true }).click();
+    await name.fill("Second client form");
+    await saveButton.click();
+    await expect(page.getByTestId("toast")).toContainText("Form Second client form saved");
+    await expect(layout).not.toHaveValue("");
+    const secondId = await layout.inputValue();
+    await layout.selectOption({ label: "Client Record" });
+    await name.fill("Saved first form edits");
+
+    const save = await pauseFixtureCall(page, "saveLayout");
+    await saveButton.click();
+    await save.started();
+    await layout.selectOption(secondId);
+    await expect(name).toHaveValue("Second client form");
+    await name.fill("Unsaved second form edits");
+    const item = page.locator(".studio-item").first();
+    await item.click();
+    const y = page.getByLabel("Y", { exact: true });
+    await y.fill("3");
+    await save.release();
+
+    await expect(page.getByTestId("toast")).toContainText("Form Saved first form edits saved");
+    await expect(layout).toHaveValue(secondId);
+    await expect(name).toHaveValue("Unsaved second form edits");
+    await expect(y).toHaveValue("3");
+    await layout.selectOption({ label: "Saved first form edits" });
+    await expect(name).toHaveValue("Saved first form edits");
+  });
+
+  test("canvas items support keyboard selection and visible focus", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const canvas = page.locator(".canvas");
+    const inspector = page.getByRole("complementary", { name: "Form item inspector" });
+    await page.getByRole("button", { name: /^Portal\b/ }).focus();
+    await page.keyboard.press("Tab");
+    const section = canvas.getByRole("button", { name: "Contact", exact: true });
+    await expect(section).toBeFocused();
+    await expect(section).toHaveCSS("outline-width", "2px");
+    await expect(section).toHaveCSS("outline-offset", "-2px");
+    await page.keyboard.press("Enter");
+    await expect(inspector.getByLabel("Title")).toHaveValue("Contact");
+    await page.keyboard.press("Tab");
+    await expect(canvas.getByRole("button", { name: /^Name\b/ })).toBeFocused();
+    await page.keyboard.press("Space");
+    await expect(inspector.getByLabel("Column")).toHaveValue("Name");
+  });
+
+  test("the snap preview matches palette drops and canvas moves at the right edge", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const palette = page.getByRole("complementary", { name: "Form elements" });
+    const canvas = page.locator(".canvas");
+    const preview = canvas.locator(".snap-preview");
+    const label = canvas.locator(".studio-item").filter({ hasText: /^Label$/ });
+    const section = canvas.locator(".studio-item").filter({ hasText: /^Section$/ });
+
+    for (const [source, item, offsetY, left, width, height] of [
+      [palette.getByRole("button", { name: /^Label\b/ }), label, 45, "50%", "50%", "56px"],
+      [palette.getByRole("button", { name: /^Section\b/ }), section, 105, "0%", "100%", "26px"],
+      [section, section, 165, "0%", "100%", "26px"],
+    ] as const) {
+      const canvasBox = await canvas.boundingBox();
+      if (!canvasBox) throw new Error("The form canvas has no box");
+      const position = { clientX: canvasBox.x + canvasBox.width - 6, clientY: canvasBox.y + offsetY };
+      const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+      // The native data store prevents reading the payload before drop.
+      const protectedTransfer = await page.evaluateHandle(() => new DataTransfer());
+      await source.dispatchEvent("dragstart", { dataTransfer });
+      await canvas.dispatchEvent("dragover", { ...position, dataTransfer: protectedTransfer });
+      const style = new RegExp(`left: ${left};.*width: ${width}; height: ${height};`);
+      await expect(preview).toHaveAttribute("style", style);
+      const box = await preview.boundingBox();
+      await canvas.dispatchEvent("drop", { ...position, dataTransfer });
+
+      await expect(preview).toHaveCount(0);
+      await expect(item).toHaveAttribute("style", style);
+      expect(await item.boundingBox()).toEqual(box);
+    }
+  });
+
+  test("changing the portal relation uses columns from the new child table", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const portal = page.locator(".studio-portal").filter({ hasText: "Client Projects" });
+    await expect(portal.locator(".portal-preview-cell")).toHaveText(["Name", "Status", "Due Date"]);
+    await portal.click();
+    await page.getByRole("combobox", { name: "Relation", exact: true }).selectOption("Client Invoices");
+    const changedPortal = page.locator(".studio-portal").filter({ hasText: "Client Invoices" });
+    await expect(changedPortal.locator(".portal-preview-cell")).toHaveText([
+      "Number", "Client", "Project", "Issued", "Due",
+    ]);
+    await page.getByRole("button", { name: "Save Form" }).click();
+    await expect(page.getByTestId("toast")).toContainText("Form Client Record saved");
+  });
+
+  test("the form inspector accepts vertical grid values above 40", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const item = page.locator(".studio-item").first();
+    await item.click();
+    const y = page.getByLabel("Y", { exact: true });
+    const h = page.getByLabel("H", { exact: true });
+    await y.fill("41");
+    await h.fill("45");
+    await expect(y).toHaveValue("41");
+    await expect(h).toHaveValue("45");
+    await expect(item).toHaveCSS("top", "1230px");
+    await expect(item).toHaveCSS("height", "1346px");
+    await y.fill("65536");
+    await h.fill("65536");
+    await expect(y).toHaveValue("65535");
+    await expect(h).toHaveValue("65535");
+  });
+
+  test("form palette items support keyboard activation and pointer dragging", async ({ page }) => {
+    await boot(page);
+    await page.getByRole("tab", { name: "Form" }).click();
+    const palette = page.getByRole("complementary", { name: "Form elements" });
+    const canvas = page.locator(".canvas");
+    const field = canvas.locator(".studio-field").filter({ hasText: /^Name/ });
+    await field.click();
+    await page.getByRole("button", { name: "Remove Item" }).click();
+    await expect(field).toHaveCount(0);
+
+    await page.getByRole("button", { name: "Save Form" }).focus();
+    await page.keyboard.press("Tab");
+    await expect(palette.getByRole("button", { name: /^Name\b/ })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(field).toHaveCount(1);
+
+    const section = palette.getByRole("button", { name: /^Section\b/ });
+    await page.getByRole("button", { name: "Save Form" }).focus();
+    await page.keyboard.press("Tab");
+    await expect(section).toBeFocused();
+    await expect(section).toHaveCSS("outline-width", "2px");
+    await page.keyboard.press("Space");
+    await expect(canvas.locator(".studio-section").getByText("Section", { exact: true })).toHaveCount(1);
+
+    const relation = palette.getByRole("combobox", { name: "Child relation" });
+    await relation.selectOption("Client Invoices");
+    await relation.focus();
+    await page.keyboard.press("Tab");
+    await expect(palette.getByRole("button", { name: /^Portal\b/ })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(canvas.locator(".studio-portal").getByText("Client Invoices")).toHaveCount(1);
+
+    await palette.getByRole("button", { name: /^Label\b/ }).dragTo(canvas, {
+      targetPosition: { x: 40, y: 40 },
+    });
+    await expect(canvas.locator(".studio-label").getByText("Label")).toHaveCount(1);
+
+    await selectTable(page, "Line Items");
+    await page.getByRole("tab", { name: "Form" }).click();
+    await page.getByRole("button", { name: "Create Form" }).click();
+    await expect(palette.getByRole("button", { name: /^Portal\b/ })).toBeDisabled();
+  });
+
   test("unsaved item edits survive a schema refresh", async ({ page }) => {
     const width = page.viewportSize()?.width ?? 0;
     test.skip(width !== 1440, "form inspector survival runs once at the laptop size");
@@ -2031,6 +2354,95 @@ test.describe("form studio state", () => {
 });
 
 test.describe("inspector state", () => {
+  for (const action of ["undo", "redo"] as const) {
+    test(`${action} closes the inspector when its selected record is removed`, async ({ page }) => {
+      await boot(page);
+      const name = "Temporary Client";
+      await createNamedRecord(page, name);
+      const inspector = page.getByTestId("inspector");
+      const row = page.getByTestId("grid-row").filter({ hasText: name });
+
+      if (action === "redo") {
+        page.once("dialog", (dialog) => void dialog.accept());
+        await inspector.getByRole("button", { name: "Delete record" }).click();
+        await expect(page.getByTestId("toast")).toContainText("Record deleted");
+        await runHistoryAction(page, "undo");
+        await expect(page.getByTestId("toast")).toContainText("Undid change");
+        await row.click();
+        await expect(inspector.getByRole("heading", { name })).toBeVisible();
+      }
+
+      await inspector.getByRole("button", { name: "Revision history" }).click();
+      await expect(page.getByTestId("record-history")).toBeVisible();
+      await runHistoryAction(page, action);
+      await expect(page.getByTestId("toast")).toContainText(action === "undo" ? "Undid change" : "Redone");
+      await expect(row).toHaveCount(0);
+      await expect(inspector).toHaveCount(0);
+    });
+  }
+
+  test("a delayed missing record read keeps the newer inspector selection", async ({ page }) => {
+    await boot(page);
+    await createNamedRecord(page, "Temporary Client");
+    const read = await pauseFixtureCall(page, "readRecord");
+    await runHistoryAction(page, "undo");
+    await read.started();
+
+    const inspector = page.getByTestId("inspector");
+    const nextTitle = inspector.getByRole("heading", { name: "Northlight Studio" });
+    await page.getByTestId("grid-row").filter({ hasText: "Northlight Studio" })
+      .locator('[data-column="Name"]').click();
+    await expect(nextTitle).toBeVisible();
+    await read.release();
+    await expect(page.getByTestId("toast")).toContainText("Undid change");
+    await expect(nextTitle).toBeVisible();
+  });
+
+  test("a delayed undo read cannot close a record restored by redo", async ({ page }) => {
+    await boot(page);
+    const name = "Restored Client";
+    await createNamedRecord(page, name);
+    const row = page.getByTestId("grid-row").filter({ hasText: name });
+    const title = page.getByTestId("inspector").getByRole("heading", { name });
+    const read = await pauseFixtureCall(page, "readRecord", "SLAB_E_NOT_FOUND");
+
+    await runHistoryAction(page, "undo");
+    await read.started();
+    await expect(row).toHaveCount(0);
+
+    await runHistoryAction(page, "redo");
+    await expect(page.getByTestId("toast")).toContainText("Redone");
+    await expect(row).toBeVisible();
+    await expect(title).toBeVisible();
+
+    await read.release();
+    await expect(page.getByTestId("toast")).toContainText("Undid change");
+    await expect(title).toBeVisible();
+  });
+
+  for (const code of ["SLAB_E_CANCELLED", "SLAB_E_INTERNAL"]) {
+    test(`a ${code} record refresh keeps the current inspector selection`, async ({ page }) => {
+      await boot(page);
+      const name = "Temporary Client";
+      await createNamedRecord(page, name);
+      const read = await pauseFixtureCall(page, "readRecord", code);
+
+      const inspector = page.getByTestId("inspector");
+      const refresh = page.evaluate(async (path) => {
+        const { useStore } = await import(path) as typeof import("../src/store");
+        await useStore.getState().refreshBundle();
+      }, "/src/store.ts");
+
+      await read.started();
+      await read.release();
+      await refresh;
+      await expect(inspector.getByRole("heading", { name })).toBeVisible();
+      await expect(page.getByTestId("toast")).toContainText(
+        code === "SLAB_E_CANCELLED" ? "Record created" : "Record read interrupted",
+      );
+    });
+  }
+
   test("double-clicking another row refreshes an open inspector", async ({ page }) => {
     const width = page.viewportSize()?.width ?? 0;
     test.skip(width !== 1440, "inspector double-click runs once at the laptop size");

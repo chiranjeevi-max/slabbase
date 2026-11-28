@@ -111,6 +111,15 @@ export function SchemaManage({ schema, activeTable, onTableSelected }: SchemaMan
     if (Array.isArray(result)) setIndexes(result);
   };
 
+  const onDropRelation = async (name: string) => {
+    const ok = await confirmDestructive(
+      `Drop relation “${name}”?`,
+      "Drop Relation",
+      "Drop Relation",
+    );
+    if (ok) await run(() => dropRelation(name));
+  };
+
   return (
     <div className="manage">
       {problem && (
@@ -158,97 +167,131 @@ export function SchemaManage({ schema, activeTable, onTableSelected }: SchemaMan
         </button>
       </div>
 
-      <div className="manage-section">
-        <div className="manage-section-head">
-          <span>Columns</span>
-          <span className="manage-count">{table.columns.length}</span>
-        </div>
-        <div className="manage-grid">
-          {table.columns.map((column) => {
-            const indexed = indexes.some(
-              (index) => index.columns.length === 1 && index.columns[0] === column.name,
-            );
-            return (
-              <div className="manage-row" key={column.id}>
-                <input
-                  className="field-input manage-name"
-                  value={renames[column.id] ?? column.name}
-                  aria-label={`Rename ${column.name}`}
-                  onChange={(event) =>
-                    setRenames((current) => ({ ...current, [column.id]: event.target.value }))
-                  }
-                  onBlur={() => void onRenameColumn(column)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-                <span className="manage-type">{columnTypeLabel(column.ty)}</span>
-                <span className="manage-flags">
-                  {column.required && <span className="badge neutral">required</span>}
-                  {column.unique && <span className="badge neutral">unique</span>}
-                  {isComputedColumn(column) && <span className="badge info">computed</span>}
-                </span>
-                <label className="inline-check" title="Single-column SQLite index">
-                  <input
-                    type="checkbox"
-                    checked={indexed}
-                    disabled={busy || isComputedColumn(column)}
-                    onChange={(event) => void onToggleIndex(column, event.target.checked)}
-                  />
-                  Index
-                </label>
-                <button
-                  type="button"
-                  className="icon-control micro danger"
-                  title={`Drop ${column.name}`}
-                  aria-label={`Drop ${column.name}`}
-                  disabled={busy}
-                  onClick={() => void onDropColumn(column)}
-                >
-                  <Icon name="trash" size={12} strokeWidth={1.5} />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      </div>
+      <ManagedColumns
+        columns={table.columns}
+        indexes={indexes}
+        renames={renames}
+        busy={busy}
+        onNameChange={(id, name) => setRenames((current) => ({ ...current, [id]: name }))}
+        onRename={onRenameColumn}
+        onDrop={onDropColumn}
+        onToggleIndex={onToggleIndex}
+      />
 
-      <div className="manage-relations">
-        <div className="manage-section-head">
-          <span>Relations</span>
-          <span className="manage-count">{schema.relations.length}</span>
-        </div>
-        {schema.relations.length === 0 && <p className="manage-empty-line">No relations</p>}
-        {schema.relations.map((relation) => (
-          <div className="manage-relation-row" key={relation.id}>
-            <span className="relation-path">
-              {relation.parent_table}
-              <span className="relation-arrow">→</span>
-              {relation.child_table}.{relation.child_column}
-            </span>
-            <span className="relation-name">{relation.name}</span>
-            <button
-              type="button"
-              className="text-button danger-text"
-              disabled={busy}
-              onClick={() => {
-                void (async () => {
-                  const ok = await confirmDestructive(
-                    `Drop relation “${relation.name}”?`,
-                    "Drop Relation",
-                    "Drop Relation",
-                  );
-                  if (ok) await run(() => dropRelation(relation.name));
-                })();
-              }}
-            >
-              Drop
-            </button>
-          </div>
-        ))}
+      <ManagedRelations relations={schema.relations} busy={busy} onDrop={onDropRelation} />
+    </div>
+  );
+}
+
+function ManagedColumns({
+  columns,
+  indexes,
+  renames,
+  busy,
+  onNameChange,
+  onRename,
+  onDrop,
+  onToggleIndex,
+}: {
+  columns: Column[];
+  indexes: IndexSpec[];
+  renames: Record<string, string>;
+  busy: boolean;
+  onNameChange: (id: string, name: string) => void;
+  onRename: (column: Column) => Promise<void>;
+  onDrop: (column: Column) => Promise<void>;
+  onToggleIndex: (column: Column, enabled: boolean) => Promise<void>;
+}) {
+  return (
+    <div className="manage-section">
+      <div className="manage-section-head">
+        <span>Columns</span>
+        <span className="manage-count">{columns.length}</span>
       </div>
+      <div className="manage-grid">
+        {columns.map((column) => {
+          const indexed = indexes.some(
+            (index) => index.columns.length === 1 && index.columns[0] === column.name,
+          );
+          return (
+            <div className="manage-row" key={column.id}>
+              <input
+                className="field-input manage-name"
+                value={renames[column.id] ?? column.name}
+                aria-label={`Rename ${column.name}`}
+                onChange={(event) =>
+                  onNameChange(column.id, event.target.value)
+                }
+                onBlur={() => void onRename(column)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
+              <span className="manage-type">{columnTypeLabel(column.ty)}</span>
+              <span className="manage-flags">
+                {column.required && <span className="badge neutral">required</span>}
+                {column.unique && <span className="badge neutral">unique</span>}
+                {isComputedColumn(column) && <span className="badge info">computed</span>}
+              </span>
+              <label className="inline-check" title="Single-column SQLite index">
+                <input
+                  type="checkbox"
+                  checked={indexed}
+                  disabled={busy || isComputedColumn(column)}
+                  onChange={(event) => void onToggleIndex(column, event.target.checked)}
+                />
+                Index
+              </label>
+              <button
+                type="button"
+                className="icon-control micro danger"
+                title={`Drop ${column.name}`}
+                aria-label={`Drop ${column.name}`}
+                disabled={busy}
+                onClick={() => void onDrop(column)}
+              >
+                <Icon name="trash" size={12} strokeWidth={1.5} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ManagedRelations({ relations, busy, onDrop }: {
+  relations: Schema["relations"];
+  busy: boolean;
+  onDrop: (name: string) => Promise<void>;
+}) {
+  return (
+    <div className="manage-relations">
+      <div className="manage-section-head">
+        <span>Relations</span>
+        <span className="manage-count">{relations.length}</span>
+      </div>
+      {relations.length === 0 && <p className="manage-empty-line">No relations</p>}
+      {relations.map((relation) => (
+        <div className="manage-relation-row" key={relation.id}>
+          <span className="relation-path">
+            {relation.parent_table}
+            <span className="relation-arrow">→</span>
+            {relation.child_table}.{relation.child_column}
+          </span>
+          <span className="relation-name">{relation.name}</span>
+          <button
+            type="button"
+            className="text-button danger-text"
+            disabled={busy}
+            onClick={() => void onDrop(relation.name)}
+          >
+            Drop
+          </button>
+        </div>
+      ))}
     </div>
   );
 }

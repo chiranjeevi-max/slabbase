@@ -115,25 +115,47 @@ fn menu_item(
 }
 
 #[cfg(desktop)]
-fn install_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    let handle = app.handle().clone();
-
-    let appearance = menu_item(&handle, "appearance", "Appearance…", Some("Cmd+,"))?;
+fn build_file_menu(handle: &AppHandle) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     let new_workspace = menu_item(
-        &handle,
+        handle,
         "new-workspace",
         "New Workspace…",
         Some("Cmd+Shift+N"),
     )?;
-    let open_workspace = menu_item(&handle, "open-workspace", "Open Workspace…", Some("Cmd+O"))?;
-    let load_sample = menu_item(&handle, "load-sample", "Load Sample Workspace", None)?;
-    let new_table = menu_item(&handle, "new-table", "New Table…", Some("Cmd+Alt+T"))?;
-    let new_record = menu_item(&handle, "new-record", "New Record", Some("Cmd+N"))?;
-    let import = menu_item(&handle, "import", "Import Data…", Some("Cmd+Shift+I"))?;
-    let export = menu_item(&handle, "export", "Export…", Some("Cmd+Shift+E"))?;
-    let backup = menu_item(&handle, "backup", "Backup Snapshot…", Some("Cmd+Shift+B"))?;
-    let print = menu_item(&handle, "print", "Print / Export PDF…", Some("Cmd+P"))?;
-    let close_workspace = menu_item(&handle, "close-workspace", "Close Workspace", None)?;
+    let open_workspace = menu_item(handle, "open-workspace", "Open Workspace…", Some("Cmd+O"))?;
+    let load_sample = menu_item(handle, "load-sample", "Load Sample Workspace", None)?;
+    let new_table = menu_item(handle, "new-table", "New Table…", Some("Cmd+Alt+T"))?;
+    let new_record = menu_item(handle, "new-record", "New Record", Some("Cmd+N"))?;
+    let import = menu_item(handle, "import", "Import Data…", Some("Cmd+Shift+I"))?;
+    let export = menu_item(handle, "export", "Export…", Some("Cmd+Shift+E"))?;
+    let backup = menu_item(handle, "backup", "Backup Snapshot…", Some("Cmd+Shift+B"))?;
+    let print = menu_item(handle, "print", "Print / Export PDF…", Some("Cmd+P"))?;
+    let close_workspace = menu_item(handle, "close-workspace", "Close Workspace", None)?;
+
+    SubmenuBuilder::new(handle, "File")
+        .item(&new_workspace)
+        .item(&open_workspace)
+        .item(&load_sample)
+        .separator()
+        .item(&new_table)
+        .item(&new_record)
+        .separator()
+        .item(&import)
+        .item(&export)
+        .item(&backup)
+        .separator()
+        .item(&print)
+        .separator()
+        .item(&close_workspace)
+        .close_window()
+        .build()
+}
+
+#[cfg(desktop)]
+fn install_menu(app: &mut tauri::App) -> tauri::Result<()> {
+    let handle = app.handle().clone();
+
+    let appearance = menu_item(&handle, "appearance", "Appearance…", Some("Cmd+,"))?;
     let undo = menu_item(&handle, "edit-undo", "Undo", Some("Cmd+Z"))?;
     let redo = menu_item(&handle, "edit-redo", "Redo", Some("Cmd+Shift+Z"))?;
     let search = menu_item(
@@ -181,23 +203,7 @@ fn install_menu(app: &mut tauri::App) -> tauri::Result<()> {
         .quit()
         .build()?;
 
-    let file_menu = SubmenuBuilder::new(&handle, "File")
-        .item(&new_workspace)
-        .item(&open_workspace)
-        .item(&load_sample)
-        .separator()
-        .item(&new_table)
-        .item(&new_record)
-        .separator()
-        .item(&import)
-        .item(&export)
-        .item(&backup)
-        .separator()
-        .item(&print)
-        .separator()
-        .item(&close_workspace)
-        .close_window()
-        .build()?;
+    let file_menu = build_file_menu(&handle)?;
 
     let edit_menu = SubmenuBuilder::new(&handle, "Edit")
         .item(&undo)

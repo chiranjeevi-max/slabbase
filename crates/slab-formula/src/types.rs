@@ -394,27 +394,7 @@ fn call_type(name: &str, args: &[Expr], env: &TypeEnv) -> Result<FormulaType, Fo
                 ))
             })
         }
-        "COALESCE" => {
-            if args.is_empty() {
-                return Err(FormulaError::Arity {
-                    function: name.into(),
-                    expected: "at least one argument".into(),
-                    found: 0,
-                });
-            }
-            let mut result = FormulaType::Any;
-            for arg in args {
-                let ty = typecheck(arg, env)?;
-                result = union_type(result, ty).ok_or_else(|| {
-                    FormulaError::Type(format!(
-                        "COALESCE arguments mix {} and {}",
-                        result.label(),
-                        ty.label()
-                    ))
-                })?;
-            }
-            Ok(result)
-        }
+        "COALESCE" => coalesce_type(name, args, env),
         "CONCAT" => {
             if args.is_empty() {
                 return Err(FormulaError::Arity {
@@ -516,24 +496,52 @@ fn call_type(name: &str, args: &[Expr], env: &TypeEnv) -> Result<FormulaType, Fo
             }
             Ok(FormulaType::Integer)
         }
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
-            expect_arity(name, args, 1)?;
-            let Some((relation, column)) = args[0].qualified_column() else {
-                return Err(FormulaError::Type(format!(
-                    "{name} expects a qualified child column such as [Line Items].[Amount]"
-                )));
-            };
-            let Some(column_type) = env.relation_column(relation, column) else {
-                return Err(FormulaError::UnknownRelation {
-                    relation: relation.to_owned(),
-                    column: column.to_owned(),
-                });
-            };
-            let aggregate = aggregate_for(name);
-            aggregate_type(aggregate, column_type)
-        }
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => aggregate_call_type(name, args, env),
         other => Err(FormulaError::UnknownFunction(other.to_owned())),
     }
+}
+
+fn coalesce_type(name: &str, args: &[Expr], env: &TypeEnv) -> Result<FormulaType, FormulaError> {
+    if args.is_empty() {
+        return Err(FormulaError::Arity {
+            function: name.into(),
+            expected: "at least one argument".into(),
+            found: 0,
+        });
+    }
+    let mut result = FormulaType::Any;
+    for arg in args {
+        let ty = typecheck(arg, env)?;
+        result = union_type(result, ty).ok_or_else(|| {
+            FormulaError::Type(format!(
+                "COALESCE arguments mix {} and {}",
+                result.label(),
+                ty.label()
+            ))
+        })?;
+    }
+    Ok(result)
+}
+
+fn aggregate_call_type(
+    name: &str,
+    args: &[Expr],
+    env: &TypeEnv,
+) -> Result<FormulaType, FormulaError> {
+    expect_arity(name, args, 1)?;
+    let Some((relation, column)) = args[0].qualified_column() else {
+        return Err(FormulaError::Type(format!(
+            "{name} expects a qualified child column such as [Line Items].[Amount]"
+        )));
+    };
+    let Some(column_type) = env.relation_column(relation, column) else {
+        return Err(FormulaError::UnknownRelation {
+            relation: relation.to_owned(),
+            column: column.to_owned(),
+        });
+    };
+    let aggregate = aggregate_for(name);
+    aggregate_type(aggregate, column_type)
 }
 
 fn aggregate_for(name: &str) -> Aggregate {

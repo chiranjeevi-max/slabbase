@@ -1229,6 +1229,75 @@ fn rollback_import_restores_rollups_and_audit() {
     assert_eq!(rollup_values(&workspace, invoice)[0], Value::Integer(125));
 }
 
+#[test]
+fn failed_import_batch_rolls_back_every_batch_and_refuses_commit() {
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let (path, mut workspace) = rollup_workspace(&directory);
+    let invoice = workspace
+        .insert_row("Invoices", &row(&[("Number", Value::from("IMPORT"))]))
+        .expect("invoice")
+        .id;
+    let item = |parent, label| {
+        row(&[
+            ("Invoice", Value::Integer(parent)),
+            ("Label", Value::from(label)),
+            ("Amount", Value::Integer(25)),
+            ("Qty", Value::Integer(1)),
+        ])
+    };
+    let rollups_before = rollup_values(&workspace, invoice);
+    let audit_before = workspace.audit_entries(100, 0).expect("audit");
+    workspace.clear_history();
+
+    workspace.begin_import().expect("begin");
+    workspace
+        .insert_import_rows("Items", &[item(invoice, "pendingfirst")])
+        .expect("earlier batch");
+    let error = workspace
+        .insert_import_rows(
+            "Items",
+            &[item(invoice, "pendingsecond"), item(-1, "badreference")],
+        )
+        .expect_err("second row of batch violates foreign key");
+    assert_eq!(error.code_str(), "SLAB_E_FK_VIOLATION");
+    assert_eq!(
+        workspace
+            .commit_import()
+            .expect_err("failed import cannot commit")
+            .code_str(),
+        "SLAB_E_COMMAND"
+    );
+    assert_eq!(count_rows(&path, "Items"), 0);
+    assert!(
+        workspace
+            .search("pendingfirst", 10)
+            .expect("search")
+            .is_empty()
+    );
+    assert!(
+        workspace
+            .search("pendingsecond", 10)
+            .expect("search")
+            .is_empty()
+    );
+    assert_eq!(rollup_values(&workspace, invoice), rollups_before);
+    assert_eq!(
+        workspace.audit_entries(100, 0).expect("audit"),
+        audit_before
+    );
+    assert!(workspace.integrity_check().expect("integrity").audit_chain);
+    assert!(!workspace.undo_state().can_undo);
+
+    workspace.begin_import().expect("restart import");
+    workspace
+        .insert_import_rows("Items", &[item(invoice, "committed")])
+        .expect("retry batch");
+    workspace.commit_import().expect("commit retry");
+    assert_eq!(rollup_values(&workspace, invoice)[0], Value::Integer(25));
+    workspace.undo().expect("undo committed import");
+    assert_eq!(count_rows(&path, "Items"), 0);
+}
+
 /// A lookup over a formula child column is evaluated from live rows. It must
 /// keep working across renames of the source column and the formula column, and
 /// it must never create a cache entry because there is no physical column.

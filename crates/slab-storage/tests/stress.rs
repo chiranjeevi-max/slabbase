@@ -933,7 +933,13 @@ fn import_transaction_rolls_back_every_row_and_commits_fifty_thousand_in_batches
         .insert_import_rows("Bulk", &batch)
         .expect_err("unique conflict");
     assert_eq!(error.code_str(), "SLAB_E_UNIQUE");
-    workspace.rollback_import().expect("rollback");
+    assert_eq!(
+        workspace
+            .commit_import()
+            .expect_err("failed import cannot commit")
+            .code_str(),
+        "SLAB_E_COMMAND"
+    );
     assert_eq!(
         workspace
             .page(&PageQuery::first("Bulk", 10))

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import type { PrintOptionsDto } from "../bindings";
+import type { Layout, PrintOptionsDto, Table } from "../bindings";
 import { api } from "../api";
 import { useFocusTrap } from "../focus";
 import { usePresence } from "../presence";
@@ -148,131 +148,191 @@ export function PrintDialog() {
           </button>
         </header>
         <div className="print-body">
-          <aside className="print-options">
-            <div className="segmented">
-              <button
-                type="button"
-                aria-pressed={mode === "record"}
-                disabled={selectedId === null}
-                onClick={() => setMode("record")}
-              >
-                Record
-              </button>
-              <button
-                type="button"
-                aria-pressed={mode === "table"}
-                onClick={() => setMode("table")}
-              >
-                Table
-              </button>
-            </div>
-            {mode === "record" && (
-              <label className="field-label">
-                Form layout
-                <select
-                  className="select"
-                  value={layoutId}
-                  onChange={(event) => setLayoutId(event.target.value)}
-                >
-                  {layouts.length === 0 && <option value="">Default layout</option>}
-                  {layouts.map((layout) => (
-                    <option key={layout.id} value={layout.id}>
-                      {layout.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            <label className="field-label">
-              Paper
-              <select
-                className="select"
-                value={options.pageSize}
-                onChange={(event) => setOptions({ ...options, pageSize: event.target.value })}
-              >
-                <option value="letter">US Letter</option>
-                <option value="a4">A4</option>
-              </select>
-            </label>
-            <label className="field-label">
-              Title
-              <input
-                className="field-input"
-                placeholder={table?.name ?? "Report"}
-                value={options.title ?? ""}
-                onChange={(event) =>
-                  setOptions({ ...options, title: event.target.value || null })
-                }
-              />
-            </label>
-            <label className="field-label">
-              Subtitle
-              <input
-                className="field-input"
-                placeholder="Prepared for the client"
-                value={options.subtitle ?? ""}
-                onChange={(event) =>
-                  setOptions({ ...options, subtitle: event.target.value || null })
-                }
-              />
-            </label>
-            <label className="inline-check">
-              <input
-                type="checkbox"
-                checked={options.includePortals}
-                onChange={(event) =>
-                  setOptions({ ...options, includePortals: event.target.checked })
-                }
-              />
-              Include child portals
-            </label>
-            <label className="inline-check">
-              <input
-                type="checkbox"
-                checked={options.includeEmptyFields}
-                onChange={(event) =>
-                  setOptions({ ...options, includeEmptyFields: event.target.checked })
-                }
-              />
-              Include empty fields
-            </label>
-            <div className="print-actions">
-              <button
-                type="button"
-                className="button"
-                onClick={() => void renderPreview()}
-                disabled={busy}
-              >
-                {busy ? "Rendering…" : "Preview"}
-              </button>
-              <button
-                type="button"
-                className="button primary"
-                onClick={() => void exportPdf()}
-                disabled={busy}
-              >
-                <Icon name="download" size={14} /> Export PDF
-              </button>
-            </div>
-            {mode === "table" && (
-              <p className="muted print-note">
-                Table reports include up to 1,000 filtered rows from the current view.
-              </p>
-            )}
-          </aside>
-          <div className="print-preview">
-            {warning && <div className="print-warning">{warning}</div>}
-            {html ? (
-              <iframe title="Print preview" srcDoc={html} sandbox="" />
-            ) : (
-              <div className="print-placeholder">
-                <Icon name="printer" size={24} />
-                <p>Preview renders a paginated HTML proof. PDF export uses the same layout.</p>
-              </div>
-            )}
-          </div>
+          <PrintOptions
+            mode={mode}
+            setMode={setMode}
+            layouts={layouts}
+            layoutId={layoutId}
+            setLayoutId={setLayoutId}
+            options={options}
+            setOptions={setOptions}
+            busy={busy}
+            renderPreview={renderPreview}
+            exportPdf={exportPdf}
+            selectedId={selectedId}
+            table={table}
+          />
+          <PrintPreview
+            warning={warning}
+            html={html}
+          />
         </div>
       </div>
+    </div>
+  );
+}
+
+function PrintOptions({
+  mode,
+  setMode,
+  layouts,
+  layoutId,
+  setLayoutId,
+  options,
+  setOptions,
+  busy,
+  renderPreview,
+  exportPdf,
+  selectedId,
+  table,
+}: {
+  mode: "record" | "table";
+  setMode: (mode: "record" | "table") => void;
+  layouts: Layout[];
+  layoutId: string;
+  setLayoutId: (id: string) => void;
+  options: PrintOptionsDto;
+  setOptions: (options: PrintOptionsDto) => void;
+  busy: boolean;
+  renderPreview: () => Promise<void>;
+  exportPdf: () => Promise<void>;
+  selectedId: number | null;
+  table: Table | undefined;
+}) {
+  return (
+    <aside className="print-options">
+      <div className="segmented">
+        <button
+          type="button"
+          aria-pressed={mode === "record"}
+          disabled={selectedId === null}
+          onClick={() => setMode("record")}
+        >
+          Record
+        </button>
+        <button
+          type="button"
+          aria-pressed={mode === "table"}
+          onClick={() => setMode("table")}
+        >
+          Table
+        </button>
+      </div>
+      {mode === "record" && (
+        <label className="field-label">
+          Form layout
+          <select
+            className="select"
+            value={layoutId}
+            onChange={(event) => setLayoutId(event.target.value)}
+          >
+            {layouts.length === 0 && <option value="">Default layout</option>}
+            {layouts.map((layout) => (
+              <option key={layout.id} value={layout.id}>
+                {layout.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <label className="field-label">
+        Paper
+        <select
+          className="select"
+          value={options.pageSize}
+          onChange={(event) => setOptions({ ...options, pageSize: event.target.value })}
+        >
+          <option value="letter">US Letter</option>
+          <option value="a4">A4</option>
+        </select>
+      </label>
+      <label className="field-label">
+        Title
+        <input
+          className="field-input"
+          placeholder={table?.name ?? "Report"}
+          value={options.title ?? ""}
+          onChange={(event) =>
+            setOptions({ ...options, title: event.target.value || null })
+          }
+        />
+      </label>
+      <label className="field-label">
+        Subtitle
+        <input
+          className="field-input"
+          placeholder="Prepared for the client"
+          value={options.subtitle ?? ""}
+          onChange={(event) =>
+            setOptions({ ...options, subtitle: event.target.value || null })
+          }
+        />
+      </label>
+      <label className="inline-check">
+        <input
+          type="checkbox"
+          checked={options.includePortals}
+          onChange={(event) =>
+            setOptions({ ...options, includePortals: event.target.checked })
+          }
+        />
+        Include child portals
+      </label>
+      <label className="inline-check">
+        <input
+          type="checkbox"
+          checked={options.includeEmptyFields}
+          onChange={(event) =>
+            setOptions({ ...options, includeEmptyFields: event.target.checked })
+          }
+        />
+        Include empty fields
+      </label>
+      <div className="print-actions">
+        <button
+          type="button"
+          className="button"
+          onClick={() => void renderPreview()}
+          disabled={busy}
+        >
+          {busy ? "Rendering…" : "Preview"}
+        </button>
+        <button
+          type="button"
+          className="button primary"
+          onClick={() => void exportPdf()}
+          disabled={busy}
+        >
+          <Icon name="download" size={14} /> Export PDF
+        </button>
+      </div>
+      {mode === "table" && (
+        <p className="muted print-note">
+          Table reports include up to 1,000 filtered rows from the current view.
+        </p>
+      )}
+    </aside>
+  );
+}
+
+function PrintPreview({
+  warning,
+  html,
+}: {
+  warning: string;
+  html: string;
+}) {
+  return (
+    <div className="print-preview">
+      {warning && <div className="print-warning">{warning}</div>}
+      {html ? (
+        <iframe title="Print preview" srcDoc={html} sandbox="" />
+      ) : (
+        <div className="print-placeholder">
+          <Icon name="printer" size={24} />
+          <p>Preview renders a paginated HTML proof. PDF export uses the same layout.</p>
+        </div>
+      )}
     </div>
   );
 }

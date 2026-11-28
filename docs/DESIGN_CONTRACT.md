@@ -50,6 +50,9 @@ Toolbar geometry:
 - Keyboard focus draws a crisp 2px accent ring on `:focus-visible`.
 - Active grid and portal cells use a 1.5px inset accent border and do not shift layout.
 - Modals, sheets, the audit drawer, and `⌘K` trap Tab. Dismissal restores focus to the element that opened the surface.
+- The sidebar drawer's header close button returns focus to the toolbar toggle.
+- In Form Studio the palette supports Tab to focus and Enter or Space to add an item. Palette items also support drag and drop.
+- Tab reaches existing Form Studio canvas items. Enter or Space selects the focused item and opens its inspector.
 
 ### Inactive window
 
@@ -84,6 +87,12 @@ Toolbar geometry:
 - Double-clicking another row while the inspector is open loads that row into the inspector.
 - A New Record draft owns the inspector until it is saved or cancelled. Grid clicks and double-clicks do not change the selection while a draft is open.
 - Unsaved Form Studio edits survive a schema refresh, including one caused by the user's own save.
+- A first save attaches the assigned layout ID to the local draft and keeps edits made while the save was pending. Selecting another form keeps that form active when an earlier save completes.
+- A save or rename that completes after a table switch preserves the newer table view and record selection.
+- Undo or redo closes the inspector when it removes the selected record.
+- Once a newer read starts for the same record, an older read cannot clear that record's inspector.
+- Snap previews use the same grid position and size as the final drop. The inspector and canvas share the layout's row and height limits.
+- When a portal switches to another relation, its column list resets to the new child table's defaults.
 
 ### Scroll surfaces
 
@@ -221,7 +230,13 @@ Appearance preferences persist in `localStorage` under `slabbase.appearance.v1` 
 | HiDPI parity | `hidpi borders stay crisp and layout does not drift` |
 | Date-only timezone invariance | `calendar dates never shift on display or edit` |
 | WCAG 2.2 AA | `axe WCAG 2.2 AA scan finds no serious violations` |
-| Stale inspector reads | `a stale inspector read cannot replace a newer table selection`, `a delayed row select is cancelled by a table switch` |
+| Stale inspector reads | `a stale inspector read cannot replace a newer table selection`, `a delayed row select is cancelled by a table switch`, `a delayed undo read cannot close a record restored by redo` |
 | Inspector follows double-click | `double-clicking another row refreshes an open inspector` |
 | Draft isolation | `a grid double-click does not steal an open draft` |
 | Form Studio edit retention | `unsaved item edits survive a schema refresh` |
+| Form Studio palette | `form palette items support keyboard activation and pointer dragging` |
+| Form Studio canvas | `canvas items support keyboard selection and visible focus`, `the snap preview matches palette drops and canvas moves at the right edge`, `the form inspector accepts vertical grid values above 40` |
+| Form Studio portals | `changing the portal relation uses columns from the new child table` |
+| Form Studio save ownership | `the first form save keeps later Clients edits`, `the first form save keeps later Line Items edits`, `a delayed form save keeps the newer form selection on the same table` |
+| Table switches during edits | `a delayed form save keeps the newer table view`, `a delayed table rename keeps the newer table and record selection` |
+| Inspector after undo and redo | `undo closes the inspector when its selected record is removed`, `redo closes the inspector when its selected record is removed` |
